@@ -36,13 +36,14 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
 
   const reportKey = (parentID, fork) => `${parentID}::${fork}`;
 
-  async function call(kind, payload) {
+  async function call(kind, payload, marker) {
     try {
       const proc = Bun.spawn([BIN, "opencode", "hook", kind], {
         stdin: "pipe",
         stdout: "pipe",
         stderr: "ignore",
       });
+      if (marker) marker.proc = proc;
       proc.stdin.write(JSON.stringify({ directory, worktree, ...payload }));
       proc.stdin.end();
       const out = await new Response(proc.stdout).text();
@@ -105,15 +106,19 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
     const s = sessionState(id);
     const mode = s.lastStatus === "busy" ? "busy" : "idle";
     if (parked.get(id)?.mode === mode) return;
-    const marker = { mode };
+    const marker = { mode, proc: null };
     parked.set(id, marker);
     const startedAt = Date.now();
-    const res = await call("stop-wait", {
-      session_id: id,
-      model: s.model?.modelID,
-      context_tokens: s.tokens ?? undefined,
-      ...(mode === "busy" ? { busy: true } : {}),
-    });
+    const res = await call(
+      "stop-wait",
+      {
+        session_id: id,
+        model: s.model?.modelID,
+        context_tokens: s.tokens ?? undefined,
+        ...(mode === "busy" ? { busy: true } : {}),
+      },
+      marker,
+    );
     const superseded = parked.get(id) !== marker;
     if (!superseded) parked.delete(id);
     if (res?.wake?.forks?.length) {
@@ -241,6 +246,26 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
   }
 
   return {
+    // Instance shutdown: close every session we registered (the daemon
+    // reopens them on the next event after a resume) and release the parked
+    // polls. Abrupt exits that never reach this are covered by the poll
+    // subprocess's own orphan watchdog + the daemon's poll-loss grace-close.
+    dispose: async () => {
+      const ends = [];
+      for (const [id, s] of sessions) {
+        if (s.started) ends.push(call("session-end", { session_id: id }));
+      }
+      await Promise.allSettled(ends);
+      for (const [, marker] of parked) {
+        try {
+          marker.proc?.kill();
+        } catch {
+          // already gone
+        }
+      }
+      parked.clear();
+      sessions.clear();
+    },
     event: async ({ event }) => {
       const type = event?.type;
       const props = event?.properties ?? {};

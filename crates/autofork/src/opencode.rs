@@ -92,9 +92,7 @@ fn run_hook_inner(kind: OcHookKind) -> Option<()> {
     let input: OcInput = serde_json::from_str(&raw).ok()?;
     let paths = Paths::from_env()?;
 
-    // The worktree (when known) is the project identity; discovery walks up
-    // from it either way.
-    let root = input.worktree.clone().unwrap_or(input.directory.clone());
+    let root = project_root_for(input.worktree.as_deref(), &input.directory);
 
     let event = |ev: EventKind| Event {
         event: ev,
@@ -135,6 +133,21 @@ fn run_hook_inner(kind: OcHookKind) -> Option<()> {
             let _ = client.request(RequestBody::Event(ev));
         }
         OcHookKind::StopWait => {
+            // Orphan watchdog: this subprocess is the session's liveness
+            // heartbeat. The plugin that spawned it dies with the opencode
+            // process, but nothing kills *us* — and an orphaned poll keeps
+            // the daemon convinced the session is alive forever (no
+            // [stale?], no grace-close). When our parent dies we get
+            // reparented; exit then, dropping the poll so the daemon's
+            // poll-loss grace-close fires. Covers crashes and exits that
+            // never reach the plugin's dispose hook.
+            let ppid0 = std::os::unix::process::parent_id();
+            std::thread::spawn(move || loop {
+                std::thread::sleep(Duration::from_secs(5));
+                if std::os::unix::process::parent_id() != ppid0 {
+                    std::process::exit(0);
+                }
+            });
             let client = Client::connect_or_spawn(&paths, Duration::from_secs(10)).ok()?;
             let mut client = client.ensure_current_version(&paths).ok()?;
             match client.stop_wait(event(EventKind::Stop)) {
@@ -173,6 +186,18 @@ fn run_hook_inner(kind: OcHookKind) -> Option<()> {
         }
     }
     Some(())
+}
+
+/// The project root for an opencode instance. The worktree (when known) is
+/// the project identity; discovery walks up from it either way. opencode
+/// reports `/` as the worktree for directories outside any VCS — that is no
+/// project root, so fall back to the directory itself (likewise for a
+/// worktree that doesn't actually contain the directory).
+fn project_root_for(worktree: Option<&std::path::Path>, directory: &std::path::Path) -> PathBuf {
+    worktree
+        .filter(|w| *w != std::path::Path::new("/") && directory.starts_with(w))
+        .map(|w| w.to_path_buf())
+        .unwrap_or_else(|| directory.to_path_buf())
 }
 
 /// The rendered plugin source (version stamped).
@@ -280,6 +305,30 @@ mod tests {
         let src = plugin_source();
         assert!(!src.contains("{{VERSION}}"));
         assert!(src.contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn project_root_ignores_the_slash_worktree() {
+        use std::path::Path;
+        // A real worktree above the directory wins.
+        assert_eq!(
+            project_root_for(Some(Path::new("/repo")), Path::new("/repo/sub")),
+            Path::new("/repo")
+        );
+        // opencode's non-VCS sentinel `/` is not a project root.
+        assert_eq!(
+            project_root_for(Some(Path::new("/")), Path::new("/tmp/proj")),
+            Path::new("/tmp/proj")
+        );
+        // A worktree that doesn't contain the directory is ignored too.
+        assert_eq!(
+            project_root_for(Some(Path::new("/elsewhere")), Path::new("/tmp/proj")),
+            Path::new("/tmp/proj")
+        );
+        assert_eq!(
+            project_root_for(None, Path::new("/tmp/proj")),
+            Path::new("/tmp/proj")
+        );
     }
 
     #[test]

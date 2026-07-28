@@ -3,7 +3,7 @@
 use crate::client::Client;
 use autofork_core::config::Paths;
 use autofork_core::project::project_root;
-use autofork_core::protocol::{RequestBody, ResponseBody};
+use autofork_core::protocol::{RequestBody, ResponseBody, StatusInfo};
 use autofork_core::wake::{build_wake_payload, DueFork};
 use std::time::Duration;
 
@@ -112,10 +112,37 @@ pub fn status(paths: &Paths) -> Result<(), String> {
     else {
         return Err("unexpected response".into());
     };
-    let t = now();
     println!("autofork daemon v{} (pid {})", info.version, info.pid);
-    println!("sessions: {}", info.sessions.len());
-    for s in &info.sessions {
+    print_sessions_header(&info);
+    Ok(())
+}
+
+/// A display form of a session id that stays distinguishable: Claude Code's
+/// UUIDs are random from the first character, so 8 chars identify them; but
+/// opencode ids (`ses_<time-ordered>`) share their leading characters across
+/// sessions created near in time — truncating them made every session of a
+/// stretch display identically ("the same session twice"). Show those whole.
+fn display_session_id(id: &str) -> &str {
+    if id.contains('-') {
+        &id[..id.len().min(8)]
+    } else {
+        id
+    }
+}
+
+fn print_sessions_header(info: &StatusInfo) {
+    let t = now();
+    // Belt: the store keys sessions by id (PRIMARY KEY), so duplicates
+    // shouldn't exist — but if a daemon ever hands back two rows for one id,
+    // show only the most recently active (the list is ordered by activity).
+    let mut seen = std::collections::HashSet::new();
+    let sessions: Vec<_> = info
+        .sessions
+        .iter()
+        .filter(|s| seen.insert(s.session_id.as_str()))
+        .collect();
+    println!("sessions: {}", sessions.len());
+    for s in sessions {
         let tokens = s
             .prompt_tokens
             .map(|n| format!(", ~{n} prompt tokens"))
@@ -123,7 +150,7 @@ pub fn status(paths: &Paths) -> Result<(), String> {
         let stale = if s.stale { " [stale?]" } else { "" };
         println!(
             "  session {} [{}]{stale} {} (active {}{tokens})",
-            &s.session_id[..s.session_id.len().min(8)],
+            display_session_id(&s.session_id),
             s.status,
             s.project_root.display(),
             fmt_ago(t, s.last_activity),
@@ -141,7 +168,6 @@ pub fn status(paths: &Paths) -> Result<(), String> {
             );
         }
     }
-    Ok(())
 }
 
 pub fn prune(paths: &Paths) -> Result<(), String> {
@@ -165,7 +191,7 @@ pub fn prune(paths: &Paths) -> Result<(), String> {
     for s in &sessions {
         println!(
             "  session {} {} (last active {})",
-            &s.session_id[..s.session_id.len().min(8)],
+            display_session_id(&s.session_id),
             s.project_root.display(),
             fmt_ago(t, s.last_activity),
         );
