@@ -383,7 +383,15 @@ impl Daemon {
             // Stop keeps the existing one, so idle deadlines don't reset.
             let _ = store.set_pause_started_at_if_unset(&ev.session_id, t);
         }
-        let prompt_tokens = self.ingest_transcript(&ev);
+        // Clients that track usage themselves (opencode) report the gauge on
+        // the event; otherwise it comes from the transcript delta.
+        let prompt_tokens = if let Some(gauge) = ev.context_tokens {
+            let store = self.store.lock().unwrap();
+            let _ = store.set_prompt_tokens(&ev.session_id, gauge);
+            Some(gauge)
+        } else {
+            self.ingest_transcript(&ev)
+        };
         let cfg = self.cfg_for(Some(&ev.project_root));
 
         // Register this wait so PromptSubmit / SessionEnd can cancel it. A
@@ -407,8 +415,11 @@ impl Daemon {
         // notification PromptSubmit) just confirmed release right now — this is
         // the Stop that follows the completion's relay turn, so the reports are
         // already in the session's context.
-        if let Some(payload) = crate::planner::release_due(self, &session) {
-            return ResponseBody::Wake { payload };
+        if let Some((payload, forks)) = crate::planner::release_due(self, &session) {
+            return ResponseBody::Wake {
+                payload,
+                forks: Some(forks),
+            };
         }
         // Idle timing is measured from the pause baseline (the first Stop of
         // this pause), so a wake-turn's own Stop doesn't restart the clock.
@@ -478,8 +489,11 @@ impl Daemon {
         // stamping throttles and latches at this point.
         let moments = elapsed_moments(prompt_tokens, max_tokens, baseline, &deadlines, now());
         let selected = crate::planner::select_forks(self, &session, &cfg, &moments);
-        if let Some(payload) = crate::planner::build_wake(self, &session, selected) {
-            return ResponseBody::Wake { payload };
+        if let Some((payload, forks)) = crate::planner::build_wake(self, &session, selected) {
+            return ResponseBody::Wake {
+                payload,
+                forks: Some(forks),
+            };
         }
         // Nothing survived re-evaluation; park.
         tokio::select! {
@@ -487,6 +501,48 @@ impl Daemon {
             _ = self.shutdown.notified() => {}
         }
         ResponseBody::Waited
+    }
+
+    /// An opencode fork run started: record it in the spawn registry, keyed by
+    /// the fork session id in the `tool_use_id` role. The registry drives
+    /// `after`-dependency release and run bookkeeping, same as a Claude Code
+    /// spawn observed in the transcript.
+    pub fn handle_fork_spawned(
+        self: &Arc<Self>,
+        session_id: &str,
+        fork: &str,
+        run_ref: &str,
+    ) -> ResponseBody {
+        self.touch_busy();
+        let store = self.store.lock().unwrap();
+        let _ = store.record_spawn(session_id, run_ref, Some(fork), now());
+        ResponseBody::Ack
+    }
+
+    /// An opencode fork run finished. Mark it terminal, then nudge the
+    /// session's parked stop-wait (resolving it `Waited`): the plugin re-parks
+    /// while the session stays idle, and the fresh poll's entry check releases
+    /// any `after` dependents this completion unblocked. (Claude Code gets the
+    /// same effect from the completion notification's relay turn ending in a
+    /// new Stop poll; opencode has no such turn, hence the nudge.)
+    pub fn handle_fork_completed(
+        self: &Arc<Self>,
+        session_id: &str,
+        fork: &str,
+        run_ref: &str,
+        status: &str,
+    ) -> ResponseBody {
+        self.touch_busy();
+        {
+            let store = self.store.lock().unwrap();
+            let matched = store
+                .mark_spawn_terminal(session_id, Some(run_ref), None, status, now())
+                .unwrap_or(false);
+            tracing::debug!(session = %session_id, fork, run_ref, status, matched,
+                "opencode fork completion");
+        }
+        self.cancel_wait(session_id);
+        ResponseBody::Ack
     }
 
     /// Read the transcript delta (updating the stored offset): refresh the

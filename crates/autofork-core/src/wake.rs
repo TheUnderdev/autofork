@@ -13,6 +13,7 @@
 //! *release* payload ([`build_release_payload`]) for the now-unblocked forks.
 
 use crate::notification::TASK_NOTIFICATION_PREFIX;
+use crate::protocol::WakeFork;
 
 /// The greppable marker every wake block carries (`source: autofork`). The
 /// payload builder emits it and the continuation sniffer anchors on it, so the
@@ -209,6 +210,31 @@ pub fn build_release_payload(
         .map(|f| release_block(f, session_id, conversation_id, project_root))
         .collect();
     format!("{}\n\n{}", blocks.join("\n\n"), closer(blocks.len()))
+}
+
+/// Build the structured due-fork specs that ride alongside a wake payload,
+/// for clients that run forks programmatically (opencode). Each spec's
+/// `prompt` is the same canonical fork prompt the model-facing payload quotes,
+/// so the wording lives in one place. Works for both normal wakes (`after`
+/// empty) and release wakes (`after` = the finished predecessors, whose
+/// reports the client appends to the prompt itself).
+pub fn build_wake_forks(
+    session_id: &str,
+    conversation_id: &str,
+    project_root: &str,
+    forks: &[DueFork],
+) -> Vec<WakeFork> {
+    forks
+        .iter()
+        .map(|f| WakeFork {
+            name: f.name.clone(),
+            path: f.path.clone(),
+            trigger: f.trigger.clone(),
+            overlap: f.overlap,
+            after: f.after.clone(),
+            prompt: spawn_prompt(f, session_id, conversation_id, project_root),
+        })
+        .collect()
 }
 
 /// Rides in every wake to recover from Claude Code's dynamic agent disclosure:

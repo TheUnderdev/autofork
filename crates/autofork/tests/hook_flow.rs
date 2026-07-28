@@ -147,6 +147,7 @@ fn stop_wait_wake_exits_2_with_payload_on_stderr() {
         env.socket.clone(),
         ResponseBody::Wake {
             payload: "WAKE_PAYLOAD_MARKER".into(),
+            forks: None,
         },
     );
     wait_for_socket(&env.socket);

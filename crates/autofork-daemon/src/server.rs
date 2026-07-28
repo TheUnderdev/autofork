@@ -172,6 +172,17 @@ async fn dispatch(daemon: &Arc<Daemon>, body: RequestBody) -> ResponseBody {
             ResponseBody::ForkList { items }
         }
         RequestBody::Prune => prune(daemon),
+        RequestBody::ForkSpawned {
+            session_id,
+            fork,
+            run_ref,
+        } => daemon.handle_fork_spawned(&session_id, &fork, &run_ref),
+        RequestBody::ForkCompleted {
+            session_id,
+            fork,
+            run_ref,
+            status,
+        } => daemon.handle_fork_completed(&session_id, &fork, &run_ref, &status),
         RequestBody::Shutdown { drain } => {
             tracing::info!(drain, "shutdown requested");
             let daemon = daemon.clone();

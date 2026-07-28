@@ -1,6 +1,7 @@
 # autofork
 
-**Forks for Claude Code.** When your session goes idle — or its context crosses a threshold —
+**Forks for Claude Code and opencode.** When your session goes idle — or its context crosses a
+threshold —
 autofork has the session's own model spawn *forks*: background **fork subagents** that inherit the
 full conversation, do work with tools, and report back, all without interrupting you.
 
@@ -180,6 +181,9 @@ autofork logs [-f]       # daemon log
 autofork prune           # close [stale?] sessions now instead of waiting for the session timeout
 autofork doctor          # install checks
 autofork stop-daemon     # retire the daemon (it restarts on the next event)
+
+autofork opencode install    # install the opencode bridge plugin (see "opencode support")
+autofork opencode uninstall  # remove it
 ```
 
 `autofork run` can no longer spawn a fork itself (forks are subagents of an interactive session); it
@@ -281,11 +285,54 @@ the session's own model.
 - **Cache economics.** The old warning that an *interactive* parent's forks couldn't reuse its cache
   no longer applies — a fork subagent inherits the live conversation and reuses ~99% of the prefix.
 
+## opencode support (v0.9)
+
+autofork also runs forks in [opencode](https://opencode.ai) sessions — same fork files, same
+daemon, same schedule semantics (throttles, tags, `after` dependencies, once-per-pause idle
+latching). Install the bridge plugin once:
+
+```
+autofork opencode install     # writes ~/.config/opencode/plugin/autofork.js
+```
+
+then restart opencode (plugins load at instance start). `autofork opencode uninstall` removes it;
+`autofork doctor` reports whether the installed copy is current.
+
+### How opencode forks run
+
+opencode has no fork subagent, but it has something better for this job: a **native session
+fork** (`POST /session/:id/fork` — the engine behind `opencode run -s <id> --fork`) that deep-copies
+the whole conversation into a new session without touching the original. The plugin listens for
+session lifecycle events and talks to the same autofork daemon; when a fork comes due it:
+
+1. forks your session (a full copy — the fork inherits everything you and the model have said),
+2. prompts the copy with the fork instruction, **pinning your session's model and agent** (a
+   forked opencode session doesn't inherit them, and cache reuse needs an identical prefix),
+3. when the copy finishes, injects its report into your session as a **no-reply message** — no
+   turn is spent; your model sees the report block (`source: autofork`) on your next exchange,
+4. reports the completion to the daemon, which releases any `after` dependents.
+
+Fork-run sessions are titled `autofork/<fork> (<trigger>)` in the session list; delete them freely,
+the report already lives in your session.
+
+### Cache economics on opencode
+
+Measured with byte-level request diffing (same methodology as the Claude Code numbers below), an
+opencode fork of an **interactive TUI session** reuses **~100% of the parent's cached prefix**
+(e.g. `cache_read 29,717 / cache_creation 535` on a live run). opencode builds identical request
+prefixes in every mode — TUI, `opencode run`, server — so the mode-stamping problem that makes
+Claude Code interactive parents cache-cold for subprocess forks does not exist there. One caveat:
+opencode requests use Anthropic's plain 5-minute ephemeral cache (no 1-hour TTL), so a fork only
+reuses the parent's cache when it fires within ~5 minutes of the parent's last request — keep
+idle deadlines short (the default fits) or budget a cold prefix write for late forks.
+
+Requires opencode >= 1.18 (the plugin uses the v1 plugin API and the session fork route).
+
 ## Other tools
 
-The `.autofork/forks/` format is deliberately tool-agnostic; autofork is the reference implementation
-for Claude Code. Other agent harnesses are welcome to read the same fork definitions natively — the
-format spec above is the whole contract.
+The `.autofork/forks/` format is deliberately tool-agnostic; autofork is the reference
+implementation for Claude Code and opencode. Other agent harnesses are welcome to read the same
+fork definitions natively — the format spec above is the whole contract.
 
 ## License
 

@@ -1,6 +1,7 @@
 mod client;
 mod commands;
 mod hook;
+mod opencode;
 
 use autofork_core::config::Paths;
 use clap::{Parser, Subcommand};
@@ -56,11 +57,35 @@ enum Command {
     Prune,
     /// Check the installation and report problems.
     Doctor,
+    /// opencode integration: install the plugin, or serve as its hook.
+    Opencode {
+        #[command(subcommand)]
+        command: OpencodeCommand,
+    },
     /// Ask the daemon to exit (it restarts on the next hook event).
     StopDaemon {
         /// Wait for in-flight fork runs to finish first.
         #[arg(long, default_value_t = true)]
         drain: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum OpencodeCommand {
+    /// Install (or refresh) the autofork plugin into opencode's global
+    /// plugin directory. Restart opencode afterwards.
+    Install {
+        /// Print the plugin source to stdout instead of installing it.
+        #[arg(long)]
+        print: bool,
+    },
+    /// Remove the installed plugin.
+    Uninstall,
+    /// The opencode plugin's hook entrypoint (reads JSON on stdin).
+    #[command(hide = true)]
+    Hook {
+        #[arg(value_enum)]
+        event: opencode::OcHookKind,
     },
 }
 
@@ -79,6 +104,11 @@ fn main() {
         Command::Logs { follow } => exit_on_err(commands::logs(&paths, follow)),
         Command::Prune => exit_on_err(commands::prune(&paths)),
         Command::Doctor => exit_on_err(commands::doctor(&paths)),
+        Command::Opencode { command } => match command {
+            OpencodeCommand::Install { print } => exit_on_err(opencode::install(print)),
+            OpencodeCommand::Uninstall => exit_on_err(opencode::uninstall()),
+            OpencodeCommand::Hook { event } => opencode::run_hook(event),
+        },
         Command::StopDaemon { drain } => exit_on_err(stop_daemon(&paths, drain)),
     }
 }

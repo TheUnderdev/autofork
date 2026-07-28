@@ -406,6 +406,16 @@ pub fn doctor(paths: &Paths) -> Result<(), String> {
         _ => println!("  note: could not run 'claude --version' to check fork subagent support"),
     }
 
+    // opencode integration (only reported when opencode or the plugin is
+    // present — a Claude-Code-only install stays quiet).
+    for line in crate::opencode::doctor_lines() {
+        if line.contains("plugin installed") {
+            ok(&line);
+        } else {
+            println!("  WARN: {line}");
+        }
+    }
+
     // Impostor `fork` agent definitions (a context-less shadow of the built-in
     // type — see the wake payload's own prohibition against creating one).
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);

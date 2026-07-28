@@ -83,6 +83,8 @@ fn run_hook_inner(kind: HookKind) -> Option<()> {
         notif_tool_use_id: None,
         notif_task_id: None,
         notif_status: None,
+        context_tokens: None,
+        client: None,
     };
 
     match kind {
@@ -128,7 +130,8 @@ fn run_hook_inner(kind: HookKind) -> Option<()> {
             let mut client = client.ensure_current_version(&paths).ok()?;
             // Long-poll until forks are due or the wait is cancelled/retired.
             // Waited / error / closed socket / proto skew: exit 0 silently.
-            if let Ok(ResponseBody::Wake { payload }) = client.stop_wait(event(EventKind::Stop)) {
+            if let Ok(ResponseBody::Wake { payload, .. }) = client.stop_wait(event(EventKind::Stop))
+            {
                 // Wake the idle session: stderr shown as a system reminder.
                 eprintln!("{payload}");
                 std::process::exit(2);
@@ -145,7 +148,7 @@ fn run_hook_inner(kind: HookKind) -> Option<()> {
 /// Read a comma-separated tag env var into a normalized list (trimmed,
 /// empties dropped, deduped). An unset or all-empty value yields `None` so the
 /// daemon falls back to the config default.
-fn tags_from_env(var: &str) -> Option<Vec<String>> {
+pub(crate) fn tags_from_env(var: &str) -> Option<Vec<String>> {
     let raw = std::env::var(var).ok()?;
     let mut out: Vec<String> = Vec::new();
     for piece in raw.split(',') {

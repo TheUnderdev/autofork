@@ -36,6 +36,22 @@ pub enum RequestBody {
     /// of waiting for the session-timeout reaper. Stale = the same heuristic
     /// `Status` annotates: open, no parked poll, idle far past the deadline.
     Prune,
+    /// An opencode fork run started: the plugin forked the session and
+    /// prompted the copy. `run_ref` is the fork session's id — the same
+    /// opaque role a Claude Code spawn's `tool_use_id` plays.
+    ForkSpawned {
+        session_id: String,
+        fork: String,
+        run_ref: String,
+    },
+    /// An opencode fork run reached a terminal status
+    /// (`completed`/`failed`/`stopped`). Drives `after`-dependency release.
+    ForkCompleted {
+        session_id: String,
+        fork: String,
+        run_ref: String,
+        status: String,
+    },
     /// Ask the daemon to exit. With `drain`, it finishes cleanly first.
     /// Frozen shape — never change.
     Shutdown { drain: bool },
@@ -81,6 +97,14 @@ pub struct Event {
     /// The notification's `<status>` (`completed`/`failed`/`stopped`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notif_status: Option<String>,
+    /// The session's context gauge in tokens, reported by clients that track
+    /// usage themselves (opencode) instead of exposing a transcript to parse.
+    /// Takes precedence over transcript parsing when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_tokens: Option<u64>,
+    /// The harness this event comes from (`"opencode"`; absent = Claude Code).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,9 +135,13 @@ pub enum ResponseBody {
         version: String,
     },
     /// Forks are due: the hook prints `payload` to stderr and exits 2 to wake
-    /// the session.
+    /// the session. `forks` carries the same due set structured, for clients
+    /// that execute fork runs programmatically (opencode) instead of handing
+    /// the text to a model. Additive: old clients ignore it.
     Wake {
         payload: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        forks: Option<Vec<WakeFork>>,
     },
     /// The stop-wait resolved without a wake (cancelled by activity, nothing
     /// due, or the daemon is retiring): the hook exits 0 silently.
@@ -177,6 +205,26 @@ pub struct RunInfo {
     pub started_at: i64,
 }
 
+/// One due fork, structured, for programmatic clients: everything needed to
+/// run it without parsing the human/model-facing wake payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WakeFork {
+    pub name: String,
+    /// Absolute path to the fork's `.md` definition.
+    pub path: String,
+    /// The matched trigger label (e.g. `idle`, `context_used:80%`).
+    pub trigger: String,
+    /// Whether concurrent runs of this fork are allowed.
+    pub overlap: bool,
+    /// In a release wake: the finished predecessor fork names whose reports
+    /// the client should append to the prompt. Empty in a normal wake.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub after: Vec<String>,
+    /// The prompt to run the fork with (already carries the fork file path,
+    /// trigger, session/conversation ids and project root).
+    pub prompt: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForkInfo {
     pub name: String,
@@ -223,6 +271,8 @@ mod tests {
                 notif_tool_use_id: None,
                 notif_task_id: None,
                 notif_status: None,
+                context_tokens: None,
+                client: None,
             }),
         };
         let line = encode(&req).unwrap();
@@ -242,12 +292,59 @@ mod tests {
             id: 1,
             body: ResponseBody::Wake {
                 payload: "hello".into(),
+                forks: Some(vec![WakeFork {
+                    name: "journal".into(),
+                    path: "/x/journal.md".into(),
+                    trigger: "idle".into(),
+                    overlap: false,
+                    after: Vec::new(),
+                    prompt: "Read the file /x/journal.md".into(),
+                }]),
             },
         };
         let line = encode(&resp).unwrap();
         let back: Response = serde_json::from_str(line.trim()).unwrap();
         match back.body {
-            ResponseBody::Wake { payload } => assert_eq!(payload, "hello"),
+            ResponseBody::Wake { payload, forks } => {
+                assert_eq!(payload, "hello");
+                let forks = forks.expect("structured forks survive the round trip");
+                assert_eq!(forks.len(), 1);
+                assert_eq!(forks[0].name, "journal");
+            }
+            _ => panic!("wrong body"),
+        }
+    }
+
+    #[test]
+    fn wake_without_forks_still_parses() {
+        // An old daemon's Wake (payload only) must keep parsing.
+        let line = r#"{"proto":1,"id":1,"type":"wake","payload":"p"}"#;
+        let resp: Response = serde_json::from_str(line).unwrap();
+        match resp.body {
+            ResponseBody::Wake { payload, forks } => {
+                assert_eq!(payload, "p");
+                assert!(forks.is_none());
+            }
+            _ => panic!("wrong body"),
+        }
+    }
+
+    #[test]
+    fn opencode_fork_frames_round_trip() {
+        let line = r#"{"proto":1,"id":2,"type":"fork_completed","session_id":"s","fork":"journal","run_ref":"ses_abc","status":"completed"}"#;
+        let req: Request = serde_json::from_str(line).unwrap();
+        match req.body {
+            RequestBody::ForkCompleted {
+                session_id,
+                fork,
+                run_ref,
+                status,
+            } => {
+                assert_eq!(session_id, "s");
+                assert_eq!(fork, "journal");
+                assert_eq!(run_ref, "ses_abc");
+                assert_eq!(status, "completed");
+            }
             _ => panic!("wrong body"),
         }
     }

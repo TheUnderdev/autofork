@@ -381,6 +381,16 @@ impl Store {
         Ok(())
     }
 
+    /// Set the context gauge directly (clients that track usage themselves —
+    /// opencode — report it on the event; there is no transcript offset).
+    pub fn set_prompt_tokens(&self, session_id: &str, prompt_tokens: u64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET prompt_tokens = ?2 WHERE session_id = ?1",
+            params![session_id, prompt_tokens as i64],
+        )?;
+        Ok(())
+    }
+
     pub fn set_transcript_gauge(
         &self,
         session_id: &str,

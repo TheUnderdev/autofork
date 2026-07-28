@@ -18,10 +18,13 @@ use crate::daemon::{now, Daemon};
 use autofork_core::config::Config;
 use autofork_core::frontmatter::{ForkParse, ForkRunOn};
 use autofork_core::moments::{match_moments, ForkMoment};
+use autofork_core::protocol::WakeFork;
 use autofork_core::schedule::{resolve_deps, Selected};
 use autofork_core::store::SessionRow;
 use autofork_core::tags::tags_allowed;
-use autofork_core::wake::{build_release_payload, build_wake_payload, DueFork, HeldFork};
+use autofork_core::wake::{
+    build_release_payload, build_wake_forks, build_wake_payload, DueFork, HeldFork,
+};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -194,15 +197,16 @@ fn conversation_id(session: &SessionRow) -> String {
 }
 
 /// Given the forks selected to fire, stamp their throttles (per-fork and
-/// per-tag) and build the wake payload the session should act on. Roots go
-/// into the payload as spawn-now blocks; `after` dependents are held in the
-/// store until their predecessors' completions are observed. Returns `None`
-/// when `selected` is empty.
+/// per-tag) and build the wake the session should act on: the model-facing
+/// payload text plus the structured due-fork specs (for programmatic
+/// clients). Roots go into the payload as spawn-now blocks; `after`
+/// dependents are held in the store until their predecessors' completions are
+/// observed. Returns `None` when `selected` is empty.
 pub fn build_wake(
     daemon: &Arc<Daemon>,
     session: &SessionRow,
     selected: Vec<SelectedFork>,
-) -> Option<String> {
+) -> Option<(String, Vec<WakeFork>)> {
     if selected.is_empty() {
         return None;
     }
@@ -271,20 +275,18 @@ pub fn build_wake(
     // continuation PromptSubmits that arrive without prunable prompt text).
     daemon.note_wake_issued(&session.session_id);
 
-    Some(build_wake_payload(
-        &session.session_id,
-        &conversation_id(session),
-        &session.project_root.to_string_lossy(),
-        &roots,
-        &held,
-    ))
+    let conv = conversation_id(session);
+    let root_str = session.project_root.to_string_lossy();
+    let payload = build_wake_payload(&session.session_id, &conv, &root_str, &roots, &held);
+    let forks = build_wake_forks(&session.session_id, &conv, &root_str, &roots);
+    Some((payload, forks))
 }
 
 /// Release any held dependents whose predecessors have all reached a terminal
 /// status since the dependent was held. Returns the release wake payload, or
 /// `None` when nothing is releasable. Latches and throttles were stamped when
 /// the dependents were first selected, so nothing is re-stamped here.
-pub fn release_due(daemon: &Arc<Daemon>, session: &SessionRow) -> Option<String> {
+pub fn release_due(daemon: &Arc<Daemon>, session: &SessionRow) -> Option<(String, Vec<WakeFork>)> {
     let released: Vec<autofork_core::store::PendingDep> = {
         let store = daemon.store.lock().unwrap();
         let pending = store.list_pending_deps(&session.session_id).ok()?;
@@ -324,10 +326,9 @@ pub fn release_due(daemon: &Arc<Daemon>, session: &SessionRow) -> Option<String>
         }
     }
     daemon.note_wake_issued(&session.session_id);
-    Some(build_release_payload(
-        &session.session_id,
-        &conversation_id(session),
-        &session.project_root.to_string_lossy(),
-        &due,
-    ))
+    let conv = conversation_id(session);
+    let root_str = session.project_root.to_string_lossy();
+    let payload = build_release_payload(&session.session_id, &conv, &root_str, &due);
+    let forks = build_wake_forks(&session.session_id, &conv, &root_str, &due);
+    Some((payload, forks))
 }

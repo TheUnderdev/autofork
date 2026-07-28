@@ -144,6 +144,8 @@ impl Harness {
             notif_tool_use_id: None,
             notif_task_id: None,
             notif_status: None,
+            context_tokens: None,
+            client: None,
         }
     }
 
@@ -320,7 +322,15 @@ fn assert_ack(body: ResponseBody) {
 
 fn wake_payload(body: ResponseBody) -> String {
     match body {
-        ResponseBody::Wake { payload } => payload,
+        ResponseBody::Wake { payload, .. } => payload,
+        other => panic!("expected a Wake, got {other:?}"),
+    }
+}
+
+/// The structured due-fork specs riding on a Wake (for opencode clients).
+fn wake_forks(body: ResponseBody) -> Vec<autofork_core::protocol::WakeFork> {
+    match body {
+        ResponseBody::Wake { forks, .. } => forks.expect("wake carries structured forks"),
         other => panic!("expected a Wake, got {other:?}"),
     }
 }
@@ -1095,4 +1105,135 @@ fn prune_closes_stale_sessions_only() {
     // Unpark s3's poll so its thread ends cleanly.
     assert_ack(h.send_event(h.prompt_submit("s3", true)));
     let _ = parked.recv_timeout(Duration::from_secs(5));
+}
+
+// ---- opencode client flow (no transcript; explicit gauge, spawns and
+// completions reported as protocol frames; wakes consumed structured) ----
+
+/// An event as the opencode plugin's hook sends it: no transcript, explicit
+/// client tag, gauge and model riding on the event itself.
+fn oc_event(h: &Harness, kind: EventKind, session: &str) -> Event {
+    let mut ev = h.event(kind, session);
+    ev.client = Some("opencode".to_string());
+    ev
+}
+
+#[test]
+fn opencode_wake_carries_structured_forks() {
+    let mut h = Harness::new("1s", "0");
+    h.write_fork(
+        "journal.md",
+        "---\nfork: true\nrun_on: [idle]\n---\nwrite the journal now",
+    );
+    h.start_daemon();
+
+    assert_ack(h.send_event(oc_event(&h, EventKind::SessionStart, "oc1")));
+    let rx = h.park_stop_wait(oc_event(&h, EventKind::Stop, "oc1"));
+
+    let forks = wake_forks(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert_eq!(forks.len(), 1);
+    let f = &forks[0];
+    assert_eq!(f.name, "journal");
+    assert_eq!(f.trigger, "idle");
+    assert!(!f.overlap);
+    assert!(f.after.is_empty());
+    assert!(f.path.ends_with("journal.md"), "{}", f.path);
+    assert!(f.prompt.contains("Read the file"), "{}", f.prompt);
+    assert!(f.prompt.contains(&f.path), "{}", f.prompt);
+    assert!(f.prompt.contains("parent session oc1"), "{}", f.prompt);
+    assert!(
+        f.prompt.contains("Your final message is your report"),
+        "{}",
+        f.prompt
+    );
+    // Issued-run bookkeeping works the same as for Claude Code sessions.
+    assert_eq!(h.status_recent_runs(), 1);
+}
+
+#[test]
+fn opencode_context_gauge_rides_on_the_event() {
+    let mut h = Harness::new("1h", "0"); // long idle: only context can fire
+    h.write_fork(
+        "distill.md",
+        "---\nfork: true\nrun_on:\n  - context_used: 50%\n---\nDISTILL",
+    );
+    h.start_daemon();
+
+    assert_ack(h.send_event(oc_event(&h, EventKind::SessionStart, "oc1")));
+
+    // Gauge under the threshold: nothing is due; the poll parks. Cancel it.
+    let mut low = oc_event(&h, EventKind::Stop, "oc1");
+    low.context_tokens = Some(10_000);
+    let rx = h.park_stop_wait(low);
+    std::thread::sleep(Duration::from_millis(400));
+    assert_ack(h.send_event({
+        let mut ev = oc_event(&h, EventKind::PromptSubmit, "oc1");
+        ev.waking = Some(true);
+        ev
+    }));
+    assert!(matches!(
+        rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        ResponseBody::Waited
+    ));
+
+    // Gauge over the threshold (default 200k window): the same poll wakes.
+    let mut high = oc_event(&h, EventKind::Stop, "oc1");
+    high.context_tokens = Some(150_000);
+    let rx = h.park_stop_wait(high);
+    let forks = wake_forks(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert_eq!(forks.len(), 1);
+    assert_eq!(forks[0].name, "distill");
+    assert_eq!(forks[0].trigger, "context_used:50%");
+}
+
+#[test]
+fn opencode_fork_completion_releases_after_dependent() {
+    let mut h = Harness::new("1s", "0");
+    h.write_fork("alpha.md", "---\nfork: true\nrun_on: [idle]\n---\nALPHA");
+    h.write_fork(
+        "beta.md",
+        "---\nfork: true\nrun_on: [idle]\nafter: alpha\n---\nBETA",
+    );
+    h.start_daemon();
+
+    assert_ack(h.send_event(oc_event(&h, EventKind::SessionStart, "oc1")));
+
+    // Wake 1: alpha is the structured root; beta is held daemon-side.
+    let rx = h.park_stop_wait(oc_event(&h, EventKind::Stop, "oc1"));
+    let forks = wake_forks(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert_eq!(forks.len(), 1);
+    assert_eq!(forks[0].name, "alpha");
+
+    // The plugin forks the session, prompts the copy, and reports the spawn.
+    assert_ack(h.request(RequestBody::ForkSpawned {
+        session_id: "oc1".into(),
+        fork: "alpha".into(),
+        run_ref: "ses_fork_alpha".into(),
+    }));
+
+    // The session stays idle, so the plugin re-parks immediately.
+    let parked = h.park_stop_wait(oc_event(&h, EventKind::Stop, "oc1"));
+    std::thread::sleep(Duration::from_millis(400));
+
+    // alpha's fork session finishes; the completion frame nudges the parked
+    // poll (resolved Waited) so the plugin re-parks and picks up the release.
+    assert_ack(h.request(RequestBody::ForkCompleted {
+        session_id: "oc1".into(),
+        fork: "alpha".into(),
+        run_ref: "ses_fork_alpha".into(),
+        status: "completed".into(),
+    }));
+    assert!(matches!(
+        parked.recv_timeout(Duration::from_secs(5)).unwrap(),
+        ResponseBody::Waited
+    ));
+
+    // The re-park is answered immediately with beta's release, `after`
+    // naming the finished predecessor whose report the plugin appends.
+    let rx = h.park_stop_wait(oc_event(&h, EventKind::Stop, "oc1"));
+    let forks = wake_forks(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert_eq!(forks.len(), 1);
+    assert_eq!(forks[0].name, "beta");
+    assert_eq!(forks[0].after, vec!["alpha".to_string()]);
+    assert!(forks[0].prompt.contains("beta.md"));
 }
