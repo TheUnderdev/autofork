@@ -142,8 +142,11 @@ Moments for `run_on`:
   session began), **without waiting for a pause**: it fires at the first turn boundary past the
   interval, however brief the pause — and in opencode sessions it fires even *mid-run* (the plugin
   keeps a poll parked while the session is busy), so hour-long autonomous runs still get their
-  periodic forks. Combine with `idle:` for "on a 4-minute pause, or hourly regardless":
-  `run_on: [idle: 4m, every: 1h]` — an idle-triggered run resets the hourly clock.
+  periodic forks. It is a backstop for **activity**, not a cron: once the session goes quiet it
+  fires at most once more (only if the last run predates the pause), then stays silent until your
+  next genuine activity re-arms it — a session left idle overnight runs nothing. Combine with
+  `idle:` for "on a 4-minute pause, or hourly regardless": `run_on: [idle: 4m, every: 1h]` — an
+  idle-triggered run resets the hourly clock (and usually absorbs that one post-pause fire too).
 
 Unknown keys are ignored; invalid values warn and fall back to defaults (`autofork forks` shows the
 warnings). Fork bodies should be **idempotent** — a fork may fire on any idle pause.

@@ -53,8 +53,15 @@ pub enum ForkMoment {
     },
     /// Wall-clock evaluation point (unix seconds): every poll evaluation
     /// carries one, so `every:` intervals can fire at turn boundaries — and,
-    /// on opencode, mid-run via busy polls.
-    Tick { now: i64 },
+    /// on opencode, mid-run via busy polls. `pause_started_at` is `None`
+    /// while the session is busy (activity is ongoing); during a pause it
+    /// carries the pause's start, and an `every:` trigger whose fork already
+    /// ran at or after that instant will not fire again — a quiet session
+    /// must not become a periodic cron. The next genuine activity re-arms it.
+    Tick {
+        now: i64,
+        pause_started_at: Option<i64>,
+    },
 }
 
 /// The base instant an `every:` interval measures from: the fork's last run
@@ -77,8 +84,25 @@ pub fn match_moments(
     for moment in moments {
         for trigger in &fork.run_on {
             let hit = match (moment, trigger) {
-                (ForkMoment::Tick { now }, ForkRunOn::Every { interval_secs }) => {
-                    now - every_base(last_run_at, session_created_at) >= *interval_secs as i64
+                (
+                    ForkMoment::Tick {
+                        now,
+                        pause_started_at,
+                    },
+                    ForkRunOn::Every { interval_secs },
+                ) => {
+                    let base = every_base(last_run_at, session_created_at);
+                    // During a pause, fire only if the fork's last run
+                    // predates the pause (there has been activity since);
+                    // busy polls (None) always qualify — activity is ongoing.
+                    // A fork that never ran always qualifies (the session's
+                    // creation was activity): with second-granularity stamps
+                    // `created_at == pause_started_at` is common and must not
+                    // suppress the first fire, while `ran_at ==
+                    // pause_started_at` (a fire at this pause's start) must.
+                    let pause_ok = pause_started_at
+                        .is_none_or(|pause| last_run_at.is_none_or(|ran| ran < pause));
+                    now - base >= *interval_secs as i64 && pause_ok
                 }
                 (ForkMoment::Idle { deadline_secs }, ForkRunOn::Idle { after_secs }) => {
                     let effective = after_secs.unwrap_or(default_idle_secs);
@@ -378,7 +402,10 @@ mod tests {
         assert_eq!(
             match_moments(
                 &f,
-                &[ForkMoment::Tick { now: 1000 + 3599 }],
+                &[ForkMoment::Tick {
+                    now: 1000 + 3599,
+                    pause_started_at: None
+                }],
                 240,
                 None,
                 1000
@@ -388,7 +415,10 @@ mod tests {
         assert_eq!(
             match_moments(
                 &f,
-                &[ForkMoment::Tick { now: 1000 + 3600 }],
+                &[ForkMoment::Tick {
+                    now: 1000 + 3600,
+                    pause_started_at: None
+                }],
                 240,
                 None,
                 1000
@@ -399,11 +429,29 @@ mod tests {
         );
         // Ran before: measured from the last run, not session start.
         assert_eq!(
-            match_moments(&f, &[ForkMoment::Tick { now: 9000 }], 240, Some(6000), 1000),
+            match_moments(
+                &f,
+                &[ForkMoment::Tick {
+                    now: 9000,
+                    pause_started_at: None
+                }],
+                240,
+                Some(6000),
+                1000
+            ),
             None
         );
         assert_eq!(
-            match_moments(&f, &[ForkMoment::Tick { now: 9600 }], 240, Some(6000), 1000),
+            match_moments(
+                &f,
+                &[ForkMoment::Tick {
+                    now: 9600,
+                    pause_started_at: None
+                }],
+                240,
+                Some(6000),
+                1000
+            ),
             Some(ForkRunOn::Every {
                 interval_secs: 3600
             })
@@ -416,7 +464,16 @@ mod tests {
             after_secs: Some(1),
         }]);
         assert_eq!(
-            match_moments(&f, &[ForkMoment::Tick { now: 999_999 }], 240, None, 0),
+            match_moments(
+                &f,
+                &[ForkMoment::Tick {
+                    now: 999_999,
+                    pause_started_at: None
+                }],
+                240,
+                None,
+                0
+            ),
             None
         );
     }
@@ -436,5 +493,53 @@ mod tests {
         let times = every_fire_times(forks.iter().map(|&(n, f)| (n, f)), ran, 1000);
         // a: 2000+100; c: never ran, 1000+500. b contributes nothing.
         assert_eq!(times, vec![1500, 2100]);
+    }
+
+    #[test]
+    fn every_is_gated_by_the_pause() {
+        let f = fork(vec![ForkRunOn::Every { interval_secs: 60 }]);
+        // Last run before the pause began (activity in between): fires.
+        assert_eq!(
+            match_moments(
+                &f,
+                &[ForkMoment::Tick {
+                    now: 5000,
+                    pause_started_at: Some(4100)
+                }],
+                240,
+                Some(4000),
+                0
+            ),
+            Some(ForkRunOn::Every { interval_secs: 60 })
+        );
+        // Last run inside the current pause: a quiet session must not become
+        // a periodic cron — no re-fire, however much time passes.
+        assert_eq!(
+            match_moments(
+                &f,
+                &[ForkMoment::Tick {
+                    now: 99_000,
+                    pause_started_at: Some(4100)
+                }],
+                240,
+                Some(4200),
+                0
+            ),
+            None
+        );
+        // Busy poll (no pause): the same fork fires freely mid-run.
+        assert_eq!(
+            match_moments(
+                &f,
+                &[ForkMoment::Tick {
+                    now: 4300,
+                    pause_started_at: None
+                }],
+                240,
+                Some(4200),
+                0
+            ),
+            Some(ForkRunOn::Every { interval_secs: 60 })
+        );
     }
 }

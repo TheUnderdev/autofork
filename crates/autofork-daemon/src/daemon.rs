@@ -30,12 +30,17 @@ pub fn now() -> i64 {
 /// deadline whose fire time (`base + d`) has passed, and the wall-clock tick
 /// `every:` triggers are matched against (always present — per-fork interval
 /// math happens in selection, where the fork's last run is known).
+/// `pause_started_at` is `None` on a busy (mid-run) poll; on idle polls it
+/// gates `every:` to at most one fire per quiet stretch — a fork whose last
+/// run is inside the current pause has seen no activity since, so its
+/// interval must not turn a quiet session into a periodic cron.
 fn elapsed_moments(
     prompt_tokens: Option<u64>,
     max_tokens: u64,
     base: i64,
     deadlines: &[u64],
     up_to: i64,
+    pause_started_at: Option<i64>,
 ) -> Vec<ForkMoment> {
     let mut moments = Vec::new();
     if let Some(pt) = prompt_tokens {
@@ -49,7 +54,10 @@ fn elapsed_moments(
             moments.push(ForkMoment::Idle { deadline_secs: d });
         }
     }
-    moments.push(ForkMoment::Tick { now: up_to });
+    moments.push(ForkMoment::Tick {
+        now: up_to,
+        pause_started_at,
+    });
     moments
 }
 
@@ -473,10 +481,20 @@ impl Daemon {
         // Context thresholds are known immediately (the turn just ended);
         // idle forks come due as their deadlines elapse, `every:` intervals
         // at their absolute fire instants.
+        // Busy polls carry no pause: `every:` fires freely mid-run. Idle
+        // polls carry the pause start, capping `every:` at one fire per
+        // quiet stretch.
+        let pause_gate = if busy { None } else { Some(baseline) };
         let due_now = |slf: &Arc<Self>| -> bool {
-            let moments = elapsed_moments(prompt_tokens, max_tokens, baseline, &deadlines, now());
-            !moments.is_empty()
-                && !crate::planner::select_forks(slf, &session, &cfg, &moments).is_empty()
+            let moments = elapsed_moments(
+                prompt_tokens,
+                max_tokens,
+                baseline,
+                &deadlines,
+                now(),
+                pause_gate,
+            );
+            !crate::planner::select_forks(slf, &session, &cfg, &moments).is_empty()
         };
 
         let fire_instants: Vec<i64> = {
@@ -521,7 +539,14 @@ impl Daemon {
         // Phase C: re-evaluate over every moment elapsed by now (deadlines that
         // landed during the debounce join the batch), then issue one wake —
         // stamping throttles and latches at this point.
-        let moments = elapsed_moments(prompt_tokens, max_tokens, baseline, &deadlines, now());
+        let moments = elapsed_moments(
+            prompt_tokens,
+            max_tokens,
+            baseline,
+            &deadlines,
+            now(),
+            pause_gate,
+        );
         let selected = crate::planner::select_forks(self, &session, &cfg, &moments);
         if let Some((payload, forks)) = crate::planner::build_wake(self, &session, selected) {
             return ResponseBody::Wake {

@@ -1259,15 +1259,23 @@ fn every_fires_at_turn_boundary_without_a_long_idle() {
         "{payload}"
     );
 
-    // The run stamped at issuance restarts the interval: an immediate
-    // re-park fires again only after another full second, not instantly.
-    let t0 = std::time::Instant::now();
+    // Within the same quiet pause the interval must NOT re-fire — a quiet
+    // session is not a cron. The re-parked poll just stays parked.
     let rx = h.park_stop_wait(h.event(EventKind::Stop, "s1"));
-    let _ = wake_payload(rx.recv_timeout(Duration::from_secs(10)).unwrap());
     assert!(
-        t0.elapsed() >= Duration::from_millis(900),
-        "re-fired too soon: {:?}",
-        t0.elapsed()
+        rx.recv_timeout(Duration::from_millis(2500)).is_err(),
+        "every re-fired during a quiet pause"
+    );
+
+    // Genuine activity starts a new pause; the next turn boundary fires
+    // again once the interval (measured from the last run) has elapsed.
+    assert_ack(h.send_event(h.prompt_submit("s1", true)));
+    let _ = rx.recv_timeout(Duration::from_secs(5)); // cancelled poll resolves
+    let rx = h.park_stop_wait(h.event(EventKind::Stop, "s1"));
+    let payload = wake_payload(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert!(
+        payload.contains("due: periodic (trigger: every:1)"),
+        "{payload}"
     );
 }
 
