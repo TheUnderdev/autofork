@@ -51,19 +51,35 @@ pub enum ForkMoment {
         prompt_tokens: u64,
         max_tokens: Option<u64>,
     },
+    /// Wall-clock evaluation point (unix seconds): every poll evaluation
+    /// carries one, so `every:` intervals can fire at turn boundaries — and,
+    /// on opencode, mid-run via busy polls.
+    Tick { now: i64 },
+}
+
+/// The base instant an `every:` interval measures from: the fork's last run
+/// when it has one, otherwise the session's start.
+pub fn every_base(last_run_at: Option<i64>, session_created_at: i64) -> i64 {
+    last_run_at.unwrap_or(session_created_at)
 }
 
 /// The first `run_on` trigger of `fork` matched by any of `moments`.
 /// Forks without an explicit `after_secs` on their idle trigger fire at the
-/// default idle deadline (`default_idle_secs`).
+/// default idle deadline (`default_idle_secs`). `every:` triggers measure
+/// from `last_run_at` (falling back to `session_created_at`).
 pub fn match_moments(
     fork: &ForkDef,
     moments: &[ForkMoment],
     default_idle_secs: u64,
+    last_run_at: Option<i64>,
+    session_created_at: i64,
 ) -> Option<ForkRunOn> {
     for moment in moments {
         for trigger in &fork.run_on {
             let hit = match (moment, trigger) {
+                (ForkMoment::Tick { now }, ForkRunOn::Every { interval_secs }) => {
+                    now - every_base(last_run_at, session_created_at) >= *interval_secs as i64
+                }
                 (ForkMoment::Idle { deadline_secs }, ForkRunOn::Idle { after_secs }) => {
                     let effective = after_secs.unwrap_or(default_idle_secs);
                     effective > 0 && effective == *deadline_secs
@@ -119,6 +135,29 @@ pub fn idle_deadlines<'a>(
     out
 }
 
+/// The absolute unix instants (ascending, deduped) at which the given forks'
+/// `every:` intervals next elapse. `ran_at` looks up a fork's last run by
+/// name; forks that never ran measure from `session_created_at`.
+pub fn every_fire_times<'a>(
+    forks: impl Iterator<Item = (&'a str, &'a ForkDef)>,
+    ran_at: impl Fn(&str) -> Option<i64>,
+    session_created_at: i64,
+) -> Vec<i64> {
+    let mut out: Vec<i64> = Vec::new();
+    for (name, fork) in forks {
+        for trigger in &fork.run_on {
+            if let ForkRunOn::Every { interval_secs } = trigger {
+                let fire = every_base(ran_at(name), session_created_at) + *interval_secs as i64;
+                if !out.contains(&fire) {
+                    out.push(fire);
+                }
+            }
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,11 +174,11 @@ mod tests {
     fn default_run_on_matches_default_idle() {
         let f = fork(default_run_on());
         assert_eq!(
-            match_moments(&f, &[ForkMoment::Idle { deadline_secs: 240 }], 240),
+            match_moments(&f, &[ForkMoment::Idle { deadline_secs: 240 }], 240, None, 0),
             Some(ForkRunOn::Idle { after_secs: None })
         );
         assert_eq!(
-            match_moments(&f, &[ForkMoment::Idle { deadline_secs: 600 }], 240),
+            match_moments(&f, &[ForkMoment::Idle { deadline_secs: 600 }], 240, None, 0),
             None
         );
     }
@@ -155,14 +194,16 @@ mod tests {
                 &[ForkMoment::Idle {
                     deadline_secs: 1200
                 }],
-                240
+                240,
+                None,
+                0
             ),
             Some(ForkRunOn::Idle {
                 after_secs: Some(1200)
             })
         );
         assert_eq!(
-            match_moments(&f, &[ForkMoment::Idle { deadline_secs: 240 }], 240),
+            match_moments(&f, &[ForkMoment::Idle { deadline_secs: 240 }], 240, None, 0),
             None
         );
     }
@@ -171,7 +212,7 @@ mod tests {
     fn zero_default_idle_never_fires() {
         let f = fork(vec![ForkRunOn::Idle { after_secs: None }]);
         assert_eq!(
-            match_moments(&f, &[ForkMoment::Idle { deadline_secs: 0 }], 0),
+            match_moments(&f, &[ForkMoment::Idle { deadline_secs: 0 }], 0, None, 0),
             None
         );
     }
@@ -184,7 +225,7 @@ mod tests {
             ForkRunOn::Boot,
         ]);
         assert_eq!(
-            match_moments(&f, &[ForkMoment::Idle { deadline_secs: 240 }], 240),
+            match_moments(&f, &[ForkMoment::Idle { deadline_secs: 240 }], 240, None, 0),
             None
         );
         assert_eq!(
@@ -194,7 +235,9 @@ mod tests {
                     prompt_tokens: 999_999,
                     max_tokens: Some(200_000)
                 }],
-                240
+                240,
+                None,
+                0
             ),
             None
         );
@@ -219,29 +262,29 @@ mod tests {
             max_tokens: None,
         }];
 
-        assert_eq!(match_moments(&tokens, &low, 240), None);
+        assert_eq!(match_moments(&tokens, &low, 240, None, 0), None);
         assert_eq!(
-            match_moments(&tokens, &high, 240),
+            match_moments(&tokens, &high, 240, None, 0),
             Some(ForkRunOn::ContextTokens(100_000))
         );
         assert_eq!(
-            match_moments(&tokens, &no_max, 240),
+            match_moments(&tokens, &no_max, 240, None, 0),
             Some(ForkRunOn::ContextTokens(100_000))
         );
 
-        assert_eq!(match_moments(&used, &low, 240), None);
+        assert_eq!(match_moments(&used, &low, 240, None, 0), None);
         assert_eq!(
-            match_moments(&used, &high, 240),
+            match_moments(&used, &high, 240, None, 0),
             Some(ForkRunOn::ContextUsedPct(80))
         );
-        assert_eq!(match_moments(&used, &no_max, 240), None);
+        assert_eq!(match_moments(&used, &no_max, 240, None, 0), None);
 
-        assert_eq!(match_moments(&left, &low, 240), None);
+        assert_eq!(match_moments(&left, &low, 240, None, 0), None);
         assert_eq!(
-            match_moments(&left, &high, 240),
+            match_moments(&left, &high, 240, None, 0),
             Some(ForkRunOn::ContextLeft(50_000))
         );
-        assert_eq!(match_moments(&left, &no_max, 240), None);
+        assert_eq!(match_moments(&left, &no_max, 240, None, 0), None);
     }
 
     #[test]
@@ -290,7 +333,7 @@ mod tests {
                 Some(150_000),
             )),
         }];
-        assert_eq!(match_moments(&used, &at_150k, 240), None);
+        assert_eq!(match_moments(&used, &at_150k, 240, None, 0), None);
         let at_800k = [ForkMoment::Context {
             prompt_tokens: 800_000,
             max_tokens: Some(resolve_context_window(
@@ -299,7 +342,7 @@ mod tests {
             )),
         }];
         assert_eq!(
-            match_moments(&used, &at_800k, 240),
+            match_moments(&used, &at_800k, 240, None, 0),
             Some(ForkRunOn::ContextUsedPct(75))
         );
     }
@@ -324,5 +367,74 @@ mod tests {
         ];
         assert_eq!(idle_deadlines(forks.iter(), 240), vec![240, 600, 1200]);
         assert_eq!(idle_deadlines(forks.iter(), 0), vec![600, 1200]);
+    }
+
+    #[test]
+    fn every_matches_on_tick_after_interval() {
+        let f = fork(vec![ForkRunOn::Every {
+            interval_secs: 3600,
+        }]);
+        // Never ran: measured from session start.
+        assert_eq!(
+            match_moments(
+                &f,
+                &[ForkMoment::Tick { now: 1000 + 3599 }],
+                240,
+                None,
+                1000
+            ),
+            None
+        );
+        assert_eq!(
+            match_moments(
+                &f,
+                &[ForkMoment::Tick { now: 1000 + 3600 }],
+                240,
+                None,
+                1000
+            ),
+            Some(ForkRunOn::Every {
+                interval_secs: 3600
+            })
+        );
+        // Ran before: measured from the last run, not session start.
+        assert_eq!(
+            match_moments(&f, &[ForkMoment::Tick { now: 9000 }], 240, Some(6000), 1000),
+            None
+        );
+        assert_eq!(
+            match_moments(&f, &[ForkMoment::Tick { now: 9600 }], 240, Some(6000), 1000),
+            Some(ForkRunOn::Every {
+                interval_secs: 3600
+            })
+        );
+    }
+
+    #[test]
+    fn idle_never_matches_a_tick() {
+        let f = fork(vec![ForkRunOn::Idle {
+            after_secs: Some(1),
+        }]);
+        assert_eq!(
+            match_moments(&f, &[ForkMoment::Tick { now: 999_999 }], 240, None, 0),
+            None
+        );
+    }
+
+    #[test]
+    fn every_fire_time_collection() {
+        let periodic = fork(vec![ForkRunOn::Every { interval_secs: 100 }]);
+        let idle_only = fork(vec![ForkRunOn::Idle { after_secs: None }]);
+        let both = fork(vec![
+            ForkRunOn::Idle {
+                after_secs: Some(60),
+            },
+            ForkRunOn::Every { interval_secs: 500 },
+        ]);
+        let forks = [("a", &periodic), ("b", &idle_only), ("c", &both)];
+        let ran = |name: &str| (name == "a").then_some(2000i64);
+        let times = every_fire_times(forks.iter().map(|&(n, f)| (n, f)), ran, 1000);
+        // a: 2000+100; c: never ran, 1000+500. b contributes nothing.
+        assert_eq!(times, vec![1500, 2100]);
     }
 }

@@ -85,6 +85,7 @@ fn run_hook_inner(kind: HookKind) -> Option<()> {
         notif_status: None,
         context_tokens: None,
         client: None,
+        busy: None,
     };
 
     match kind {

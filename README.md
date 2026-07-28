@@ -138,6 +138,12 @@ Moments for `run_on`:
 - `idle: 20m` — a custom idle deadline
 - `context_tokens: 150000` / `context_used: 80%` / `context_left: 20000` — context-size thresholds,
   each firing at most once per session
+- `every: 1h` — at least this long since the fork's last run (before the first run: since the
+  session began), **without waiting for a pause**: it fires at the first turn boundary past the
+  interval, however brief the pause — and in opencode sessions it fires even *mid-run* (the plugin
+  keeps a poll parked while the session is busy), so hour-long autonomous runs still get their
+  periodic forks. Combine with `idle:` for "on a 4-minute pause, or hourly regardless":
+  `run_on: [idle: 4m, every: 1h]` — an idle-triggered run resets the hourly clock.
 
 Unknown keys are ignored; invalid values warn and fall back to defaults (`autofork forks` shows the
 warnings). Fork bodies should be **idempotent** — a fork may fire on any idle pause.
@@ -314,6 +320,12 @@ session lifecycle events and talks to the same autofork daemon; when a fork come
 
 Fork-run sessions are titled `autofork/<fork> (<trigger>)` in the session list; delete them freely,
 the report already lives in your session.
+
+`every:` triggers get their strongest form here: the plugin parks a poll even while the session is
+**busy**, so an `every: 1h` fork fires in the middle of an hour-long run — the fork copies the
+conversation as it stands mid-run, and its report is injected as a message the in-flight run picks
+up on a later step. (On Claude Code, `every:` fires at the first turn boundary past the interval —
+there is no mid-turn hook.)
 
 ### Cache economics on opencode
 

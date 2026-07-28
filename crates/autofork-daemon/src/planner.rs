@@ -53,6 +53,9 @@ fn latch_key_for(trigger: &ForkRunOn, pause_epoch: i64) -> Option<String> {
         ForkRunOn::ContextTokens(_) | ForkRunOn::ContextUsedPct(_) | ForkRunOn::ContextLeft(_) => {
             Some(trigger.label())
         }
+        // `every` needs no latch: its own interval (measured from the run
+        // stamped at issuance) is the re-fire guard.
+        ForkRunOn::Every { .. } => None,
         _ => None,
     }
 }
@@ -117,8 +120,13 @@ pub fn select_forks(
         if !tags_allowed(&parsed.def.tags, effective_enable, effective_disable) {
             continue;
         }
-        let Some(trigger) = match_moments(&parsed.def, moments, cfg.default_idle_deadline_secs)
-        else {
+        let Some(trigger) = match_moments(
+            &parsed.def,
+            moments,
+            cfg.default_idle_deadline_secs,
+            entry.ran_at,
+            session.created_at,
+        ) else {
             continue;
         };
         // Per-fork throttle.

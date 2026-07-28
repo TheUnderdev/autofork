@@ -26,8 +26,10 @@ pub fn now() -> i64 {
 }
 
 /// Every fork moment that has elapsed for a session by `up_to`: the context
-/// gauge (if known, always "elapsed" the instant the turn ended) plus every
-/// idle deadline whose fire time (`base + d`) has passed.
+/// gauge (if known, always "elapsed" the instant the turn ended), every idle
+/// deadline whose fire time (`base + d`) has passed, and the wall-clock tick
+/// `every:` triggers are matched against (always present — per-fork interval
+/// math happens in selection, where the fork's last run is known).
 fn elapsed_moments(
     prompt_tokens: Option<u64>,
     max_tokens: u64,
@@ -47,6 +49,7 @@ fn elapsed_moments(
             moments.push(ForkMoment::Idle { deadline_secs: d });
         }
     }
+    moments.push(ForkMoment::Tick { now: up_to });
     moments
 }
 
@@ -364,6 +367,10 @@ impl Daemon {
         // A new poll parking proves the session is alive.
         self.clear_pending_close(&ev.session_id);
         let t = now();
+        // A busy poll (opencode parks one mid-run so `every:`/context
+        // triggers can fire without a pause) must not start a pause or arm
+        // idle deadlines — the session is still working.
+        let busy = ev.busy.unwrap_or(false);
         let enable_tags = ev.enable_tags.as_ref().map(|v| v.join(","));
         let disable_tags = ev.disable_tags.as_ref().map(|v| v.join(","));
         {
@@ -381,7 +388,9 @@ impl Daemon {
             let _ = store.set_last_activity(&ev.session_id, t);
             // The first Stop of a pause sets the baseline; a wake-turn's own
             // Stop keeps the existing one, so idle deadlines don't reset.
-            let _ = store.set_pause_started_at_if_unset(&ev.session_id, t);
+            if !busy {
+                let _ = store.set_pause_started_at_if_unset(&ev.session_id, t);
+            }
         }
         // Clients that track usage themselves (opencode) report the gauge on
         // the event; otherwise it comes from the transcript delta.
@@ -430,31 +439,56 @@ impl Daemon {
         // an under-assumed window.
         let max_tokens = resolve_context_window(session.model.as_deref(), prompt_tokens);
 
-        // Idle deadlines (seconds from the baseline) this session's forks need.
-        let deadlines = {
-            let (entries, _) = autofork_core::discovery::discover_forks(
-                &session.cwd,
-                Some(&self.user_forks_root()),
-            );
+        // Idle deadlines (seconds from the baseline) this session's forks
+        // need — none on a busy poll (the session isn't pausing) — plus the
+        // absolute instants at which `every:` intervals next elapse.
+        let (entries, _) =
+            autofork_core::discovery::discover_forks(&session.cwd, Some(&self.user_forks_root()));
+        let deadlines = if busy {
+            Vec::new()
+        } else {
             idle_deadlines(
                 entries.iter().map(|e| &e.parsed.def),
                 cfg.default_idle_deadline_secs,
             )
         };
+        let every_times = {
+            let ran: std::collections::HashMap<String, Option<i64>> = {
+                let store = self.store.lock().unwrap();
+                store
+                    .roster(&session.session_id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|e| (e.fork_name, e.ran_at))
+                    .collect()
+            };
+            autofork_core::moments::every_fire_times(
+                entries.iter().map(|e| (e.name.as_str(), &e.parsed.def)),
+                |name| ran.get(name).copied().flatten(),
+                session.created_at,
+            )
+        };
 
         // Phase A: find the first instant ≥1 fork is due (read-only eval).
         // Context thresholds are known immediately (the turn just ended);
-        // idle forks come due as their deadlines elapse.
+        // idle forks come due as their deadlines elapse, `every:` intervals
+        // at their absolute fire instants.
         let due_now = |slf: &Arc<Self>| -> bool {
             let moments = elapsed_moments(prompt_tokens, max_tokens, baseline, &deadlines, now());
             !moments.is_empty()
                 && !crate::planner::select_forks(slf, &session, &cfg, &moments).is_empty()
         };
 
+        let fire_instants: Vec<i64> = {
+            let mut v: Vec<i64> = deadlines.iter().map(|&d| baseline + d as i64).collect();
+            v.extend(every_times);
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
         let mut due = due_now(self);
         if !due {
-            for &d in &deadlines {
-                let fire_at = baseline + d as i64;
+            for &fire_at in &fire_instants {
                 let wait = (fire_at - now()).max(0) as u64;
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(wait)) => {

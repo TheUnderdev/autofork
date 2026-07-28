@@ -75,6 +75,11 @@ pub enum ForkRunOn {
     ContextUsedPct(u8),
     /// At most this many tokens remain in the model's context window.
     ContextLeft(u64),
+    /// At least this many seconds since the fork's last run (or, before the
+    /// first run, since the session began) — evaluated at every turn
+    /// boundary, and on opencode also mid-run. Unlike `idle`, it does not
+    /// wait for a pause: the first evaluation point past the interval fires.
+    Every { interval_secs: u64 },
     /// Context compaction. Not supported since v0.5 (never fires).
     Compact,
     /// A new session starting. Not supported since v0.5 (never fires).
@@ -99,6 +104,7 @@ impl ForkRunOn {
             ForkRunOn::ContextTokens(n) => format!("context_tokens:{n}"),
             ForkRunOn::ContextUsedPct(p) => format!("context_used:{p}%"),
             ForkRunOn::ContextLeft(n) => format!("context_left:{n}"),
+            ForkRunOn::Every { interval_secs } => format!("every:{interval_secs}"),
             ForkRunOn::Compact => "compact".into(),
             ForkRunOn::SessionStart => "session_start".into(),
             ForkRunOn::SessionEnd => "session_end".into(),
@@ -115,6 +121,7 @@ impl ForkRunOn {
                 | ForkRunOn::ContextTokens(_)
                 | ForkRunOn::ContextUsedPct(_)
                 | ForkRunOn::ContextLeft(_)
+                | ForkRunOn::Every { .. }
         )
     }
 }
@@ -160,6 +167,9 @@ fn parse_run_on_entry(v: &serde_yaml::Value, warnings: &mut Vec<String>) -> Opti
                     "idle" => parse_duration_yaml(val).map(|s| ForkRunOn::Idle {
                         after_secs: Some(s),
                     }),
+                    "every" => parse_duration_yaml(val)
+                        .filter(|&s| s > 0)
+                        .map(|s| ForkRunOn::Every { interval_secs: s }),
                     "context_tokens" => parse_token_count(val).map(ForkRunOn::ContextTokens),
                     "context_used" => parse_percent(val).map(ForkRunOn::ContextUsedPct),
                     "context_left" => parse_token_count(val).map(ForkRunOn::ContextLeft),
@@ -749,5 +759,33 @@ mod tests {
         let p = parse("---\nfork: true\ndescription: d\n---");
         assert_eq!(p.def.description.as_deref(), Some("d"));
         assert_eq!(p.body, "");
+    }
+
+    #[test]
+    fn every_trigger_parses() {
+        let p = match parse_fork_file(
+            "periodic",
+            "---\nfork: true\nrun_on:\n  - every: 1h\n  - idle: 4m\n---\nbody",
+        ) {
+            ForkParse::Fork(p) => p,
+            other => panic!("expected fork, got {other:?}"),
+        };
+        assert_eq!(
+            p.def.run_on[0],
+            ForkRunOn::Every {
+                interval_secs: 3600
+            }
+        );
+        assert_eq!(p.def.run_on[0].label(), "every:3600");
+        assert!(p.def.run_on[0].is_supported());
+
+        // Zero intervals are rejected with a warning.
+        let z = match parse_fork_file("zero", "---\nfork: true\nrun_on:\n  - every: 0s\n---\nbody")
+        {
+            ForkParse::Fork(p) => p,
+            other => panic!("expected fork, got {other:?}"),
+        };
+        assert!(z.def.run_on.is_empty() || z.def.run_on[0] == ForkRunOn::Idle { after_secs: None });
+        assert!(z.warnings.iter().any(|w| w.contains("every")));
     }
 }

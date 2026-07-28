@@ -1,7 +1,7 @@
 {
   "name": "autofork",
   "displayName": "autofork",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "Forks for Claude Code: at idle and context-threshold moments an asyncRewake Stop hook has your session spawn background fork subagents that inherit its context and report back.",
   "author": {
     "name": "TheUnderdev",

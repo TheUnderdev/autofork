@@ -71,6 +71,10 @@ struct OcInput {
     /// fork-completed: `completed` / `failed` / `stopped`.
     #[serde(default)]
     status: Option<String>,
+    /// stop-wait: the session is mid-run (busy poll — `every:`/context
+    /// triggers only; no idle deadlines, no pause baseline).
+    #[serde(default)]
+    busy: Option<bool>,
 }
 
 pub fn run_hook(kind: OcHookKind) {
@@ -108,6 +112,7 @@ fn run_hook_inner(kind: OcHookKind) -> Option<()> {
         notif_status: None,
         context_tokens: input.context_tokens,
         client: Some(CLIENT.to_string()),
+        busy: input.busy,
     };
 
     match kind {

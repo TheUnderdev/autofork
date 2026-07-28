@@ -105,6 +105,11 @@ pub struct Event {
     /// The harness this event comes from (`"opencode"`; absent = Claude Code).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client: Option<String>,
+    /// For a StopWait: the session is mid-run, not pausing (opencode parks a
+    /// poll even while busy so `every:`/context triggers can fire mid-run).
+    /// A busy poll never arms idle deadlines or sets the pause baseline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub busy: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -273,6 +278,7 @@ mod tests {
                 notif_status: None,
                 context_tokens: None,
                 client: None,
+                busy: None,
             }),
         };
         let line = encode(&req).unwrap();

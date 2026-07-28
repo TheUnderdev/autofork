@@ -146,6 +146,7 @@ impl Harness {
             notif_status: None,
             context_tokens: None,
             client: None,
+            busy: None,
         }
     }
 
@@ -1236,4 +1237,70 @@ fn opencode_fork_completion_releases_after_dependent() {
     assert_eq!(forks[0].name, "beta");
     assert_eq!(forks[0].after, vec!["alpha".to_string()]);
     assert!(forks[0].prompt.contains("beta.md"));
+}
+
+// ---- `every:` interval trigger (turn-boundary and mid-run busy polls) ----
+
+#[test]
+fn every_fires_at_turn_boundary_without_a_long_idle() {
+    // Idle deadline far away: only `every` can fire this poll.
+    let mut h = Harness::new("1h", "0");
+    h.write_fork(
+        "periodic.md",
+        "---\nfork: true\nrun_on:\n  - every: 1s\n---\nPERIODIC",
+    );
+    h.start_daemon();
+
+    assert_ack(h.send_event(h.event(EventKind::SessionStart, "s1")));
+    let rx = h.park_stop_wait(h.event(EventKind::Stop, "s1"));
+    let payload = wake_payload(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert!(
+        payload.contains("due: periodic (trigger: every:1)"),
+        "{payload}"
+    );
+
+    // The run stamped at issuance restarts the interval: an immediate
+    // re-park fires again only after another full second, not instantly.
+    let t0 = std::time::Instant::now();
+    let rx = h.park_stop_wait(h.event(EventKind::Stop, "s1"));
+    let _ = wake_payload(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert!(
+        t0.elapsed() >= Duration::from_millis(900),
+        "re-fired too soon: {:?}",
+        t0.elapsed()
+    );
+}
+
+#[test]
+fn busy_poll_fires_every_but_never_idle() {
+    let mut h = Harness::new("1s", "0");
+    h.write_fork(
+        "idler.md",
+        "---\nfork: true\nrun_on:\n  - idle: 1s\n---\nIDLER",
+    );
+    h.write_fork(
+        "periodic.md",
+        "---\nfork: true\nrun_on:\n  - every: 1s\n---\nPERIODIC",
+    );
+    h.start_daemon();
+
+    assert_ack(h.send_event(oc_event(&h, EventKind::SessionStart, "oc1")));
+    // A busy (mid-run) poll: idle deadlines must not arm even though the
+    // idle fork's 1s deadline would elapse well within the wait.
+    let mut ev = oc_event(&h, EventKind::Stop, "oc1");
+    ev.busy = Some(true);
+    let rx = h.park_stop_wait(ev);
+    let forks = wake_forks(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert_eq!(
+        forks.len(),
+        1,
+        "only the every fork may fire on a busy poll"
+    );
+    assert_eq!(forks[0].name, "periodic");
+    assert_eq!(forks[0].trigger, "every:1");
+
+    // A subsequent idle poll still fires the idle fork normally.
+    let rx = h.park_stop_wait(oc_event(&h, EventKind::Stop, "oc1"));
+    let forks = wake_forks(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert!(forks.iter().any(|f| f.name == "idler"), "{forks:?}");
 }

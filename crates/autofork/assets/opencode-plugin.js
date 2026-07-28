@@ -94,33 +94,44 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
     await call("session-start", { session_id: id, model: s.model?.modelID });
   }
 
+  // Park a stop-wait poll for the session's *current* mode. Idle polls are
+  // the turn-boundary long poll (idle deadlines + every + context); busy
+  // polls ride along mid-run so `every:` and context triggers can fire
+  // without waiting for a pause (the daemon arms no idle deadlines for
+  // them). A mode change parks a replacement poll — the daemon cancels the
+  // superseded one, whose resolution is ignored via the marker check.
   async function park(id) {
-    if (parked.has(id)) return;
+    if (ignored.has(id) || !sessions.has(id)) return;
     const s = sessionState(id);
-    const marker = {};
+    const mode = s.lastStatus === "busy" ? "busy" : "idle";
+    if (parked.get(id)?.mode === mode) return;
+    const marker = { mode };
     parked.set(id, marker);
     const startedAt = Date.now();
     const res = await call("stop-wait", {
       session_id: id,
       model: s.model?.modelID,
       context_tokens: s.tokens ?? undefined,
+      ...(mode === "busy" ? { busy: true } : {}),
     });
-    if (parked.get(id) === marker) parked.delete(id);
+    const superseded = parked.get(id) !== marker;
+    if (!superseded) parked.delete(id);
     if (res?.wake?.forks?.length) {
       await executeWake(id, res.wake.forks);
     }
+    if (superseded || parked.has(id)) return;
     // Whether this was a wake, a cancel, a daemon retire, or an after-release
-    // nudge: as long as the session is still idle, keep a poll parked (with a
+    // nudge: keep a poll parked for whatever the session is doing now (with a
     // backoff so a misbehaving daemon can't spin us). A short-lived poll that
     // resolved without a wake is the suspicious case; wakes and long parks
     // reset the backoff.
-    if (sessionState(id).lastStatus !== "idle" || parked.has(id)) return;
+    if (ignored.has(id) || !sessions.has(id)) return;
     const b = backoff.get(id) ?? { delay: 1000 };
     const longPark = Date.now() - startedAt > 5000;
     b.delay = res?.wake || longPark ? 1000 : Math.min(b.delay * 2, 60000);
     backoff.set(id, b);
     await new Promise((r) => setTimeout(r, b.delay));
-    if (sessionState(id).lastStatus === "idle" && !parked.has(id)) await park(id);
+    if (!parked.has(id)) await park(id);
   }
 
   async function executeWake(parentID, forks) {
@@ -254,9 +265,12 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
           // Transition only: opencode republishes `busy` every tool
           // round-trip, but one turn is one pause-ending activity. A genuine
           // turn started (our report injections never start one): cancels any
-          // parked poll, begins a new pause.
+          // parked poll, begins a new pause. Then park a busy poll so
+          // `every:`/context forks can still fire mid-run.
           await ensureStarted(id);
           await call("prompt-submit", { session_id: id });
+          backoff.delete(id);
+          await park(id);
         }
         return;
       }
