@@ -102,6 +102,14 @@ pub struct Event {
     /// Takes precedence over transcript parsing when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_tokens: Option<u64>,
+    /// The session's real context window in tokens, reported by clients that
+    /// know it (opencode reads the model's `limit.context` from its catalog).
+    /// Wins over the model-id window heuristics — opencode model ids never
+    /// carry Claude Code's `[1m]` marker, so without this a 1M session was
+    /// judged against the 200k default (`context_used: 75%` fired at 150k =
+    /// 15% of the real window). Additive field (no proto bump).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
     /// The harness this event comes from (`"opencode"`; absent = Claude Code).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client: Option<String>,
@@ -277,6 +285,7 @@ mod tests {
                 notif_task_id: None,
                 notif_status: None,
                 context_tokens: None,
+                context_window: None,
                 client: None,
                 busy: None,
             }),

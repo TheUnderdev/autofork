@@ -15,25 +15,36 @@ pub const DEFAULT_CONTEXT_WINDOW: u64 = 200_000;
 /// session's model id (e.g. `claude-opus-4-8[1m]`).
 pub const CONTEXT_WINDOW_1M: u64 = 1_000_000;
 
-/// The context window for a session, resolved from the model id Claude Code
-/// reports in hook input and the observed gauge. The hook-side model string
-/// keeps the `[1m]` marker (the transcript's `message.model` strips it), so
-/// marked sessions get the 1M window. Fable/Mythos-family models are 1M
-/// unconditionally — their window has no 200k variant, so the bare id is
+/// The context window for a session. A window the client reported explicitly
+/// (opencode reads the model's `limit.context` from its catalog, which
+/// includes user config overrides) wins outright — the model-id heuristics
+/// exist only for clients that report nothing. Claude Code's hook-side model
+/// string keeps the `[1m]` marker (the transcript's `message.model` strips
+/// it), so marked sessions get the 1M window; Fable/Mythos-family models are
+/// 1M unconditionally — their window has no 200k variant, so the bare id is
 /// enough. A gauge that already exceeds the resolved window proves it wrong —
-/// the window bumps to the 1M tier (belt for sessions whose events never
-/// carried a model), and beyond that to the gauge itself so `context_used`
-/// saturates at 100% instead of overshooting.
-pub fn resolve_context_window(model: Option<&str>, prompt_tokens: Option<u64>) -> u64 {
-    let mut window = match model {
+/// a heuristic window bumps to the 1M tier (belt for sessions whose events
+/// never carried a model) and beyond that to the gauge itself; a reported
+/// window saturates at the gauge, so `context_used` never overshoots 100%.
+pub fn resolve_context_window(
+    model: Option<&str>,
+    prompt_tokens: Option<u64>,
+    reported: Option<u64>,
+) -> u64 {
+    let reported = reported.filter(|&w| w > 0);
+    let mut window = reported.unwrap_or(match model {
         Some(m) if m.contains("[1m]") || m.contains("fable") || m.contains("mythos") => {
             CONTEXT_WINDOW_1M
         }
         _ => DEFAULT_CONTEXT_WINDOW,
-    };
+    });
     if let Some(pt) = prompt_tokens {
         if pt > window {
-            window = CONTEXT_WINDOW_1M.max(pt);
+            window = if reported.is_some() {
+                pt
+            } else {
+                CONTEXT_WINDOW_1M.max(pt)
+            };
         }
     }
     window
@@ -314,35 +325,64 @@ mod tests {
     #[test]
     fn window_resolution() {
         // No model, small gauge: the default window.
-        assert_eq!(resolve_context_window(None, Some(90_000)), 200_000);
+        assert_eq!(resolve_context_window(None, Some(90_000), None), 200_000);
         assert_eq!(
-            resolve_context_window(Some("claude-opus-4-8"), None),
+            resolve_context_window(Some("claude-opus-4-8"), None, None),
             200_000
         );
         // The [1m] marker selects the 1M window regardless of gauge.
         assert_eq!(
-            resolve_context_window(Some("claude-opus-4-8[1m]"), Some(150_000)),
+            resolve_context_window(Some("claude-opus-4-8[1m]"), Some(150_000), None),
             1_000_000
         );
         // Fable/Mythos models are always 1M — no marker needed.
         assert_eq!(
-            resolve_context_window(Some("claude-fable-5"), Some(50_000)),
+            resolve_context_window(Some("claude-fable-5"), Some(50_000), None),
             1_000_000
         );
         assert_eq!(
-            resolve_context_window(Some("claude-mythos-5"), None),
+            resolve_context_window(Some("claude-mythos-5"), None, None),
             1_000_000
         );
         // A gauge over the assumed window bumps to the 1M tier (model unknown
         // or unmarked), and past 1M the gauge itself becomes the window.
-        assert_eq!(resolve_context_window(None, Some(397_929)), 1_000_000);
+        assert_eq!(resolve_context_window(None, Some(397_929), None), 1_000_000);
         assert_eq!(
-            resolve_context_window(Some("claude-opus-4-8"), Some(250_000)),
+            resolve_context_window(Some("claude-opus-4-8"), Some(250_000), None),
             1_000_000
         );
         assert_eq!(
-            resolve_context_window(Some("m[1m]"), Some(1_200_000)),
+            resolve_context_window(Some("m[1m]"), Some(1_200_000), None),
             1_200_000
+        );
+    }
+
+    #[test]
+    fn reported_window_wins_over_heuristics() {
+        // The opencode regression: a bare model id (no [1m], not
+        // fable/mythos) with an explicitly reported 1M window must use 1M —
+        // before this, the 200k default made `context_used: 75%` fire at
+        // 150k (15% of the real window).
+        assert_eq!(
+            resolve_context_window(Some("claude-sonnet-4-5"), Some(150_000), Some(1_000_000)),
+            1_000_000
+        );
+        // A reported window also wins downward: a genuinely small model must
+        // not be assumed 200k.
+        assert_eq!(
+            resolve_context_window(Some("some-local-model"), Some(10_000), Some(32_000)),
+            32_000
+        );
+        // A gauge over a reported window saturates at the gauge (used never
+        // overshoots 100%) without jumping to the 1M tier.
+        assert_eq!(
+            resolve_context_window(Some("some-local-model"), Some(40_000), Some(32_000)),
+            40_000
+        );
+        // A nonsense zero report falls back to the heuristics.
+        assert_eq!(
+            resolve_context_window(Some("claude-opus-4-8[1m]"), None, Some(0)),
+            1_000_000
         );
     }
 
@@ -355,6 +395,7 @@ mod tests {
             max_tokens: Some(resolve_context_window(
                 Some("claude-opus-4-8[1m]"),
                 Some(150_000),
+                None,
             )),
         }];
         assert_eq!(match_moments(&used, &at_150k, 240, None, 0), None);
@@ -363,6 +404,7 @@ mod tests {
             max_tokens: Some(resolve_context_window(
                 Some("claude-opus-4-8[1m]"),
                 Some(800_000),
+                None,
             )),
         }];
         assert_eq!(

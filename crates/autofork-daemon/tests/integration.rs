@@ -145,6 +145,7 @@ impl Harness {
             notif_task_id: None,
             notif_status: None,
             context_tokens: None,
+            context_window: None,
             client: None,
             busy: None,
         }
@@ -1185,6 +1186,52 @@ fn opencode_context_gauge_rides_on_the_event() {
     assert_eq!(forks.len(), 1);
     assert_eq!(forks[0].name, "distill");
     assert_eq!(forks[0].trigger, "context_used:50%");
+}
+
+#[test]
+fn opencode_reported_window_governs_context_thresholds() {
+    // The 1M regression: opencode model ids never carry the `[1m]` marker,
+    // so without a reported window the 200k default judged `context_used:
+    // 75%` at 150k — 15% of the real 1M window.
+    let mut h = Harness::new("1h", "0"); // long idle: only context can fire
+    h.write_fork(
+        "distill.md",
+        "---\nfork: true\nrun_on:\n  - context_used: 75%\n---\nDISTILL",
+    );
+    h.start_daemon();
+
+    assert_ack(h.send_event(oc_event(&h, EventKind::SessionStart, "oc1")));
+
+    // 150k gauge on a reported 1M window is 15% used: nothing fires, even
+    // though it clears 75% of the 200k the heuristic would assume. Cancel
+    // the parked poll with a genuine prompt.
+    let mut low = oc_event(&h, EventKind::Stop, "oc1");
+    low.model = Some("claude-sonnet-4-5".to_string());
+    low.context_tokens = Some(150_000);
+    low.context_window = Some(1_000_000);
+    let rx = h.park_stop_wait(low);
+    std::thread::sleep(Duration::from_millis(400));
+    assert_ack(h.send_event({
+        let mut ev = oc_event(&h, EventKind::PromptSubmit, "oc1");
+        ev.waking = Some(true);
+        ev
+    }));
+    assert!(matches!(
+        rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        ResponseBody::Waited
+    ));
+
+    // 800k of 1M is past the threshold: the poll wakes. The window rides on
+    // the session row too, so this poll could even omit it.
+    let mut high = oc_event(&h, EventKind::Stop, "oc1");
+    high.model = Some("claude-sonnet-4-5".to_string());
+    high.context_tokens = Some(800_000);
+    high.context_window = Some(1_000_000);
+    let rx = h.park_stop_wait(high);
+    let forks = wake_forks(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert_eq!(forks.len(), 1);
+    assert_eq!(forks[0].name, "distill");
+    assert_eq!(forks[0].trigger, "context_used:75%");
 }
 
 #[test]

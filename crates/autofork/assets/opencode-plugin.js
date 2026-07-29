@@ -36,6 +36,33 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
 
   const reportKey = (parentID, fork) => `${parentID}::${fork}`;
 
+  // "providerID/modelID" -> real context window (limit.context), from the
+  // provider catalog (models.dev plus the user's config overrides). Without
+  // it the daemon falls back to a model-id heuristic that assumes 200k —
+  // which judged `context_used: 75%` at 150k on 1M sessions (opencode model
+  // ids never carry Claude Code's `[1m]` marker). Fetched once per plugin
+  // life; a failed fetch retries on the next lookup.
+  let modelLimits = null;
+  async function contextWindow(model) {
+    if (!model?.providerID || !model.modelID) return undefined;
+    if (!modelLimits) {
+      try {
+        const res = await client.config.providers();
+        const limits = new Map();
+        for (const p of res?.data?.providers ?? []) {
+          for (const [id, m] of Object.entries(p.models ?? {})) {
+            if (m?.limit?.context) limits.set(`${p.id}/${id}`, m.limit.context);
+          }
+        }
+        if (limits.size === 0) return undefined;
+        modelLimits = limits;
+      } catch {
+        return undefined;
+      }
+    }
+    return modelLimits.get(`${model.providerID}/${model.modelID}`);
+  }
+
   async function call(kind, payload, marker) {
     try {
       const proc = Bun.spawn([BIN, "opencode", "hook", kind], {
@@ -92,7 +119,11 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
     const s = sessionState(id);
     if (s.started) return;
     s.started = true;
-    await call("session-start", { session_id: id, model: s.model?.modelID });
+    await call("session-start", {
+      session_id: id,
+      model: s.model?.modelID,
+      context_window: await contextWindow(s.model),
+    });
   }
 
   // Park a stop-wait poll for the session's *current* mode. Idle polls are
@@ -115,6 +146,7 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
         session_id: id,
         model: s.model?.modelID,
         context_tokens: s.tokens ?? undefined,
+        context_window: await contextWindow(s.model),
         ...(mode === "busy" ? { busy: true } : {}),
       },
       marker,

@@ -84,6 +84,7 @@ fn run_hook_inner(kind: HookKind) -> Option<()> {
         notif_task_id: None,
         notif_status: None,
         context_tokens: None,
+        context_window: None,
         client: None,
         busy: None,
     };

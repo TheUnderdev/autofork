@@ -62,6 +62,10 @@ struct OcInput {
     /// write of the last assistant step).
     #[serde(default)]
     context_tokens: Option<u64>,
+    /// The model's real context window (`limit.context` from opencode's
+    /// provider catalog), for context-threshold resolution.
+    #[serde(default)]
+    context_window: Option<u64>,
     /// fork-spawned / fork-completed: the fork's name.
     #[serde(default)]
     fork: Option<String>,
@@ -109,6 +113,7 @@ fn run_hook_inner(kind: OcHookKind) -> Option<()> {
         notif_task_id: None,
         notif_status: None,
         context_tokens: input.context_tokens,
+        context_window: input.context_window,
         client: Some(CLIENT.to_string()),
         busy: input.busy,
     };
@@ -338,11 +343,13 @@ mod tests {
         assert!(min.model.is_none());
         let full: OcInput = serde_json::from_str(
             r#"{"session_id":"s","directory":"/p","worktree":"/w","model":"claude-haiku-4-5",
-                "context_tokens":1234,"fork":"journal","run_ref":"ses_x","status":"completed"}"#,
+                "context_tokens":1234,"context_window":1000000,
+                "fork":"journal","run_ref":"ses_x","status":"completed"}"#,
         )
         .unwrap();
         assert_eq!(full.worktree.as_deref(), Some(std::path::Path::new("/w")));
         assert_eq!(full.context_tokens, Some(1234));
+        assert_eq!(full.context_window, Some(1_000_000));
         assert_eq!(full.status.as_deref(), Some("completed"));
     }
 }

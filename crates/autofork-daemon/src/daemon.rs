@@ -270,6 +270,9 @@ impl Daemon {
                     disable_tags.as_deref(),
                     t,
                 );
+                if let Some(w) = ev.context_window {
+                    let _ = store.set_context_window(&ev.session_id, w);
+                }
                 ResponseBody::Ack
             }
             EventKind::PromptSubmit => {
@@ -394,6 +397,9 @@ impl Daemon {
                 t,
             );
             let _ = store.set_last_activity(&ev.session_id, t);
+            if let Some(w) = ev.context_window {
+                let _ = store.set_context_window(&ev.session_id, w);
+            }
             // The first Stop of a pause sets the baseline; a wake-turn's own
             // Stop keeps the existing one, so idle deadlines don't reset.
             if !busy {
@@ -441,11 +447,16 @@ impl Daemon {
         // Idle timing is measured from the pause baseline (the first Stop of
         // this pause), so a wake-turn's own Stop doesn't restart the clock.
         let baseline = session.pause_started_at.unwrap_or(t);
-        // Context thresholds are judged against the session's real window: the
+        // Context thresholds are judged against the session's real window: an
+        // explicitly reported window (opencode's model catalog) wins; else the
         // hook-reported model id keeps Claude Code's `[1m]` marker (the session
         // row holds the latest non-null value), and an oversized gauge bumps
         // an under-assumed window.
-        let max_tokens = resolve_context_window(session.model.as_deref(), prompt_tokens);
+        let max_tokens = resolve_context_window(
+            session.model.as_deref(),
+            prompt_tokens,
+            session.context_window,
+        );
 
         // Idle deadlines (seconds from the baseline) this session's forks
         // need — none on a busy poll (the session isn't pausing) — plus the

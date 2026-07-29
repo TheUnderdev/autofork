@@ -20,7 +20,7 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
-const SCHEMA_VERSION: i32 = 5;
+const SCHEMA_VERSION: i32 = 6;
 
 /// Split a comma-joined tag column back into a list (trimmed, empties
 /// dropped). `NULL` (unset) stays `None`.
@@ -45,6 +45,9 @@ pub struct SessionRow {
     pub transcript_offset: u64,
     pub prompt_tokens: Option<u64>,
     pub model: Option<String>,
+    /// The real context window the client reported (opencode); `None` = use
+    /// the model-id heuristics.
+    pub context_window: Option<u64>,
     pub created_at: i64,
     /// Per-session enable (whitelist) tag filter; `None` = unset.
     pub enable_tags: Option<Vec<String>>,
@@ -250,6 +253,15 @@ impl Store {
                  COMMIT;",
             )?;
         }
+        if version < 6 {
+            // The session's real context window, when the client reports one
+            // (opencode); NULL falls back to the model-id heuristics.
+            conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE sessions ADD COLUMN context_window INTEGER;
+                 COMMIT;",
+            )?;
+        }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(Self { conn })
     }
@@ -305,7 +317,8 @@ impl Store {
             .query_row(
                 "SELECT session_id, project_root, cwd, transcript_path, status, last_activity,
                         transcript_offset, prompt_tokens, model, created_at,
-                        enable_tags, disable_tags, pause_epoch, pause_started_at
+                        enable_tags, disable_tags, pause_epoch, pause_started_at,
+                        context_window
                  FROM sessions WHERE session_id = ?1",
                 params![session_id],
                 Self::row_to_session,
@@ -333,6 +346,7 @@ impl Store {
             disable_tags: split_tags(row.get::<_, Option<String>>(11)?),
             pause_epoch: row.get(12)?,
             pause_started_at: row.get(13)?,
+            context_window: row.get::<_, Option<i64>>(14)?.map(|n| n as u64),
         })
     }
 
@@ -366,7 +380,8 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT session_id, project_root, cwd, transcript_path, status, last_activity,
                     transcript_offset, prompt_tokens, model, created_at,
-                    enable_tags, disable_tags, pause_epoch, pause_started_at
+                    enable_tags, disable_tags, pause_epoch, pause_started_at,
+                    context_window
              FROM sessions WHERE status = 'open' ORDER BY last_activity DESC",
         )?;
         let rows = stmt.query_map([], Self::row_to_session)?;
@@ -387,6 +402,17 @@ impl Store {
         self.conn.execute(
             "UPDATE sessions SET prompt_tokens = ?2 WHERE session_id = ?1",
             params![session_id, prompt_tokens as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Set the session's real context window (clients that know it — opencode
+    /// — report it on the event). Kept across events that omit it, like
+    /// `model`.
+    pub fn set_context_window(&self, session_id: &str, window: u64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET context_window = ?2 WHERE session_id = ?1",
+            params![session_id, window as i64],
         )?;
         Ok(())
     }
