@@ -11,7 +11,10 @@ the fork's report arriving as a completion notification your agent relays when i
 
 > forks are **not** skills. A skill is something the model chooses to load and follow. A fork is
 > something the *harness* schedules at lifecycle moments the model never sees. A fork fires because
-> its `run_on` moment happened, full stop — there is no retrieval/RAG involved.
+> its `run_on` moment happened, full stop — there is no retrieval/RAG involved. (A fork *can* be
+> attached to a skill — a `FORK.md` next to a `SKILL.md` — but the skill stays a skill and the
+> fork stays a fork: the attachment only names the fork after the skill and makes sure the fork
+> sees the skill's instructions when it runs.)
 
 ## How a fork fires (v0.5)
 
@@ -86,8 +89,17 @@ For local development: `claude --plugin-dir ./plugin` inside this repo.
 
 ## Writing forks
 
-Forks live in `.autofork/forks/`, discovered upward from your project directory plus the
-user-level `~/.autofork/forks/`. Two layouts, mix freely (subfolders are just organization):
+Forks are discovered upward from your project directory and at the user level, from three
+kinds of places:
+
+- `.autofork/forks/` trees (autofork's own layout), plus the user-level `~/.autofork/forks/`
+- `.claude/forks/` trees — a `forks/` dir next to your skills dir — plus `~/.claude/forks/`
+- **skill folders**: a `FORK.md` next to a `SKILL.md` inside `.claude/skills/**` (or
+  `~/.claude/skills/`) defines a fork named after the skill — see
+  [Skill-attached forks](#skill-attached-forks) below
+
+Project definitions win name collisions over user-level ones (nearest first). Inside a forks
+root, two layouts mix freely (subfolders are just organization):
 
 ```
 .autofork/forks/
@@ -129,6 +141,7 @@ a missing marker can't silently disable a real fork. `fork: false` is an explici
 | `run_on` | list of moments, see below | `[idle]` |
 | `throttle` | min gap between runs: `30m`, `2h`, `90` (seconds) | none |
 | `after` | fork name(s) to run after: `journal`, `[a, b]` | — |
+| `priority` | ordering weight (z-index): lower spawns earlier, higher waits for the lower waves; equal = together | `0` |
 | `overlap` | `true` to allow two runs of this fork at once | `false` |
 | `tags` | labels for the enable/disable filter: `ci`, `[ci, review]` | — |
 
@@ -175,9 +188,32 @@ whole chain simply re-fires on the next pause) and when the session ends. Depend
 within one due batch: `after` sequences forks that come due together, it does not delay a fork
 until some other fork eventually runs.
 
+`priority` orders forks that come due together without naming them: the batch runs in ascending
+priority waves — a wave spawns once every fork of the lower waves has finished — and forks sharing
+a priority spawn together. Use `priority: 100` for "run this fork last no matter what else is
+defined", `-10` for "before everything". It is enforced the same way as `after` (higher waves are
+held by the daemon and released on the lower forks' completions), but the gate is order-only — no
+reports are piped. `after` wins over `priority`: a dependent's effective priority is lifted to at
+least its predecessors', so it can never jump ahead of something it must run after.
+
 By default two runs of the same fork never overlap: the wake block for a fork tells the model to
 skip spawning it if a previous run of that fork is still among its running background tasks. Set
 `overlap: true` to drop that line and allow concurrent runs.
+
+### Skill-attached forks
+
+A skill folder holding both a `SKILL.md` and a `FORK.md` defines a fork named after the skill.
+Use it for background duties that are really "apply this skill when the moment comes": the fork
+body can stay a one-liner because the spawn prompt tells the fork to **load the skill first if it
+isn't already in its inherited context**, then follow the fork body.
+
+```
+.claude/skills/changelog/
+├── SKILL.md        # the skill, as usual
+└── FORK.md         # fork: true + run_on — "apply the changelog skill to this session"
+```
+
+The same frontmatter keys apply; `autofork forks` shows the linked skill.
 
 ## CLI
 
@@ -345,9 +381,12 @@ Requires opencode >= 1.18 (the plugin uses the v1 plugin API and the session for
 
 ## Other tools
 
-The `.autofork/forks/` format is deliberately tool-agnostic; autofork is the reference
-implementation for Claude Code and opencode. Other agent harnesses are welcome to read the same
-fork definitions natively — the format spec above is the whole contract.
+The fork file format is deliberately tool-agnostic; autofork is the reference implementation for
+Claude Code and opencode. Other agent harnesses are welcome to read the same fork definitions
+natively — the format spec above is the whole contract. A harness with its own lifecycle may
+honor extra keys or moments as extensions (autofork warns about and ignores keys like `delivery`
+that only make sense elsewhere), and the reverse holds here: a definition written for such a
+harness degrades gracefully under autofork.
 
 ## License
 

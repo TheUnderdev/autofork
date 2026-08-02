@@ -232,6 +232,9 @@ pub fn list_forks(paths: &Paths, project: Option<std::path::PathBuf>) -> Result<
         if !f.after.is_empty() {
             details.push(format!("after: {}", f.after.join(", ")));
         }
+        if f.priority != 0 {
+            details.push(format!("priority: {}", f.priority));
+        }
         if !f.tags.is_empty() {
             details.push(format!("tags: {}", f.tags.join(", ")));
         }
@@ -240,6 +243,9 @@ pub fn list_forks(paths: &Paths, project: Option<std::path::PathBuf>) -> Result<
         }
         println!("      {}", details.join(" | "));
         println!("      {}", f.path.display());
+        if let Some(skill) = &f.skill {
+            println!("      skill: {}", skill.display());
+        }
         for w in &f.warnings {
             println!("      warning: {w}");
         }
@@ -257,7 +263,11 @@ pub fn run_fork(paths: &Paths, name: Option<String>, tag: Option<String>) -> Res
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let root = project_root(&cwd);
     let user_forks = paths.base.join("forks");
-    let (entries, _) = autofork_core::discovery::discover_forks(&cwd, Some(&user_forks));
+    let claude_dir = std::env::var_os("AUTOFORK_CLAUDE_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".claude")));
+    let (entries, _) =
+        autofork_core::discovery::discover_forks(&cwd, Some(&user_forks), claude_dir.as_deref());
 
     let picked: Vec<_> = match (&name, &tag) {
         (Some(name), _) => match entries.into_iter().find(|e| &e.name == name) {
@@ -293,6 +303,8 @@ pub fn run_fork(paths: &Paths, name: Option<String>, tag: Option<String>) -> Res
             trigger: "manual".to_string(),
             overlap: e.parsed.def.overlap,
             after: Vec::new(),
+            skill: autofork_core::discovery::skill_sibling(&e.path)
+                .map(|p| p.to_string_lossy().into_owned()),
         })
         .collect();
     let payload = build_wake_payload(

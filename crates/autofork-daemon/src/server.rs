@@ -147,17 +147,22 @@ async fn dispatch(daemon: &Arc<Daemon>, body: RequestBody) -> ResponseBody {
             project_root: _,
             cwd,
         } => {
-            let (entries, warnings) =
-                autofork_core::discovery::discover_forks(&cwd, Some(&daemon.user_forks_root()));
+            let (entries, warnings) = autofork_core::discovery::discover_forks(
+                &cwd,
+                Some(&daemon.user_forks_root()),
+                daemon.claude_dir().as_deref(),
+            );
             let items = entries
                 .into_iter()
                 .map(|e| ForkInfo {
+                    skill: autofork_core::discovery::skill_sibling(&e.path),
                     name: e.name,
                     path: e.path,
                     description: e.parsed.def.description.clone(),
                     triggers: e.parsed.def.run_on.iter().map(|r| r.label()).collect(),
                     throttle_secs: e.parsed.def.throttle_secs,
                     after: e.parsed.def.after.clone(),
+                    priority: e.parsed.def.priority,
                     overlap: e.parsed.def.overlap,
                     tags: e.parsed.def.tags.clone(),
                     warnings: e

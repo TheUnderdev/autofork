@@ -7,12 +7,12 @@
 //! notes, with a migration warning when they carry fork-like frontmatter.
 //!
 //! Supported top-level keys: `fork`, `description`, `run_on`, `throttle`,
-//! `after`, `overlap`, `tags`. Unknown keys are ignored for forward
-//! compatibility; invalid values warn and fall back rather than dropping the
-//! fork. The keys `delivery`, `model`, `allowed_tools`, `permission_mode` are
-//! parsed-and-ignored with a deprecation warning (v0.5 forks inherit the
-//! session's permissions and model; report delivery is native). There is
-//! deliberately no RAG surface in this format.
+//! `after`, `priority`, `overlap`, `tags`. Unknown keys are ignored for
+//! forward compatibility; invalid values warn and fall back rather than
+//! dropping the fork. The keys `delivery`, `model`, `allowed_tools`,
+//! `permission_mode` are parsed-and-ignored with a deprecation warning (v0.5
+//! forks inherit the session's permissions and model; report delivery is
+//! native). There is deliberately no RAG surface in this format.
 
 use crate::duration::parse_duration_yaml;
 use serde::Deserialize;
@@ -30,6 +30,12 @@ pub struct ForkDef {
     /// Sequencing: run after these forks finish at the same moment (empty =
     /// independent).
     pub after: Vec<String>,
+    /// Ordering weight across forks due at the same moment (z-index-like):
+    /// forks run in ascending priority waves — a wave starts once every fork
+    /// of the lower waves finished — and forks sharing a priority run in
+    /// parallel. `after` wins over priority: a dependent never runs before
+    /// its predecessors, whatever the numbers say. Default 0.
+    pub priority: i64,
     /// Whether two runs of this fork may overlap in time. Off by default.
     pub overlap: bool,
     /// Free-form tags used by the per-session enable/disable filter. Empty
@@ -44,6 +50,7 @@ impl Default for ForkDef {
             run_on: default_run_on(),
             throttle_secs: None,
             after: Vec::new(),
+            priority: 0,
             overlap: false,
             tags: Vec::new(),
         }
@@ -305,6 +312,8 @@ struct RawFork {
     #[serde(default)]
     after: Option<serde_yaml::Value>,
     #[serde(default)]
+    priority: Option<serde_yaml::Value>,
+    #[serde(default)]
     overlap: Option<serde_yaml::Value>,
     #[serde(default)]
     tags: Option<serde_yaml::Value>,
@@ -337,6 +346,7 @@ impl RawFork {
             || self.run_on.is_some()
             || self.throttle.is_some()
             || self.after.is_some()
+            || self.priority.is_some()
             || self.overlap.is_some()
             || self.tags.is_some()
             || self.delivery.is_some()
@@ -500,6 +510,20 @@ pub fn parse_fork_file(name: &str, content: &str) -> ForkParse {
         .map(|v| parse_after(v, name, &mut warnings))
         .unwrap_or_default();
 
+    let priority = match &raw.priority {
+        None => 0,
+        Some(serde_yaml::Value::Number(n)) if n.as_i64().is_some() => n.as_i64().unwrap(),
+        Some(serde_yaml::Value::String(s)) if s.trim().parse::<i64>().is_ok() => {
+            s.trim().parse().unwrap()
+        }
+        Some(_) => {
+            warnings.push(format!(
+                "fork '{name}': priority must be an integer; using 0"
+            ));
+            0
+        }
+    };
+
     let overlap = match &raw.overlap {
         None => false,
         Some(serde_yaml::Value::Bool(b)) => *b,
@@ -527,6 +551,7 @@ pub fn parse_fork_file(name: &str, content: &str) -> ForkParse {
             run_on,
             throttle_secs,
             after,
+            priority,
             overlap,
             tags,
         },
@@ -717,6 +742,38 @@ mod tests {
         let p = parse("---\nfork: true\noverlap: sometimes\n---\n");
         assert!(!p.def.overlap);
         assert!(p.warnings.iter().any(|w| w.contains("overlap")));
+    }
+
+    #[test]
+    fn priority_parsing() {
+        assert_eq!(parse("---\nfork: true\n---\n").def.priority, 0);
+        assert_eq!(
+            parse("---\nfork: true\npriority: 100\n---\n").def.priority,
+            100
+        );
+        assert_eq!(
+            parse("---\nfork: true\npriority: -5\n---\n").def.priority,
+            -5
+        );
+        assert_eq!(
+            parse("---\nfork: true\npriority: \"7\"\n---\n")
+                .def
+                .priority,
+            7
+        );
+        let p = parse("---\nfork: true\npriority: high\n---\n");
+        assert_eq!(p.def.priority, 0);
+        assert!(p.warnings.iter().any(|w| w.contains("priority")));
+    }
+
+    #[test]
+    fn priority_alone_is_fork_like() {
+        // A file with only `priority:` and no marker should trip the
+        // forgotten-marker guard rail.
+        assert!(matches!(
+            parse_fork_file("x", "---\npriority: 3\n---\n"),
+            ForkParse::NotFork { fork_like: true }
+        ));
     }
 
     #[test]

@@ -19,7 +19,7 @@ use autofork_core::config::Config;
 use autofork_core::frontmatter::{ForkParse, ForkRunOn};
 use autofork_core::moments::{match_moments, ForkMoment};
 use autofork_core::protocol::WakeFork;
-use autofork_core::schedule::{resolve_deps, Selected};
+use autofork_core::schedule::{effective_priorities, resolve_deps, Selected};
 use autofork_core::store::SessionRow;
 use autofork_core::tags::tags_allowed;
 use autofork_core::wake::{
@@ -36,6 +36,8 @@ pub struct SelectedFork {
     pub trigger: String,
     pub overlap: bool,
     pub after: Vec<String>,
+    /// Declared ordering weight (`priority:`, z-index-like; default 0).
+    pub priority: i64,
     pub tags: Vec<String>,
     /// The latch this fork consumes at wake-issuance, if any: `context_*`
     /// triggers latch once per session (key = the trigger label); `idle`
@@ -67,13 +69,19 @@ impl Selected for SelectedFork {
     fn after(&self) -> Vec<&str> {
         self.after.iter().map(|a| a.as_str()).collect()
     }
+    fn priority(&self) -> i64 {
+        self.priority
+    }
 }
 
 /// Refresh discovery for a session's cwd and queue every visible fork onto
 /// the session's roster.
 pub fn refresh_roster(daemon: &Arc<Daemon>, session_id: &str, cwd: &Path) {
-    let (entries, _) =
-        autofork_core::discovery::discover_forks(cwd, Some(&daemon.user_forks_root()));
+    let (entries, _) = autofork_core::discovery::discover_forks(
+        cwd,
+        Some(&daemon.user_forks_root()),
+        daemon.claude_dir().as_deref(),
+    );
     let store = daemon.store.lock().unwrap();
     let t = now();
     for entry in entries {
@@ -181,6 +189,7 @@ pub fn select_forks(
             trigger: label,
             overlap: parsed.def.overlap,
             after: parsed.def.after.clone(),
+            priority: parsed.def.priority,
             tags: parsed.def.tags.clone(),
             latch_key,
         });
@@ -224,8 +233,14 @@ pub fn build_wake(
         "issuing wake"
     );
 
-    // Resolve `after` dependencies within the selected set.
+    // Resolve `after` dependencies within the selected set, then layer the
+    // priority waves on top: each fork's effective priority is its declared
+    // one lifted to its predecessors' (`after` wins), and a fork gates on
+    // every batch-mate of strictly lower effective priority (order-only —
+    // those extra predecessors' reports are not piped).
     let deps = resolve_deps(&selected);
+    let eff = effective_priorities(&selected, &deps);
+    let min_eff = eff.iter().min().copied().unwrap_or(0);
 
     // Stamp throttles and latches at wake-issuance — dependents included:
     // their spawn is deferred, not reconsidered, so they must not re-enter
@@ -253,14 +268,26 @@ pub fn build_wake(
             if let Some(key) = &sel.latch_key {
                 let _ = store.try_latch_fire(&session.session_id, &sel.name, key, t);
             }
-            let preds: Vec<String> = deps[i].iter().map(|&j| selected[j].name.clone()).collect();
-            if preds.is_empty() {
+            let report_preds: Vec<String> =
+                deps[i].iter().map(|&j| selected[j].name.clone()).collect();
+            // The full gate: `after` deps plus every lower-wave batch-mate.
+            let mut gate = report_preds.clone();
+            if eff[i] > min_eff {
+                for (j, other) in selected.iter().enumerate() {
+                    if j != i && eff[j] < eff[i] && !gate.contains(&other.name) {
+                        gate.push(other.name.clone());
+                    }
+                }
+            }
+            if gate.is_empty() {
                 roots.push(DueFork {
                     name: sel.name.clone(),
                     path: sel.path.to_string_lossy().into_owned(),
                     trigger: sel.trigger.clone(),
                     overlap: sel.overlap,
                     after: Vec::new(),
+                    skill: autofork_core::discovery::skill_sibling(&sel.path)
+                        .map(|p| p.to_string_lossy().into_owned()),
                 });
             } else {
                 let _ = store.insert_pending_dep(
@@ -269,12 +296,13 @@ pub fn build_wake(
                     &sel.path,
                     &sel.trigger,
                     sel.overlap,
-                    &preds,
+                    &gate,
+                    &report_preds,
                     t,
                 );
                 held.push(HeldFork {
                     name: sel.name.clone(),
-                    after: preds,
+                    after: gate,
                 });
             }
         }
@@ -324,7 +352,11 @@ pub fn release_due(daemon: &Arc<Daemon>, session: &SessionRow) -> Option<(String
             path: dep.fork_path.to_string_lossy().into_owned(),
             trigger: dep.trigger_label.clone(),
             overlap: dep.overlap,
-            after: dep.preds.clone(),
+            // Only the true `after` deps are quoted/report-piped; priority
+            // gates were order-only.
+            after: dep.report_preds.clone(),
+            skill: autofork_core::discovery::skill_sibling(&dep.fork_path)
+                .map(|p| p.to_string_lossy().into_owned()),
         })
         .collect();
     {

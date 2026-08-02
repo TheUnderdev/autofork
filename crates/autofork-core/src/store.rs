@@ -20,7 +20,7 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
-const SCHEMA_VERSION: i32 = 6;
+const SCHEMA_VERSION: i32 = 7;
 
 /// Split a comma-joined tag column back into a list (trimmed, empties
 /// dropped). `NULL` (unset) stays `None`.
@@ -93,8 +93,12 @@ pub struct PendingDep {
     pub fork_path: PathBuf,
     pub trigger_label: String,
     pub overlap: bool,
-    /// Predecessor fork names that must reach a terminal status first.
+    /// Predecessor fork names that must reach a terminal status first (the
+    /// full gate: `after` dependencies plus lower-priority batch-mates).
     pub preds: Vec<String>,
+    /// The subset of `preds` whose reports the fork should receive — its
+    /// true `after` dependencies. Priority gates are order-only.
+    pub report_preds: Vec<String>,
     /// When the wake that held this dependent was issued; only predecessor
     /// completions at or after this instant count.
     pub created_at: i64,
@@ -259,6 +263,19 @@ impl Store {
             conn.execute_batch(
                 "BEGIN;
                  ALTER TABLE sessions ADD COLUMN context_window INTEGER;
+                 COMMIT;",
+            )?;
+        }
+        if version < 7 {
+            // Priority waves: `preds` becomes the full gate (after-deps plus
+            // lower-priority batch-mates); `report_preds` keeps the subset
+            // whose reports the fork should receive (the true `after` deps).
+            // Existing held rows were pure after-deps, so they report on all
+            // their preds.
+            conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE pending_deps ADD COLUMN report_preds TEXT NOT NULL DEFAULT '';
+                 UPDATE pending_deps SET report_preds = preds;
                  COMMIT;",
             )?;
         }
@@ -692,6 +709,8 @@ impl Store {
 
     /// Hold a dependent back until its predecessors finish. Overwrites any
     /// stale pending row for the same fork (a fresh wake supersedes it).
+    /// `preds` is the full gate; `report_preds` the subset whose reports the
+    /// fork receives (its true `after` deps).
     #[allow(clippy::too_many_arguments)]
     pub fn insert_pending_dep(
         &self,
@@ -701,12 +720,13 @@ impl Store {
         trigger_label: &str,
         overlap: bool,
         preds: &[String],
+        report_preds: &[String],
         now: i64,
     ) -> rusqlite::Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO pending_deps
-               (session_id, fork_name, fork_path, trigger_label, overlap, preds, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+               (session_id, fork_name, fork_path, trigger_label, overlap, preds, report_preds, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 session_id,
                 fork_name,
@@ -714,6 +734,7 @@ impl Store {
                 trigger_label,
                 overlap,
                 preds.join(","),
+                report_preds.join(","),
                 now
             ],
         )?;
@@ -723,7 +744,7 @@ impl Store {
     /// The session's held dependents, oldest first.
     pub fn list_pending_deps(&self, session_id: &str) -> rusqlite::Result<Vec<PendingDep>> {
         let mut stmt = self.conn.prepare(
-            "SELECT fork_name, fork_path, trigger_label, overlap, preds, created_at
+            "SELECT fork_name, fork_path, trigger_label, overlap, preds, report_preds, created_at
              FROM pending_deps WHERE session_id = ?1 ORDER BY created_at, fork_name",
         )?;
         let rows = stmt.query_map(params![session_id], |row| {
@@ -733,7 +754,8 @@ impl Store {
                 trigger_label: row.get(2)?,
                 overlap: row.get(3)?,
                 preds: split_tags(row.get::<_, Option<String>>(4)?).unwrap_or_default(),
-                created_at: row.get(5)?,
+                report_preds: split_tags(row.get::<_, Option<String>>(5)?).unwrap_or_default(),
+                created_at: row.get(6)?,
             })
         })?;
         rows.collect()
@@ -1010,9 +1032,11 @@ mod tests {
             "idle",
             false,
             &["alpha".to_string()],
+            &["alpha".to_string()],
             110,
         )
         .unwrap();
+        // A priority-held fork: gated on both, but only alpha's report pipes.
         s.insert_pending_dep(
             "a",
             "gamma",
@@ -1020,6 +1044,7 @@ mod tests {
             "idle",
             true,
             &["alpha".to_string(), "beta".to_string()],
+            &["alpha".to_string()],
             111,
         )
         .unwrap();
@@ -1028,7 +1053,9 @@ mod tests {
         assert_eq!(deps[0].fork_name, "beta");
         assert!(!deps[0].overlap);
         assert_eq!(deps[0].preds, vec!["alpha".to_string()]);
+        assert_eq!(deps[0].report_preds, vec!["alpha".to_string()]);
         assert_eq!(deps[1].preds.len(), 2);
+        assert_eq!(deps[1].report_preds, vec!["alpha".to_string()]);
 
         s.delete_pending_dep("a", "beta").unwrap();
         assert_eq!(s.list_pending_deps("a").unwrap().len(), 1);
@@ -1047,6 +1074,7 @@ mod tests {
             Path::new("/p/b.md"),
             "idle",
             false,
+            &["j".to_string()],
             &["j".to_string()],
             110,
         )

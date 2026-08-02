@@ -167,6 +167,16 @@ impl Daemon {
         self.paths.base.join("forks")
     }
 
+    /// The user-level `.claude` directory, whose `forks/` and `skills/`
+    /// subdirs are extra discovery roots. `AUTOFORK_CLAUDE_DIR` overrides
+    /// (tests use it to keep the real home directory out of fixtures).
+    pub fn claude_dir(&self) -> Option<PathBuf> {
+        if let Some(dir) = std::env::var_os("AUTOFORK_CLAUDE_DIR") {
+            return Some(PathBuf::from(dir));
+        }
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude"))
+    }
+
     /// Effective config for a project.
     pub fn cfg_for(&self, project_root: Option<&Path>) -> Config {
         load_config_at(project_root, &self.paths.user_config()).0
@@ -461,8 +471,11 @@ impl Daemon {
         // Idle deadlines (seconds from the baseline) this session's forks
         // need — none on a busy poll (the session isn't pausing) — plus the
         // absolute instants at which `every:` intervals next elapse.
-        let (entries, _) =
-            autofork_core::discovery::discover_forks(&session.cwd, Some(&self.user_forks_root()));
+        let (entries, _) = autofork_core::discovery::discover_forks(
+            &session.cwd,
+            Some(&self.user_forks_root()),
+            self.claude_dir().as_deref(),
+        );
         let deadlines = if busy {
             Vec::new()
         } else {

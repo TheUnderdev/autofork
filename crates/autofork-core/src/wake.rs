@@ -54,8 +54,15 @@ pub struct DueFork {
     /// wake block tells the model to skip if a previous run is still active.
     pub overlap: bool,
     /// Predecessor fork names this fork ran `after` (empty in a normal wake;
-    /// set in a release payload, where it names the finished predecessors).
+    /// set in a release payload, where it names the finished predecessors
+    /// whose reports the fork should receive — priority-ordering gates are
+    /// not listed).
     pub after: Vec<String>,
+    /// For a fork defined as a `FORK.md` next to a `SKILL.md` (a
+    /// skill-attached fork): the absolute path of that SKILL.md. The spawn
+    /// prompt tells the fork to load the skill first if it isn't already in
+    /// context.
+    pub skill: Option<String>,
 }
 
 /// A fork the daemon is holding back until its predecessors finish, named in
@@ -81,8 +88,16 @@ fn spawn_prompt(
     conversation_id: &str,
     project_root: &str,
 ) -> String {
+    let skill_line = match &fork.skill {
+        Some(skill) => format!(
+            " This fork belongs to the skill at {skill} — if that skill's instructions are \
+             not already in your context, read that file too and apply it as the fork body \
+             directs.",
+        ),
+        None => String::new(),
+    };
     format!(
-        "Read the file {path} and follow the instructions in its body. \
+        "Read the file {path} and follow the instructions in its body.{skill_line} \
          {SPAWN_CTX_PREFIX}{name}', trigger '{trigger}', parent session {session_id}, conversation \
          {conversation_id}, project root {project_root}. The conversation id is stable when \
          a session is resumed (a resumed session gets a fresh session id); key any \
@@ -126,6 +141,21 @@ fn release_block(
     conversation_id: &str,
     project_root: &str,
 ) -> String {
+    // `after` names the finished predecessors whose reports the fork should
+    // receive. A fork held purely for priority ordering has none: it spawns
+    // like a normal root, just later.
+    if fork.after.is_empty() {
+        return format!(
+            "---\nsource: autofork\ndue: {name} (trigger: {trigger}) — released, earlier forks finished\n---\n\
+             The forks ordered before this one have finished. Spawn a background fork \
+             subagent now: use the Agent tool with subagent_type \"fork\" and this prompt: \
+             \"{prompt}\" Do not read that file yourself — only the fork reads it.{overlap}",
+            name = fork.name,
+            trigger = fork.trigger,
+            prompt = spawn_prompt(fork, session_id, conversation_id, project_root),
+            overlap = overlap_line(fork),
+        );
+    }
     let preds = quoted_names(&fork.after);
     format!(
         "---\nsource: autofork\ndue: {name} (trigger: {trigger}) — released, {preds} finished\n---\n\
@@ -267,6 +297,7 @@ mod tests {
             trigger: "idle".to_string(),
             overlap,
             after: after.iter().map(|s| s.to_string()).collect(),
+            skill: None,
         }
     }
 
@@ -382,6 +413,25 @@ mod tests {
         assert!(!p.contains("/x/beta.md"));
         // Held note must not change the closer's count.
         assert!(p.contains("After spawning the fork above"));
+    }
+
+    #[test]
+    fn skill_fork_prompt_tells_the_fork_to_load_the_skill() {
+        let mut f = due("feedback", &[], false);
+        f.skill = Some("/x/feedback/SKILL.md".to_string());
+        let p = build_wake_payload("s", "conv-s", "/p", &[f], &[]);
+        assert!(p.contains("belongs to the skill at /x/feedback/SKILL.md"));
+        assert!(p.contains("not already in your context"));
+        // The transcript-watcher fingerprint survives the extra sentence.
+        assert!(p.contains(&format!("{SPAWN_CTX_PREFIX}feedback'")));
+    }
+
+    #[test]
+    fn priority_release_without_report_preds_reads_as_ordering() {
+        let p = build_release_payload("s", "conv-s", "/p", &[due("last", &[], false)]);
+        assert!(p.contains("due: last (trigger: idle) — released, earlier forks finished"));
+        assert!(p.contains("The forks ordered before this one have finished."));
+        assert!(!p.contains("append the report(s)"));
     }
 
     #[test]

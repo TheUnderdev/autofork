@@ -9,6 +9,11 @@ pub trait Selected {
     fn name(&self) -> &str;
     /// The `after` dependencies' fork names.
     fn after(&self) -> Vec<&str>;
+    /// The fork's declared ordering weight (`priority:`, z-index-like;
+    /// default 0).
+    fn priority(&self) -> i64 {
+        0
+    }
 }
 
 /// Resolve the `after` dependencies among the selected forks into per-node
@@ -74,6 +79,39 @@ pub fn resolve_deps<S: Selected>(selected: &[S]) -> Vec<Vec<usize>> {
 /// Root nodes (no dependencies) of a resolved graph.
 pub fn roots(deps: &[Vec<usize>]) -> Vec<usize> {
     (0..deps.len()).filter(|i| deps[*i].is_empty()).collect()
+}
+
+/// Effective priorities under the "`after` wins over `priority`" rule: each
+/// node's declared priority is lifted to at least the effective priority of
+/// every `after` predecessor, so a dependent can never end up in an earlier
+/// wave than something it must run after. `deps` must be the acyclic graph
+/// from [`resolve_deps`]. Execution then proceeds in ascending effective-
+/// priority waves (equal priorities in parallel), with `after` edges still
+/// sequencing nodes inside a wave.
+pub fn effective_priorities<S: Selected>(selected: &[S], deps: &[Vec<usize>]) -> Vec<i64> {
+    let n = selected.len();
+    let mut eff: Vec<i64> = selected.iter().map(|s| s.priority()).collect();
+    let mut done = vec![false; n];
+    let mut resolved = 0usize;
+    while resolved < n {
+        let mut progressed = false;
+        for i in 0..n {
+            if done[i] || !deps[i].iter().all(|d| done[*d]) {
+                continue;
+            }
+            for &d in &deps[i] {
+                eff[i] = eff[i].max(eff[d]);
+            }
+            done[i] = true;
+            resolved += 1;
+            progressed = true;
+        }
+        // `deps` is acyclic by construction; this is just a safety valve.
+        if !progressed {
+            break;
+        }
+    }
+    eff
 }
 
 #[cfg(test)]
@@ -187,5 +225,60 @@ mod tests {
         ];
         let deps = resolve_deps(&sel);
         assert_eq!(waves(&deps).iter().flatten().count(), 4);
+    }
+
+    struct P(&'static str, Vec<&'static str>, i64);
+    impl Selected for P {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn after(&self) -> Vec<&str> {
+            self.1.clone()
+        }
+        fn priority(&self) -> i64 {
+            self.2
+        }
+    }
+
+    #[test]
+    fn priority_defaults_to_zero() {
+        let sel = [S("a", vec![])];
+        assert_eq!(sel[0].priority(), 0);
+    }
+
+    #[test]
+    fn effective_priority_passes_through_without_deps() {
+        let sel = vec![
+            P("a", vec![], 0),
+            P("last", vec![], 100),
+            P("first", vec![], -10),
+        ];
+        let deps = resolve_deps(&sel);
+        assert_eq!(effective_priorities(&sel, &deps), vec![0, 100, -10]);
+    }
+
+    #[test]
+    fn after_lifts_a_dependent_to_its_predecessor() {
+        // b declares -5 but runs after a (0): lifted to 0. c hangs off b and
+        // declares 10: stays 10 (already above).
+        let sel = vec![
+            P("a", vec![], 0),
+            P("b", vec!["a"], -5),
+            P("c", vec!["b"], 10),
+        ];
+        let deps = resolve_deps(&sel);
+        assert_eq!(effective_priorities(&sel, &deps), vec![0, 0, 10]);
+    }
+
+    #[test]
+    fn lift_propagates_through_chains() {
+        // high (10) ← dep (0) ← deeper (-3): both lifted to 10.
+        let sel = vec![
+            P("high", vec![], 10),
+            P("dep", vec!["high"], 0),
+            P("deeper", vec!["dep"], -3),
+        ];
+        let deps = resolve_deps(&sel);
+        assert_eq!(effective_priorities(&sel, &deps), vec![10, 10, 10]);
     }
 }

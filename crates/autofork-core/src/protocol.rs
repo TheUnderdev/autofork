@@ -247,10 +247,18 @@ pub struct ForkInfo {
     pub throttle_secs: Option<u64>,
     #[serde(default)]
     pub after: Vec<String>,
+    /// Ordering weight (`priority:`; 0 = default wave). Additive field (no
+    /// proto bump).
+    #[serde(default)]
+    pub priority: i64,
     #[serde(default)]
     pub overlap: bool,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// For a skill-attached fork (`FORK.md` next to `SKILL.md`): the
+    /// SKILL.md path. Additive field (no proto bump).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill: Option<PathBuf>,
     pub warnings: Vec<String>,
 }
 

@@ -98,6 +98,8 @@ impl Harness {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_autofork-daemon"));
         cmd.env("AUTOFORK_HOME", &self.home)
             .env("AUTOFORK_SOCKET", &self.socket)
+            // Keep the developer's real ~/.claude out of test discovery.
+            .env("AUTOFORK_CLAUDE_DIR", self.home.join("claude"))
             .env("RUST_LOG", "debug")
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -599,6 +601,131 @@ fn after_dependent_held_until_predecessor_completes() {
         rx4.recv_timeout(Duration::from_millis(2500)).is_err(),
         "release fired twice"
     );
+}
+
+#[test]
+fn priority_layers_forks_into_waves() {
+    let mut h = Harness::new("1s", "0");
+    // Adversarial naming: the high-priority fork sorts FIRST lexically, so a
+    // pass here can't come from incidental roster order.
+    h.write_fork(
+        "aaa-last.md",
+        "---\nfork: true\nrun_on: [idle]\npriority: 10\n---\nLAST",
+    );
+    h.write_fork(
+        "zzz-first.md",
+        "---\nfork: true\nrun_on: [idle]\n---\nFIRST",
+    );
+    h.start_daemon();
+    h.write_transcript(100);
+    assert_ack(h.send_event(h.event_t(EventKind::SessionStart, "s1")));
+
+    // Wake 1: only the priority-0 fork spawns; the 10 is held for ordering.
+    let rx = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
+    let body = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let payload = wake_payload(body.clone());
+    assert!(payload.contains("due: zzz-first"), "{payload}");
+    assert!(!payload.contains("due: aaa-last"), "{payload}");
+    assert!(payload.contains("held back by autofork"), "{payload}");
+    assert!(
+        payload.contains("'aaa-last' (after 'zzz-first')"),
+        "{payload}"
+    );
+    let forks = wake_forks(body);
+    assert_eq!(forks.len(), 1);
+    assert_eq!(forks[0].name, "zzz-first");
+
+    // zzz-first completes → aaa-last releases, with ordering wording (no
+    // report piping: the priority gate is order-only).
+    h.append_fork_spawn("toolu_first", "zzz-first");
+    let rx2 = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
+    std::thread::sleep(Duration::from_millis(400));
+    h.append_completion_notification("toolu_first", "completed");
+    assert_ack(h.send_event(h.prompt_submit("s1", false)));
+    assert!(matches!(
+        rx2.recv_timeout(Duration::from_secs(5)).unwrap(),
+        ResponseBody::Waited
+    ));
+    let rx3 = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
+    let body = rx3.recv_timeout(Duration::from_secs(10)).unwrap();
+    let release = wake_payload(body.clone());
+    assert!(
+        release.contains("due: aaa-last (trigger: idle) — released, earlier forks finished"),
+        "{release}"
+    );
+    assert!(
+        release.contains("The forks ordered before this one have finished."),
+        "{release}"
+    );
+    assert!(!release.contains("append the report(s)"), "{release}");
+    // The structured spec carries no report preds either.
+    let forks = wake_forks(body);
+    assert_eq!(forks.len(), 1);
+    assert_eq!(forks[0].name, "aaa-last");
+    assert!(forks[0].after.is_empty());
+}
+
+#[test]
+fn after_wins_over_priority_and_reports_still_pipe() {
+    let mut h = Harness::new("1s", "0");
+    // beta declares a LOWER priority than alpha but runs `after: alpha` —
+    // the lift keeps it behind alpha, and its release still pipes the report.
+    h.write_fork("alpha.md", "---\nfork: true\nrun_on: [idle]\n---\nA");
+    h.write_fork(
+        "beta.md",
+        "---\nfork: true\nrun_on: [idle]\nafter: alpha\npriority: -5\n---\nB",
+    );
+    h.start_daemon();
+    h.write_transcript(100);
+    assert_ack(h.send_event(h.event_t(EventKind::SessionStart, "s1")));
+
+    let rx = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
+    let payload = wake_payload(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert!(payload.contains("due: alpha"), "{payload}");
+    assert!(!payload.contains("due: beta"), "{payload}");
+
+    h.append_fork_spawn("toolu_alpha", "alpha");
+    let rx2 = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
+    std::thread::sleep(Duration::from_millis(400));
+    h.append_completion_notification("toolu_alpha", "completed");
+    assert_ack(h.send_event(h.prompt_submit("s1", false)));
+    assert!(matches!(
+        rx2.recv_timeout(Duration::from_secs(5)).unwrap(),
+        ResponseBody::Waited
+    ));
+    let rx3 = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
+    let release = wake_payload(rx3.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert!(
+        release.contains("append the report(s) 'alpha' returned"),
+        "{release}"
+    );
+}
+
+#[test]
+fn skill_attached_fork_wake_tells_the_fork_to_load_the_skill() {
+    let mut h = Harness::new("1s", "0");
+    let skill_dir = h.project.join(".claude/skills/feedback");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: feedback\ndescription: d\n---\nskill body",
+    )
+    .unwrap();
+    std::fs::write(
+        skill_dir.join("FORK.md"),
+        "---\nfork: true\nrun_on: [idle]\n---\napply the skill",
+    )
+    .unwrap();
+    h.start_daemon();
+    h.write_transcript(100);
+    assert_ack(h.send_event(h.event_t(EventKind::SessionStart, "s1")));
+
+    let rx = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
+    let payload = wake_payload(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert!(payload.contains("due: feedback"), "{payload}");
+    assert!(payload.contains("belongs to the skill at"), "{payload}");
+    assert!(payload.contains("SKILL.md"), "{payload}");
+    assert!(payload.contains("not already in your context"), "{payload}");
 }
 
 #[test]
