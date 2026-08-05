@@ -1413,6 +1413,66 @@ fn opencode_fork_completion_releases_after_dependent() {
     assert!(forks[0].prompt.contains("beta.md"));
 }
 
+#[test]
+fn opencode_fork_run_sessions_are_never_scheduled() {
+    // The breeding-loop guard: a fork-run session that slips past the
+    // plugin's eligibility check (lost title marker, duplicate plugin
+    // instance, event race at creation) reports itself as a real session —
+    // the daemon must refuse to register it or schedule forks on it, or its
+    // own idle forks would fork it again every deadline.
+    let mut h = Harness::new("1s", "0");
+    h.write_fork(
+        "journal.md",
+        "---\nfork: true\nrun_on: [idle]\n---\nJOURNAL",
+    );
+    h.start_daemon();
+
+    assert_ack(h.send_event(oc_event(&h, EventKind::SessionStart, "oc1")));
+    let rx = h.park_stop_wait(oc_event(&h, EventKind::Stop, "oc1"));
+    let forks = wake_forks(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert_eq!(forks[0].name, "journal");
+    assert_ack(h.request(RequestBody::ForkSpawned {
+        session_id: "oc1".into(),
+        fork: "journal".into(),
+        run_ref: "ses_fork_run".into(),
+    }));
+
+    // A confused plugin instance registers the fork session and parks a poll
+    // for it. SessionStart is dropped; the poll resolves Waited immediately
+    // instead of firing the idle fork on the fork session.
+    assert_ack(h.send_event(oc_event(&h, EventKind::SessionStart, "ses_fork_run")));
+    assert!(
+        !h.has_open_session("ses_fork_run"),
+        "fork run was registered"
+    );
+    let rx = h.park_stop_wait(oc_event(&h, EventKind::Stop, "ses_fork_run"));
+    assert!(matches!(
+        rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        ResponseBody::Waited
+    ));
+    assert!(
+        !h.has_open_session("ses_fork_run"),
+        "fork run was registered"
+    );
+    // No run was issued beyond the parent's original wake.
+    assert_eq!(h.status_recent_runs(), 1);
+
+    // A finished fork run stays unschedulable (the registry keeps terminal
+    // rows), and the parent itself is unaffected.
+    assert_ack(h.request(RequestBody::ForkCompleted {
+        session_id: "oc1".into(),
+        fork: "journal".into(),
+        run_ref: "ses_fork_run".into(),
+        status: "completed".into(),
+    }));
+    let rx = h.park_stop_wait(oc_event(&h, EventKind::Stop, "ses_fork_run"));
+    assert!(matches!(
+        rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        ResponseBody::Waited
+    ));
+    assert!(h.has_open_session("oc1"), "parent must stay registered");
+}
+
 // ---- `every:` interval trigger (turn-boundary and mid-run busy polls) ----
 
 #[test]

@@ -15,6 +15,12 @@
 
 const BIN = process.env.AUTOFORK_OPENCODE_BIN || "autofork";
 const TITLE_PREFIX = "autofork/";
+// The daemon-built fork prompt's fingerprint (SPAWN_CTX_PREFIX in
+// autofork-core's wake.rs — keep in sync). A session whose last user message
+// carries it is one of our fork runs, whatever its title says: the title
+// marker can be lost to auto-titling, a failed update, or another plugin
+// instance, and a fork run mistaken for a real session breeds forks of forks.
+const SPAWN_CTX = "Context for this run: fork '";
 
 export const AutoforkPlugin = async ({ client, directory, worktree }) => {
   // Per-session tracking (parent sessions only).
@@ -112,6 +118,27 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
     } catch {
       return false;
     }
+    // Second marker, independent of the title: a fork run's last user message
+    // is the daemon-built fork prompt. Fail open on fetch errors — the
+    // title/parentID checks passed, and the daemon refuses fork-run session
+    // ids anyway (its spawn registry outlives plugin instances).
+    try {
+      const msgs = (await client.session.messages({ path: { id } }))?.data ?? [];
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        if (msgs[i]?.info?.role !== "user") continue;
+        const text = (msgs[i].parts ?? [])
+          .filter((p) => p.type === "text")
+          .map((p) => p.text)
+          .join("\n");
+        if (text.includes(SPAWN_CTX)) {
+          ignored.add(id);
+          return false;
+        }
+        break;
+      }
+    } catch {
+      // fall through as eligible
+    }
     return true;
   }
 
@@ -172,6 +199,10 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
   }
 
   async function executeWake(parentID, forks) {
+    // Never execute a wake on a session we know is a fork run (or otherwise
+    // not ours): a poll parked before the session was classified can still
+    // resolve with a wake, and acting on it forks a fork.
+    if (forkRuns.has(parentID) || ignored.has(parentID)) return;
     const parent = sessionState(parentID);
     for (const spec of forks) {
       if (!spec.overlap && (liveByFork.get(spec.name) ?? 0) > 0) continue;
@@ -201,6 +232,14 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
           done: false,
         });
         liveByFork.set(spec.name, (liveByFork.get(spec.name) ?? 0) + 1);
+        // Register the run ref with the daemon BEFORE prompting: from here on
+        // it refuses to register or schedule the fork session, so an event
+        // race or another plugin instance can't turn it into a real session.
+        await call("fork-spawned", {
+          session_id: parentID,
+          fork: spec.name,
+          run_ref: forked.id,
+        });
         // Pin the parent's model and agent: a forked session doesn't inherit
         // them, and prompt-cache reuse needs an identical request prefix.
         await client.session.promptAsync({
@@ -211,20 +250,23 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
             parts: [{ type: "text", text: prompt }],
           },
         });
-        await call("fork-spawned", {
-          session_id: parentID,
-          fork: spec.name,
-          run_ref: forked.id,
-        });
       } catch {
         // A failed spawn is dropped; the daemon's throttles already stamped,
         // matching the Claude Code behavior for a wake the model fumbled. A
         // run registered before the prompt failed must not pin the overlap
         // gate: unregister it (the fork session never ran, so it will never
-        // emit the idle that normally does this).
+        // emit the idle that normally does this), and mark the spawn
+        // terminal so `after` dependents aren't held for a run that never
+        // started.
         if (forkedID && forkRuns.has(forkedID)) {
           forkRuns.delete(forkedID);
           liveByFork.set(spec.name, Math.max(0, (liveByFork.get(spec.name) ?? 0) - 1));
+          await call("fork-completed", {
+            session_id: parentID,
+            fork: spec.name,
+            run_ref: forkedID,
+            status: "failed",
+          });
         }
       }
     }

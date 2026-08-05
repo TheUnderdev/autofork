@@ -642,6 +642,22 @@ impl Store {
         Ok(())
     }
 
+    /// Whether `id` is a recorded fork-run session (any session's spawn
+    /// `run_ref` — opencode run refs live in the `tool_use_id` column, and a
+    /// Claude Code tool-use id can never collide with a session id). The
+    /// daemon refuses to register or schedule such ids: a fork-run session
+    /// that slips past the plugin's eligibility check (lost title marker,
+    /// duplicate plugin instance, event race at creation) would otherwise
+    /// become a scheduled session and breed forks of forks.
+    pub fn is_fork_run_ref(&self, id: &str) -> rusqlite::Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM fork_spawns WHERE tool_use_id = ?1",
+            params![id],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
     /// Whether a completion notification's ids match a recorded fork spawn.
     pub fn is_fork_spawn(
         &self,
@@ -1019,6 +1035,23 @@ mod tests {
             .unwrap());
         assert!(!s.fork_completed_since("a", "journal", 141).unwrap());
         assert!(s.fork_completed_since("a", "journal", 140).unwrap());
+    }
+
+    #[test]
+    fn fork_run_refs_are_recognized_across_sessions() {
+        let s = store();
+        seed_session(&s, "a", "/p", 100);
+        s.record_spawn("a", "ses_fork_run", Some("journal"), 110)
+            .unwrap();
+        // The run ref is recognized no matter which session asks — the fork
+        // session id is globally not schedulable.
+        assert!(s.is_fork_run_ref("ses_fork_run").unwrap());
+        assert!(!s.is_fork_run_ref("ses_ordinary").unwrap());
+        // Terminal runs stay recognized: a finished fork session going idle
+        // again must not become schedulable.
+        s.mark_spawn_terminal("a", Some("ses_fork_run"), None, "completed", 120)
+            .unwrap();
+        assert!(s.is_fork_run_ref("ses_fork_run").unwrap());
     }
 
     #[test]

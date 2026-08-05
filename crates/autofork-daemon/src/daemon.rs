@@ -258,9 +258,27 @@ impl Daemon {
             .is_some_and(|&at| t - at < wake_grace_secs())
     }
 
+    /// Whether this id names one of our own fork-run sessions. Such ids must
+    /// never be registered or scheduled: a fork-run session that slips past
+    /// the plugin's eligibility check (lost title marker, duplicate plugin
+    /// instance, event race at creation) would otherwise become a scheduled
+    /// session whose idle forks fork it again — forks breeding forks.
+    fn is_fork_run_session(&self, id: &str) -> bool {
+        let store = self.store.lock().unwrap();
+        store.is_fork_run_ref(id).unwrap_or(false)
+    }
+
     /// Handle one fast lifecycle event; returns the response body.
     pub async fn handle_event(self: &Arc<Self>, ev: Event) -> ResponseBody {
         self.touch_busy();
+        // Lifecycle events for a fork-run session are dropped (SessionEnd is
+        // let through: it only closes a row, cleaning up after a session that
+        // was registered before its spawn frame landed).
+        if ev.event != EventKind::SessionEnd && self.is_fork_run_session(&ev.session_id) {
+            tracing::info!(session = %ev.session_id, kind = ?ev.event,
+                "ignoring event for a fork-run session");
+            return ResponseBody::Ack;
+        }
         // A fresh event proves the session is alive: cancel any pending
         // lost-poll close.
         self.clear_pending_close(&ev.session_id);
@@ -385,6 +403,14 @@ impl Daemon {
     /// is cancelled / the daemon retires (returning `Waited`).
     pub async fn handle_stop_wait(self: &Arc<Self>, ev: Event) -> ResponseBody {
         self.touch_busy();
+        // Never park a poll for (or schedule forks on) one of our own
+        // fork-run sessions — the breeding-loop guard. Answer Waited so a
+        // confused plugin's poll resolves instead of hanging.
+        if self.is_fork_run_session(&ev.session_id) {
+            tracing::info!(session = %ev.session_id,
+                "refusing to schedule a fork-run session");
+            return ResponseBody::Waited;
+        }
         // A new poll parking proves the session is alive.
         self.clear_pending_close(&ev.session_id);
         let t = now();
