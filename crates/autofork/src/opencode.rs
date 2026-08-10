@@ -79,6 +79,14 @@ struct OcInput {
     /// triggers only; no idle deadlines, no pause baseline).
     #[serde(default)]
     busy: Option<bool>,
+    /// prompt-submit: whether this turn is genuine user activity. The plugin
+    /// sends `false` for the turn its own chain-report injection starts —
+    /// that turn must not bump the pause epoch. Absent = genuine (`true`).
+    #[serde(default)]
+    waking: Option<bool>,
+    /// fork-completed: the run's report ended with the chain sentinel.
+    #[serde(default, rename = "continue")]
+    cont: Option<bool>,
 }
 
 pub fn run_hook(kind: OcHookKind) {
@@ -112,6 +120,7 @@ fn run_hook_inner(kind: OcHookKind) -> Option<()> {
         notif_tool_use_id: None,
         notif_task_id: None,
         notif_status: None,
+        notif_continue: None,
         context_tokens: input.context_tokens,
         context_window: input.context_window,
         client: Some(CLIENT.to_string()),
@@ -132,9 +141,11 @@ fn run_hook_inner(kind: OcHookKind) -> Option<()> {
                 return Some(());
             };
             let mut ev = event(EventKind::PromptSubmit);
-            // The plugin only reports genuine user turns (it skips its own
-            // report injections), so every one of these starts a new pause.
-            ev.waking = Some(true);
+            // The plugin skips its own zero-turn report injections entirely,
+            // and flags the one turn it *does* start itself — a chain fork's
+            // turn-triggering report — as `waking: false`. Everything else is
+            // a genuine user turn and starts a new pause.
+            ev.waking = Some(input.waking.unwrap_or(true));
             let _ = client.request(RequestBody::Event(ev));
         }
         OcHookKind::StopWait => {
@@ -187,6 +198,7 @@ fn run_hook_inner(kind: OcHookKind) -> Option<()> {
                 fork: input.fork.clone()?,
                 run_ref: input.run_ref.clone()?,
                 status: input.status.clone().unwrap_or_else(|| "completed".into()),
+                cont: input.cont,
             });
         }
     }

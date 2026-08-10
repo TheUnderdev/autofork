@@ -83,6 +83,7 @@ fn run_hook_inner(kind: HookKind) -> Option<()> {
         notif_tool_use_id: None,
         notif_task_id: None,
         notif_status: None,
+        notif_continue: None,
         context_tokens: None,
         context_window: None,
         client: None,
@@ -120,6 +121,7 @@ fn run_hook_inner(kind: HookKind) -> Option<()> {
                     ev.notif_tool_use_id = n.tool_use_id;
                     ev.notif_task_id = n.task_id;
                     ev.notif_status = n.status;
+                    ev.notif_continue = Some(n.continue_requested);
                 } else {
                     ev.waking = Some(true);
                 }

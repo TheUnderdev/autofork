@@ -39,6 +39,10 @@ pub struct SelectedFork {
     /// Declared ordering weight (`priority:`, z-index-like; default 0).
     pub priority: i64,
     pub tags: Vec<String>,
+    /// `chain: true`: runs may request another via the continue sentinel.
+    pub chain: bool,
+    /// `gate: true`: holds the session's other idle forks while unsettled.
+    pub gate: bool,
     /// The latch this fork consumes at wake-issuance, if any: `context_*`
     /// triggers latch once per session (key = the trigger label); `idle`
     /// triggers latch once per pause (key = `idle-pause:<epoch>`). `None` means
@@ -191,10 +195,81 @@ pub fn select_forks(
             after: parsed.def.after.clone(),
             priority: parsed.def.priority,
             tags: parsed.def.tags.clone(),
+            chain: parsed.def.chain,
+            gate: parsed.def.gate,
             latch_key,
         });
     }
+    apply_gate_filter(daemon, session, &mut selected);
     selected
+}
+
+/// A trigger label produced by an idle deadline (`idle` / `idle:<secs>`) —
+/// the only trigger family a gate holds back.
+fn is_idle_trigger(label: &str) -> bool {
+    label == "idle" || label.starts_with("idle:")
+}
+
+/// How long an active gate survives without an observed spawn before the
+/// belt lifts it (a wake the model fumbled must not silence every other fork
+/// for the rest of the pause). Overridable via `AUTOFORK_GATE_GRACE_SECS`
+/// (tests shorten it).
+pub(crate) fn gate_grace_secs() -> i64 {
+    std::env::var("AUTOFORK_GATE_GRACE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(180)
+}
+
+/// While a `gate: true` fork's run/chain is unsettled, hold every other
+/// idle-triggered fork: drop them from the selection *without* stamping their
+/// latches or throttles, so they fire intact once the gate clears. Two
+/// prongs: a gate fork in the current selection always holds its batch-mates
+/// (covers the re-arm gap between chain iterations, when the persisted gate
+/// may have lapsed); otherwise the session's persisted `active_gate` holds —
+/// unless it is neither live (a spawn in flight) nor recent (wake just
+/// issued), in which case the belt lifts it.
+fn apply_gate_filter(daemon: &Arc<Daemon>, session: &SessionRow, selected: &mut Vec<SelectedFork>) {
+    let selected_gate = selected.iter().any(|s| s.gate);
+    let mut holding = selected_gate;
+    if !holding {
+        // Re-read the gate fresh: the snapshot in `session` predates any
+        // chain-end processed while this poll was parked.
+        let gate = {
+            let store = daemon.store.lock().unwrap();
+            store
+                .get_session(&session.session_id)
+                .ok()
+                .flatten()
+                .and_then(|s| s.active_gate)
+        };
+        if let Some(g) = gate {
+            let store = daemon.store.lock().unwrap();
+            let live = store
+                .live_spawn_exists(&session.session_id, &g)
+                .unwrap_or(false);
+            let recent = store
+                .last_issued_at(&session.session_id, &g)
+                .ok()
+                .flatten()
+                .is_some_and(|at| now() - at < gate_grace_secs());
+            if live || recent {
+                holding = true;
+            } else {
+                tracing::warn!(session = %session.session_id, gate = %g,
+                    "active gate has no live spawn and no recent wake — lifting it");
+                let _ = store.clear_active_gate(&session.session_id);
+            }
+        }
+    }
+    if holding {
+        let before = selected.len();
+        selected.retain(|s| s.gate || !is_idle_trigger(&s.trigger));
+        if selected.len() < before {
+            tracing::info!(session = %session.session_id, held = before - selected.len(),
+                "gate active: holding other idle forks");
+        }
+    }
 }
 
 fn parse_fork(name: &str, content: &str) -> ForkParse {
@@ -279,6 +354,9 @@ pub fn build_wake(
                     }
                 }
             }
+            if sel.gate {
+                let _ = store.set_active_gate(&session.session_id, &sel.name);
+            }
             if gate.is_empty() {
                 roots.push(DueFork {
                     name: sel.name.clone(),
@@ -288,6 +366,7 @@ pub fn build_wake(
                     after: Vec::new(),
                     skill: autofork_core::discovery::skill_sibling(&sel.path)
                         .map(|p| p.to_string_lossy().into_owned()),
+                    chain: sel.chain,
                 });
             } else {
                 let _ = store.insert_pending_dep(
@@ -325,9 +404,18 @@ pub fn build_wake(
 pub fn release_due(daemon: &Arc<Daemon>, session: &SessionRow) -> Option<(String, Vec<WakeFork>)> {
     let released: Vec<autofork_core::store::PendingDep> = {
         let store = daemon.store.lock().unwrap();
+        // An active gate holds releases too (a dependent spawning mid-chain
+        // would defeat the gate); the gated deps release on the first poll
+        // after the gate clears. The gate fork itself is never held here.
+        let active_gate = store
+            .get_session(&session.session_id)
+            .ok()
+            .flatten()
+            .and_then(|s| s.active_gate);
         let pending = store.list_pending_deps(&session.session_id).ok()?;
         pending
             .into_iter()
+            .filter(|dep| active_gate.as_deref().is_none_or(|g| g == dep.fork_name))
             .filter(|dep| {
                 dep.preds.iter().all(|pred| {
                     store
@@ -345,6 +433,18 @@ pub fn release_due(daemon: &Arc<Daemon>, session: &SessionRow) -> Option<(String
         forks = ?released.iter().map(|d| d.fork_name.as_str()).collect::<Vec<_>>(),
         "releasing held dependents"
     );
+    // Pending rows carry no chain/gate info; re-read each definition so a
+    // released chain fork still learns the sentinel and a released gate fork
+    // still claims the gate.
+    let flags = |dep: &autofork_core::store::PendingDep| -> (bool, bool) {
+        std::fs::read_to_string(&dep.fork_path)
+            .ok()
+            .and_then(|c| match parse_fork(&dep.fork_name, &c) {
+                ForkParse::Fork(p) => Some((p.def.chain, p.def.gate)),
+                _ => None,
+            })
+            .unwrap_or((false, false))
+    };
     let due: Vec<DueFork> = released
         .iter()
         .map(|dep| DueFork {
@@ -357,12 +457,16 @@ pub fn release_due(daemon: &Arc<Daemon>, session: &SessionRow) -> Option<(String
             after: dep.report_preds.clone(),
             skill: autofork_core::discovery::skill_sibling(&dep.fork_path)
                 .map(|p| p.to_string_lossy().into_owned()),
+            chain: flags(dep).0,
         })
         .collect();
     {
         let store = daemon.store.lock().unwrap();
         for dep in &released {
             let _ = store.delete_pending_dep(&session.session_id, &dep.fork_name);
+            if flags(dep).1 {
+                let _ = store.set_active_gate(&session.session_id, &dep.fork_name);
+            }
         }
     }
     daemon.note_wake_issued(&session.session_id);

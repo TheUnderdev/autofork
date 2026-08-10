@@ -46,11 +46,16 @@ pub enum RequestBody {
     },
     /// An opencode fork run reached a terminal status
     /// (`completed`/`failed`/`stopped`). Drives `after`-dependency release.
+    /// `cont` (wire name `continue`, additive): the fork's report ended with
+    /// the chain sentinel — re-arm it for another run this pause (honored
+    /// only for `chain: true` forks, up to their chain limit).
     ForkCompleted {
         session_id: String,
         fork: String,
         run_ref: String,
         status: String,
+        #[serde(default, rename = "continue", skip_serializing_if = "Option::is_none")]
+        cont: Option<bool>,
     },
     /// Ask the daemon to exit. With `drain`, it finishes cleanly first.
     /// Frozen shape — never change.
@@ -97,6 +102,11 @@ pub struct Event {
     /// The notification's `<status>` (`completed`/`failed`/`stopped`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notif_status: Option<String>,
+    /// The notification's `<result>` ends with the chain sentinel: the fork
+    /// asks to run again. Additive field; the daemon honors it only when the
+    /// completion matches one of its own spawns of a `chain: true` fork.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notif_continue: Option<bool>,
     /// The session's context gauge in tokens, reported by clients that track
     /// usage themselves (opencode) instead of exposing a transcript to parse.
     /// Takes precedence over transcript parsing when present.
@@ -233,6 +243,11 @@ pub struct WakeFork {
     /// the client should append to the prompt. Empty in a normal wake.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub after: Vec<String>,
+    /// `chain: true` fork: the client should honor a trailing chain sentinel
+    /// in the run's report (turn-triggering injection + `continue` on the
+    /// completion frame). Additive field (no proto bump).
+    #[serde(default)]
+    pub chain: bool,
     /// The prompt to run the fork with (already carries the fork file path,
     /// trigger, session/conversation ids and project root).
     pub prompt: String,
@@ -259,6 +274,14 @@ pub struct ForkInfo {
     /// SKILL.md path. Additive field (no proto bump).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill: Option<PathBuf>,
+    /// `chain: true` fork (may request re-runs via the sentinel). Additive
+    /// field (no proto bump).
+    #[serde(default)]
+    pub chain: bool,
+    /// `gate: true` fork (holds other idle forks while unsettled). Additive
+    /// field (no proto bump).
+    #[serde(default)]
+    pub gate: bool,
     pub warnings: Vec<String>,
 }
 
@@ -292,6 +315,7 @@ mod tests {
                 notif_tool_use_id: None,
                 notif_task_id: None,
                 notif_status: None,
+                notif_continue: None,
                 context_tokens: None,
                 context_window: None,
                 client: None,
@@ -321,6 +345,7 @@ mod tests {
                     trigger: "idle".into(),
                     overlap: false,
                     after: Vec::new(),
+                    chain: false,
                     prompt: "Read the file /x/journal.md".into(),
                 }]),
             },
@@ -362,12 +387,23 @@ mod tests {
                 fork,
                 run_ref,
                 status,
+                cont,
             } => {
                 assert_eq!(session_id, "s");
                 assert_eq!(fork, "journal");
                 assert_eq!(run_ref, "ses_abc");
                 assert_eq!(status, "completed");
+                // Old plugins omit the field entirely.
+                assert_eq!(cont, None);
             }
+            _ => panic!("wrong body"),
+        }
+
+        // The chain variant rides the wire name `continue`.
+        let line = r#"{"proto":1,"id":3,"type":"fork_completed","session_id":"s","fork":"goal","run_ref":"ses_g","status":"completed","continue":true}"#;
+        let req: Request = serde_json::from_str(line).unwrap();
+        match req.body {
+            RequestBody::ForkCompleted { cont, .. } => assert_eq!(cont, Some(true)),
             _ => panic!("wrong body"),
         }
     }

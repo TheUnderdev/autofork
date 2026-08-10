@@ -144,11 +144,15 @@ a missing marker can't silently disable a real fork. `fork: false` is an explici
 | `priority` | ordering weight (z-index): lower spawns earlier, higher waits for the lower waves; equal = together | `0` |
 | `overlap` | `true` to allow two runs of this fork at once | `false` |
 | `tags` | labels for the enable/disable filter: `ci`, `[ci, review]` | — |
+| `chain` | `true` — a run may request another by ending its report with `<<autofork:continue>>` | `false` |
+| `chain_limit` | max chain runs within one pause | config `chain_limit` (25) |
+| `gate` | `true` — hold the other idle forks while this fork's run/chain is unsettled | `false` |
 
 Moments for `run_on`:
 
 - `idle` — the session has been quiet for the default idle deadline (config, 10m)
-- `idle: 20m` — a custom idle deadline
+- `idle: 20m` — a custom idle deadline; `idle: 0s` fires at the pause's very first `Stop` (the
+  goal-fork recipe below)
 - `context_tokens: 150000` / `context_used: 80%` / `context_left: 20000` — context-size thresholds,
   each firing at most once per session
 - `every: 1h` — at least this long since the fork's last run (before the first run: since the
@@ -215,6 +219,66 @@ isn't already in its inherited context**, then follow the fork body.
 
 The same frontmatter keys apply; `autofork forks` shows the linked skill.
 
+### Chain forks: the fork decides whether to run again
+
+A fork with `chain: true` is told, in its spawn prompt, about the **continue sentinel**: if it ends
+its report with a final line that is exactly
+
+```
+<<autofork:continue>>
+```
+
+autofork runs the fork again once the parent session has digested the report. The decision is made
+**per run, by the fork itself** — a run that omits the line ends the chain. That turns a fork into
+an evaluator loop: check the state of some goal against the parent's current conversation, report
+what's missing, and come back after the parent has seen the report; each iteration forks the
+parent's *current* context, prior reports included.
+
+Mechanics per client:
+
+- **Claude Code** — the fork's completion notification already wakes the parent natively; the
+  sentinel additionally re-arms the fork's once-per-pause latch, so it fires again right after the
+  relay turn settles. Nothing else changes: no epoch bump, so every *other* idle fork stays exactly
+  as it was.
+- **opencode** — a sentinel-ending report is injected as a **real turn** (instead of the usual
+  zero-turn no-reply message), so the parent model reacts to it; the completion frame carries
+  `continue: true` and the daemon re-arms the fork the same way.
+
+Belts: the sentinel is honored only for `chain: true` forks (a fork that merely quotes it, or was
+never opted in, changes nothing — position-anchored on the last non-empty line, and the daemon
+re-checks the definition). A chain is capped at `chain_limit` runs per pause (frontmatter, falling
+back to the `chain_limit` config key, default 25). Your own next message always ends the chain —
+genuine activity starts a new pause and the fork re-evaluates on the next one.
+
+### Goal forks: `gate: true`
+
+A **goal fork** combines the pieces: fire immediately after every one of your turns, keep working
+while the goal isn't met, and keep the consolidation forks out of the way until it's done.
+
+```markdown
+---
+fork: true
+description: Drive the session's stated goal to completion
+run_on: [idle: 0s]
+chain: true
+gate: true
+---
+Look at the parent conversation's current goal. If it is not yet met: do the
+next concrete chunk of work (or tell the parent exactly what to do next in
+your report) and end your report with the continue line. If the goal is met,
+or there is no active goal, report one line and stop — no continue line.
+```
+
+`gate: true` holds **every other idle-triggered fork** while this fork's run/chain is unsettled —
+they are dropped at selection without consuming their once-per-pause latches, and `after`-held
+dependents stay held. When the chain settles (a run without the sentinel, a failure, or the chain
+limit), the pause baseline resets: the held forks' idle deadlines measure from that moment, so a
+`handover` on `idle: 4m` fires 4 minutes after the goal work ends and captures all of it. `every:`
+and `context_*` triggers are deliberately *not* gated (a periodic backstop and a filling context
+window still matter mid-goal). A gate whose wake was fumbled (no spawn ever observed) lifts after
+a grace window (`AUTOFORK_GATE_GRACE_SECS`, default 180s) rather than silencing the session's
+forks for the whole pause; your own next message drops the gate immediately.
+
 ## CLI
 
 ```
@@ -243,6 +307,7 @@ default_idle_deadline = "10m"  # bare `idle` deadline; 0 disables idle forks
 session_timeout = "12h"        # close sessions idle longer than this
 quiet_period = "20m"           # daemon self-exit after this much nothing (global only)
 wake_debounce = "5s"           # batch near-simultaneous forks into one wake; 0 answers immediately
+chain_limit = 25               # default cap on chain runs per pause (see chain forks)
 enable_tags = ["ci"]           # default tag whitelist (see below)
 disable_tags = ["noisy"]       # default tag blocklist (see below)
 

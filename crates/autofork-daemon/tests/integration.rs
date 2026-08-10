@@ -23,6 +23,7 @@ struct Harness {
     daemon: Option<Child>,
     poll_grace_ms: Option<u64>,
     wake_grace_secs: Option<u64>,
+    gate_grace_secs: Option<u64>,
 }
 
 impl Harness {
@@ -48,6 +49,7 @@ impl Harness {
             daemon: None,
             poll_grace_ms: None,
             wake_grace_secs: None,
+            gate_grace_secs: None,
         }
     }
 
@@ -58,6 +60,11 @@ impl Harness {
 
     fn wake_grace_secs(mut self, secs: u64) -> Self {
         self.wake_grace_secs = Some(secs);
+        self
+    }
+
+    fn gate_grace_secs(mut self, secs: u64) -> Self {
+        self.gate_grace_secs = Some(secs);
         self
     }
 
@@ -109,6 +116,9 @@ impl Harness {
         if let Some(secs) = self.wake_grace_secs {
             cmd.env("AUTOFORK_WAKE_GRACE_SECS", secs.to_string());
         }
+        if let Some(secs) = self.gate_grace_secs {
+            cmd.env("AUTOFORK_GATE_GRACE_SECS", secs.to_string());
+        }
         let child = cmd.spawn().unwrap();
         self.daemon = Some(child);
         let start = Instant::now();
@@ -146,6 +156,7 @@ impl Harness {
             notif_tool_use_id: None,
             notif_task_id: None,
             notif_status: None,
+            notif_continue: None,
             context_tokens: None,
             context_window: None,
             client: None,
@@ -170,6 +181,15 @@ impl Harness {
         ev.waking = Some(false);
         ev.notif_tool_use_id = Some(tool_use_id.to_string());
         ev.notif_status = Some(status.to_string());
+        ev.notif_continue = Some(false);
+        ev
+    }
+
+    /// Like [`prompt_submit_notif`], for a report that ended with the chain
+    /// sentinel (the CLI sets `notif_continue` from the `<result>` scan).
+    fn prompt_submit_notif_cont(&self, session: &str, tool_use_id: &str) -> Event {
+        let mut ev = self.prompt_submit_notif(session, tool_use_id, "completed");
+        ev.notif_continue = Some(true);
         ev
     }
 
@@ -213,10 +233,16 @@ impl Harness {
     /// Append a background-task completion notification to the transcript, as
     /// the relay turn's user entry would contain.
     fn append_completion_notification(&self, tool_use_id: &str, status: &str) {
+        self.append_completion_notification_result(tool_use_id, status, "report");
+    }
+
+    /// Same, with a custom `<result>` payload (e.g. a report ending with the
+    /// chain sentinel).
+    fn append_completion_notification_result(&self, tool_use_id: &str, status: &str, result: &str) {
         let content = format!(
             "<task-notification>\n<task-id>t-{tool_use_id}</task-id>\n\
              <tool-use-id>{tool_use_id}</tool-use-id>\n<status>{status}</status>\n\
-             <summary>Agent \"x\" finished</summary>\n<result>report</result>"
+             <summary>Agent \"x\" finished</summary>\n<result>{result}</result>"
         );
         let line = serde_json::json!({
             "type": "user",
@@ -1397,6 +1423,7 @@ fn opencode_fork_completion_releases_after_dependent() {
         fork: "alpha".into(),
         run_ref: "ses_fork_alpha".into(),
         status: "completed".into(),
+        cont: None,
     }));
     assert!(matches!(
         parked.recv_timeout(Duration::from_secs(5)).unwrap(),
@@ -1464,6 +1491,7 @@ fn opencode_fork_run_sessions_are_never_scheduled() {
         fork: "journal".into(),
         run_ref: "ses_fork_run".into(),
         status: "completed".into(),
+        cont: None,
     }));
     let rx = h.park_stop_wait(oc_event(&h, EventKind::Stop, "ses_fork_run"));
     assert!(matches!(
@@ -1545,4 +1573,268 @@ fn busy_poll_fires_every_but_never_idle() {
     let rx = h.park_stop_wait(oc_event(&h, EventKind::Stop, "oc1"));
     let forks = wake_forks(rx.recv_timeout(Duration::from_secs(10)).unwrap());
     assert!(forks.iter().any(|f| f.name == "idler"), "{forks:?}");
+}
+
+// ---- chain forks (`chain: true` + the continue sentinel) and gate forks ----
+
+#[test]
+fn chain_continue_rearms_the_fork_within_the_pause() {
+    let mut h = Harness::new("1s", "0").wake_grace_secs(0);
+    h.write_fork(
+        "goal.md",
+        "---\nfork: true\nrun_on: [idle]\nchain: true\n---\nGOAL",
+    );
+    h.start_daemon();
+    h.write_transcript(100);
+    assert_ack(h.send_event(h.event_t(EventKind::SessionStart, "s1")));
+
+    // Wake 1: the spawn prompt teaches the sentinel.
+    let rx = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
+    let payload = wake_payload(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert!(payload.contains("due: goal"), "{payload}");
+    assert!(payload.contains("<<autofork:continue>>"), "{payload}");
+
+    // The run's report ends with the sentinel (seen via the transcript scan).
+    h.append_fork_spawn("toolu_g1", "goal");
+    h.append_completion_notification_result(
+        "toolu_g1",
+        "completed",
+        "goal not met, queued more work\n<<autofork:continue>>",
+    );
+    assert_ack(h.send_event(h.prompt_submit_notif_cont("s1", "toolu_g1")));
+
+    // Same pause: the relay turn's Stop re-fires the fork immediately.
+    let rx2 = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
+    let payload = wake_payload(rx2.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert!(payload.contains("due: goal"), "{payload}");
+
+    // Run 2 ends WITHOUT the sentinel: the chain is over, no third wake.
+    h.append_fork_spawn("toolu_g2", "goal");
+    h.append_completion_notification("toolu_g2", "completed");
+    assert_ack(h.send_event(h.prompt_submit_notif("s1", "toolu_g2", "completed")));
+    let rx3 = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
+    assert!(
+        rx3.recv_timeout(Duration::from_millis(2500)).is_err(),
+        "chain re-fired without the sentinel"
+    );
+}
+
+#[test]
+fn chain_continue_via_prompt_ids_without_transcript_notification() {
+    // The notification can reach the PromptSubmit hook before it is flushed
+    // to the transcript: the forwarded notif_continue alone must re-arm.
+    let mut h = Harness::new("1s", "0").wake_grace_secs(0);
+    h.write_fork(
+        "goal.md",
+        "---\nfork: true\nrun_on: [idle]\nchain: true\n---\nGOAL",
+    );
+    h.start_daemon();
+    h.write_transcript(100);
+    assert_ack(h.send_event(h.event_t(EventKind::SessionStart, "s1")));
+
+    let rx = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
+    wake_payload(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+
+    // Spawn on disk, completion notification NOT on disk yet.
+    h.append_fork_spawn("toolu_g1", "goal");
+    assert_ack(h.send_event(h.prompt_submit_notif_cont("s1", "toolu_g1")));
+
+    let rx2 = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
+    let payload = wake_payload(rx2.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert!(payload.contains("due: goal"), "{payload}");
+}
+
+#[test]
+fn chain_sentinel_ignored_without_optin() {
+    let mut h = Harness::new("1s", "0").wake_grace_secs(0);
+    h.write_fork("journal.md", "---\nfork: true\nrun_on: [idle]\n---\nJ");
+    h.start_daemon();
+    h.write_transcript(100);
+    assert_ack(h.send_event(h.event_t(EventKind::SessionStart, "s1")));
+
+    // A non-chain fork is never taught the sentinel.
+    let rx = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
+    let payload = wake_payload(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert!(!payload.contains("<<autofork:continue>>"), "{payload}");
+
+    // Even a report that ends with the sentinel must not re-arm it.
+    h.append_fork_spawn("toolu_j1", "journal");
+    h.append_completion_notification_result(
+        "toolu_j1",
+        "completed",
+        "quoting the docs\n<<autofork:continue>>",
+    );
+    assert_ack(h.send_event(h.prompt_submit_notif_cont("s1", "toolu_j1")));
+    let rx2 = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
+    assert!(
+        rx2.recv_timeout(Duration::from_millis(2500)).is_err(),
+        "sentinel re-armed a fork without chain: true"
+    );
+}
+
+#[test]
+fn chain_limit_caps_refires() {
+    let mut h = Harness::new("1s", "0").wake_grace_secs(0);
+    h.write_fork(
+        "goal.md",
+        "---\nfork: true\nrun_on: [idle]\nchain: true\nchain_limit: 2\n---\nGOAL",
+    );
+    h.start_daemon();
+    h.write_transcript(100);
+    assert_ack(h.send_event(h.event_t(EventKind::SessionStart, "s1")));
+
+    // Wake 1 (run 1) → continue → wake 2 (run 2).
+    let rx = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
+    wake_payload(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    h.append_fork_spawn("toolu_g1", "goal");
+    h.append_completion_notification_result("toolu_g1", "completed", "more\n<<autofork:continue>>");
+    assert_ack(h.send_event(h.prompt_submit_notif_cont("s1", "toolu_g1")));
+    let rx2 = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
+    wake_payload(rx2.recv_timeout(Duration::from_secs(10)).unwrap());
+
+    // Run 2 also asks to continue, but the limit (2 runs this pause) is spent.
+    h.append_fork_spawn("toolu_g2", "goal");
+    h.append_completion_notification_result("toolu_g2", "completed", "more\n<<autofork:continue>>");
+    assert_ack(h.send_event(h.prompt_submit_notif_cont("s1", "toolu_g2")));
+    let rx3 = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
+    assert!(
+        rx3.recv_timeout(Duration::from_millis(2500)).is_err(),
+        "chain exceeded its chain_limit"
+    );
+}
+
+#[test]
+fn opencode_continue_field_rearms_and_settles() {
+    let mut h = Harness::new("1s", "0").wake_grace_secs(0);
+    h.write_fork(
+        "goal.md",
+        "---\nfork: true\nrun_on: [idle]\nchain: true\n---\nGOAL",
+    );
+    h.start_daemon();
+    assert_ack(h.send_event(oc_event(&h, EventKind::SessionStart, "oc1")));
+
+    // Wake 1: the structured spec carries the chain flag and the sentinel.
+    let rx = h.park_stop_wait(oc_event(&h, EventKind::Stop, "oc1"));
+    let forks = wake_forks(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert_eq!(forks[0].name, "goal");
+    assert!(forks[0].chain, "structured spec must carry chain");
+    assert!(forks[0].prompt.contains("<<autofork:continue>>"));
+    assert_ack(h.request(RequestBody::ForkSpawned {
+        session_id: "oc1".into(),
+        fork: "goal".into(),
+        run_ref: "ses_g1".into(),
+    }));
+
+    // The completion carries `continue`: the parked poll is nudged and the
+    // re-park is answered with the same fork again.
+    let parked = h.park_stop_wait(oc_event(&h, EventKind::Stop, "oc1"));
+    std::thread::sleep(Duration::from_millis(400));
+    assert_ack(h.request(RequestBody::ForkCompleted {
+        session_id: "oc1".into(),
+        fork: "goal".into(),
+        run_ref: "ses_g1".into(),
+        status: "completed".into(),
+        cont: Some(true),
+    }));
+    assert!(matches!(
+        parked.recv_timeout(Duration::from_secs(5)).unwrap(),
+        ResponseBody::Waited
+    ));
+    let rx2 = h.park_stop_wait(oc_event(&h, EventKind::Stop, "oc1"));
+    let forks = wake_forks(rx2.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert_eq!(forks[0].name, "goal");
+
+    // Run 2 settles (no continue): the chain is over.
+    assert_ack(h.request(RequestBody::ForkSpawned {
+        session_id: "oc1".into(),
+        fork: "goal".into(),
+        run_ref: "ses_g2".into(),
+    }));
+    assert_ack(h.request(RequestBody::ForkCompleted {
+        session_id: "oc1".into(),
+        fork: "goal".into(),
+        run_ref: "ses_g2".into(),
+        status: "completed".into(),
+        cont: None,
+    }));
+    let rx3 = h.park_stop_wait(oc_event(&h, EventKind::Stop, "oc1"));
+    assert!(
+        rx3.recv_timeout(Duration::from_millis(2500)).is_err(),
+        "chain re-fired after settling"
+    );
+}
+
+#[test]
+fn gate_holds_idle_forks_until_chain_settles() {
+    let mut h = Harness::new("1s", "0").wake_grace_secs(0);
+    h.write_fork(
+        "goal.md",
+        "---\nfork: true\nrun_on: [idle: 0s]\nchain: true\ngate: true\n---\nGOAL",
+    );
+    h.write_fork("handover.md", "---\nfork: true\nrun_on: [idle: 1s]\n---\nH");
+    h.start_daemon();
+    h.write_transcript(100);
+    assert_ack(h.send_event(h.event_t(EventKind::SessionStart, "s1")));
+
+    // Wake 1: the goal fork fires right at the Stop; handover is not due yet.
+    let rx = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
+    let payload = wake_payload(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert!(payload.contains("due: goal"), "{payload}");
+    assert!(!payload.contains("due: handover"), "{payload}");
+
+    // Handover's deadline elapses mid-run, but the gate holds it.
+    h.append_fork_spawn("toolu_g1", "goal");
+    let rx2 = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
+    assert!(
+        rx2.recv_timeout(Duration::from_millis(2500)).is_err(),
+        "gate failed to hold the idle fork mid-chain"
+    );
+
+    // Run 1 continues the chain: the next wake is the goal fork again, and
+    // handover stays held even though its deadline has long elapsed.
+    h.append_completion_notification_result("toolu_g1", "completed", "more\n<<autofork:continue>>");
+    assert_ack(h.send_event(h.prompt_submit_notif_cont("s1", "toolu_g1")));
+    let rx3 = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
+    let payload = wake_payload(rx3.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert!(payload.contains("due: goal"), "{payload}");
+    assert!(!payload.contains("due: handover"), "{payload}");
+
+    // Run 2 settles the chain: the gate clears, the pause baseline resets,
+    // and handover fires at its own deadline measured from the next Stop.
+    h.append_fork_spawn("toolu_g2", "goal");
+    h.append_completion_notification("toolu_g2", "completed");
+    assert_ack(h.send_event(h.prompt_submit_notif("s1", "toolu_g2", "completed")));
+    let rx4 = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
+    let payload = wake_payload(rx4.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert!(payload.contains("due: handover"), "{payload}");
+    assert!(!payload.contains("due: goal"), "{payload}");
+}
+
+#[test]
+fn gate_belt_lifts_a_fumbled_wake() {
+    // A gate wake the model never acted on (no spawn observed) must not
+    // silence the other idle forks for the whole pause: the belt lifts the
+    // gate after the grace window, from the parked poll itself.
+    let mut h = Harness::new("1s", "0")
+        .wake_grace_secs(0)
+        .gate_grace_secs(1);
+    h.write_fork(
+        "goal.md",
+        "---\nfork: true\nrun_on: [idle: 0s]\nchain: true\ngate: true\n---\nGOAL",
+    );
+    h.write_fork("handover.md", "---\nfork: true\nrun_on: [idle: 1s]\n---\nH");
+    h.start_daemon();
+    h.write_transcript(100);
+    assert_ack(h.send_event(h.event_t(EventKind::SessionStart, "s1")));
+
+    let rx = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
+    let payload = wake_payload(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert!(payload.contains("due: goal"), "{payload}");
+
+    // No spawn ever lands. The next poll first holds handover, then the
+    // grace expires and the belt lifts the gate — handover fires.
+    let rx2 = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
+    let payload = wake_payload(rx2.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert!(payload.contains("due: handover"), "{payload}");
+    assert!(!payload.contains("due: goal"), "{payload}");
 }

@@ -165,6 +165,8 @@ async fn dispatch(daemon: &Arc<Daemon>, body: RequestBody) -> ResponseBody {
                     priority: e.parsed.def.priority,
                     overlap: e.parsed.def.overlap,
                     tags: e.parsed.def.tags.clone(),
+                    chain: e.parsed.def.chain,
+                    gate: e.parsed.def.gate,
                     warnings: e
                         .parsed
                         .warnings
@@ -187,7 +189,14 @@ async fn dispatch(daemon: &Arc<Daemon>, body: RequestBody) -> ResponseBody {
             fork,
             run_ref,
             status,
-        } => daemon.handle_fork_completed(&session_id, &fork, &run_ref, &status),
+            cont,
+        } => daemon.handle_fork_completed(
+            &session_id,
+            &fork,
+            &run_ref,
+            &status,
+            cont.unwrap_or(false),
+        ),
         RequestBody::Shutdown { drain } => {
             tracing::info!(drain, "shutdown requested");
             let daemon = daemon.clone();

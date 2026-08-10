@@ -36,6 +36,11 @@ pub struct TaskNotification {
     pub task_id: Option<String>,
     /// `completed` / `failed` / `stopped` — see [`is_terminal_status`].
     pub status: Option<String>,
+    /// The `<result>` payload ends with the chain sentinel: the fork asks to
+    /// run again. Only meaningful when the completion matches one of the
+    /// daemon's own spawns AND that fork opted in via `chain: true` — the
+    /// daemon checks both before acting.
+    pub continue_requested: bool,
 }
 
 /// Whether `text` is a task-notification, and if so its extracted envelope.
@@ -48,12 +53,25 @@ pub fn parse_task_notification(text: &str) -> Option<TaskNotification> {
     }
     // Only read the envelope, never the payload: the <summary>/<result> tags
     // can quote arbitrary text (including other notifications), so stop at the
-    // first closing of the envelope-level tags we care about.
+    // first closing of the envelope-level tags we care about. The one
+    // deliberate exception is the chain sentinel, position-anchored at the
+    // very end of the <result> payload (widest span, so quoted closers inside
+    // the report can't truncate it).
     Some(TaskNotification {
         tool_use_id: tag_value(trimmed, "tool-use-id"),
         task_id: tag_value(trimmed, "task-id"),
         status: tag_value(trimmed, "status"),
+        continue_requested: result_span(trimmed).is_some_and(crate::wake::wants_continue),
     })
+}
+
+/// The widest `<result>…</result>` span: from the first opener to the *last*
+/// closer, so a report that quotes `</result>` mid-text doesn't cut the scan
+/// short of the trailing sentinel line. `None` when the tag is absent.
+fn result_span(text: &str) -> Option<&str> {
+    let start = text.find("<result>")? + "<result>".len();
+    let end = text.rfind("</result>")?;
+    (end >= start).then(|| &text[start..end])
 }
 
 /// A terminal task status: the task will not produce further work on its own.
@@ -118,6 +136,35 @@ mod tests {
             parse_task_notification("the string <task-notification> mid-text"),
             None
         );
+    }
+
+    #[test]
+    fn continue_request_rides_on_the_result_tail() {
+        let n = parse_task_notification(
+            "<task-notification>\n<tool-use-id>toolu_1</tool-use-id>\n\
+             <status>completed</status>\n<summary>Agent finished</summary>\n\
+             <result>goal not met, queued 3 more items\n<<autofork:continue>>\n</result>\n\
+             </task-notification>",
+        )
+        .unwrap();
+        assert!(n.continue_requested);
+
+        // Sentinel quoted mid-report (with a quoted closer, even): not a request.
+        let n = parse_task_notification(
+            "<task-notification>\n<tool-use-id>toolu_1</tool-use-id>\n\
+             <status>completed</status>\n\
+             <result>the docs say `<<autofork:continue>></result>` chains a fork\ndone</result>\n\
+             </task-notification>",
+        )
+        .unwrap();
+        assert!(!n.continue_requested);
+
+        // No result tag at all.
+        let n = parse_task_notification(
+            "<task-notification>\n<task-id>abc</task-id>\n<status>stopped</status>",
+        )
+        .unwrap();
+        assert!(!n.continue_requested);
     }
 
     #[test]

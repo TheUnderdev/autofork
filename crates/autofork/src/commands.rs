@@ -235,6 +235,12 @@ pub fn list_forks(paths: &Paths, project: Option<std::path::PathBuf>) -> Result<
         if f.priority != 0 {
             details.push(format!("priority: {}", f.priority));
         }
+        if f.chain {
+            details.push("chain".into());
+        }
+        if f.gate {
+            details.push("gate".into());
+        }
         if !f.tags.is_empty() {
             details.push(format!("tags: {}", f.tags.join(", ")));
         }
@@ -305,6 +311,7 @@ pub fn run_fork(paths: &Paths, name: Option<String>, tag: Option<String>) -> Res
             after: Vec::new(),
             skill: autofork_core::discovery::skill_sibling(&e.path)
                 .map(|p| p.to_string_lossy().into_owned()),
+            chain: e.parsed.def.chain,
         })
         .collect();
     let payload = build_wake_payload(

@@ -20,7 +20,7 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
-const SCHEMA_VERSION: i32 = 7;
+const SCHEMA_VERSION: i32 = 8;
 
 /// Split a comma-joined tag column back into a list (trimmed, empties
 /// dropped). `NULL` (unset) stays `None`.
@@ -60,6 +60,10 @@ pub struct SessionRow {
     /// here, so wake-turn Stops don't reset the clock. `None` until the first
     /// Stop of a pause.
     pub pause_started_at: Option<i64>,
+    /// The `gate: true` fork currently holding this session's other idle
+    /// forks, if any (set at its wake issuance, cleared when its run/chain
+    /// settles or on genuine user activity).
+    pub active_gate: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -279,6 +283,16 @@ impl Store {
                  COMMIT;",
             )?;
         }
+        if version < 8 {
+            // The gate fork currently holding this session's other idle forks
+            // (`gate: true`): set at wake issuance, cleared when its run/chain
+            // settles, on genuine user activity, and on session close.
+            conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE sessions ADD COLUMN active_gate TEXT;
+                 COMMIT;",
+            )?;
+        }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(Self { conn })
     }
@@ -335,7 +349,7 @@ impl Store {
                 "SELECT session_id, project_root, cwd, transcript_path, status, last_activity,
                         transcript_offset, prompt_tokens, model, created_at,
                         enable_tags, disable_tags, pause_epoch, pause_started_at,
-                        context_window
+                        context_window, active_gate
                  FROM sessions WHERE session_id = ?1",
                 params![session_id],
                 Self::row_to_session,
@@ -364,18 +378,77 @@ impl Store {
             pause_epoch: row.get(12)?,
             pause_started_at: row.get(13)?,
             context_window: row.get::<_, Option<i64>>(14)?.map(|n| n as u64),
+            active_gate: row.get(15)?,
         })
     }
 
     /// Advance the pause epoch and clear the pause baseline (genuine user
-    /// activity begins a new pause).
+    /// activity begins a new pause). Also drops any active gate — the user
+    /// spoke, so the goal chain's hold on other forks is over.
     pub fn bump_pause_epoch(&self, session_id: &str) -> rusqlite::Result<()> {
         self.conn.execute(
-            "UPDATE sessions SET pause_epoch = pause_epoch + 1, pause_started_at = NULL
+            "UPDATE sessions SET pause_epoch = pause_epoch + 1, pause_started_at = NULL,
+                                 active_gate = NULL
              WHERE session_id = ?1",
             params![session_id],
         )?;
         Ok(())
+    }
+
+    /// Clear the pause baseline without advancing the epoch: a gate fork's
+    /// chain settled, so the pause effectively (re)starts — held idle forks'
+    /// deadlines measure from the next Stop. Latches stay: forks that already
+    /// fired this pause don't re-fire.
+    pub fn clear_pause_baseline(&self, session_id: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET pause_started_at = NULL WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        Ok(())
+    }
+
+    /// Record the gate fork currently holding this session's other idle forks.
+    pub fn set_active_gate(&self, session_id: &str, fork_name: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET active_gate = ?2 WHERE session_id = ?1",
+            params![session_id, fork_name],
+        )?;
+        Ok(())
+    }
+
+    /// Drop the active gate (its run/chain settled, or the belt lifted it).
+    pub fn clear_active_gate(&self, session_id: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET active_gate = NULL WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        Ok(())
+    }
+
+    /// Whether the session has a live (non-terminal) spawn of this fork —
+    /// the gate belt's "is it actually running" check.
+    pub fn live_spawn_exists(&self, session_id: &str, fork_name: &str) -> rusqlite::Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM fork_spawns
+             WHERE session_id = ?1 AND fork_name = ?2 AND status = 'spawned'",
+            params![session_id, fork_name],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// When this fork's latest wake was issued in this session, if ever.
+    pub fn last_issued_at(
+        &self,
+        session_id: &str,
+        fork_name: &str,
+    ) -> rusqlite::Result<Option<i64>> {
+        self.conn.query_row(
+            "SELECT MAX(started_at) FROM fork_runs
+             WHERE session_id = ?1 AND fork_name = ?2",
+            params![session_id, fork_name],
+            |r| r.get::<_, Option<i64>>(0),
+        )
     }
 
     /// Set the pause baseline to `now` only if it is unset (the first Stop of
@@ -398,7 +471,7 @@ impl Store {
             "SELECT session_id, project_root, cwd, transcript_path, status, last_activity,
                     transcript_offset, prompt_tokens, model, created_at,
                     enable_tags, disable_tags, pause_epoch, pause_started_at,
-                    context_window
+                    context_window, active_gate
              FROM sessions WHERE status = 'open' ORDER BY last_activity DESC",
         )?;
         let rows = stmt.query_map([], Self::row_to_session)?;
@@ -677,9 +750,14 @@ impl Store {
     }
 
     /// Mark a recorded fork spawn terminal (`completed`/`failed`/`stopped`),
-    /// matching by tool-use id or task id. Returns whether a spawn matched
-    /// (i.e. the notification was one of the daemon's own forks). A spawn
-    /// already terminal keeps its first status and `terminal_at`.
+    /// matching by tool-use id or task id. Returns `(matched, transitioned)`:
+    /// `matched` = the notification was one of the daemon's own forks (drives
+    /// pause-epoch classification, true even for an already-terminal spawn);
+    /// `transitioned` = this call flipped it from `spawned` to terminal (the
+    /// once-only edge chain re-arms key on — the same notification is often
+    /// seen twice, once via the PromptSubmit ids and once via the transcript
+    /// delta, and must not re-arm twice). An already-terminal spawn keeps its
+    /// first status and `terminal_at`.
     pub fn mark_spawn_terminal(
         &self,
         session_id: &str,
@@ -687,18 +765,73 @@ impl Store {
         task_id: Option<&str>,
         status: &str,
         now: i64,
-    ) -> rusqlite::Result<bool> {
+    ) -> rusqlite::Result<(bool, bool)> {
         if !self.is_fork_spawn(session_id, tool_use_id, task_id)? {
-            return Ok(false);
+            return Ok((false, false));
         }
-        self.conn.execute(
+        let n = self.conn.execute(
             "UPDATE fork_spawns SET status = ?4, terminal_at = ?5
              WHERE session_id = ?1 AND status = 'spawned'
                AND ((?2 IS NOT NULL AND tool_use_id = ?2)
                  OR (?3 IS NOT NULL AND task_id = ?3))",
             params![session_id, tool_use_id, task_id, status, now],
         )?;
-        Ok(true)
+        Ok((true, n > 0))
+    }
+
+    /// The fork name recorded for a spawn, matched by tool-use id or task id.
+    /// `None` when nothing matches or the spawn prompt didn't carry the
+    /// name fingerprint.
+    pub fn spawn_fork_name(
+        &self,
+        session_id: &str,
+        tool_use_id: Option<&str>,
+        task_id: Option<&str>,
+    ) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT fork_name FROM fork_spawns
+                 WHERE session_id = ?1
+                   AND ((?2 IS NOT NULL AND tool_use_id = ?2)
+                     OR (?3 IS NOT NULL AND task_id = ?3))",
+                params![session_id, tool_use_id, task_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(|v| v.flatten())
+    }
+
+    /// Release a chaining fork's once-per-pause idle latch so it can fire
+    /// again within the same pause. Returns whether a latch row was cleared.
+    pub fn rearm_idle_latch(
+        &self,
+        session_id: &str,
+        fork_name: &str,
+        pause_epoch: i64,
+    ) -> rusqlite::Result<bool> {
+        let n = self.conn.execute(
+            "DELETE FROM fork_fires
+             WHERE session_id = ?1 AND fork_name = ?2 AND trigger_label = ?3",
+            params![session_id, fork_name, format!("idle-pause:{pause_epoch}")],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// How many wakes of this fork were issued in this session at or after
+    /// `since` — the chain-limit gauge (a chain's runs all land in one pause,
+    /// whose baseline is `since`).
+    pub fn count_runs_since(
+        &self,
+        session_id: &str,
+        fork_name: &str,
+        since: i64,
+    ) -> rusqlite::Result<i64> {
+        self.conn.query_row(
+            "SELECT COUNT(*) FROM fork_runs
+             WHERE session_id = ?1 AND fork_name = ?2 AND started_at >= ?3",
+            params![session_id, fork_name, since],
+            |r| r.get(0),
+        )
     }
 
     /// Whether fork `fork_name` reached a terminal status in this session at
@@ -1015,26 +1148,99 @@ mod tests {
         s.set_spawn_task_id("a", "toolu_1", "task_9").unwrap();
         // Unknown tool uses are not fork spawns.
         assert!(!s.is_fork_spawn("a", Some("toolu_other"), None).unwrap());
-        assert!(!s
-            .mark_spawn_terminal("a", Some("toolu_other"), Some("task_x"), "completed", 130)
-            .unwrap());
+        assert_eq!(
+            s.mark_spawn_terminal("a", Some("toolu_other"), Some("task_x"), "completed", 130)
+                .unwrap(),
+            (false, false)
+        );
         // Match by tool-use id or by task id; wrong session never matches.
         assert!(s.is_fork_spawn("a", Some("toolu_1"), None).unwrap());
         assert!(s.is_fork_spawn("a", None, Some("task_9")).unwrap());
         assert!(!s.is_fork_spawn("b", Some("toolu_1"), None).unwrap());
+        assert_eq!(
+            s.spawn_fork_name("a", Some("toolu_1"), None).unwrap(),
+            Some("journal".to_string())
+        );
+        assert_eq!(s.spawn_fork_name("a", Some("toolu_x"), None).unwrap(), None);
         assert!(!s.fork_completed_since("a", "journal", 0).unwrap());
-        assert!(s
-            .mark_spawn_terminal("a", None, Some("task_9"), "completed", 140)
-            .unwrap());
+        assert_eq!(
+            s.mark_spawn_terminal("a", None, Some("task_9"), "completed", 140)
+                .unwrap(),
+            (true, true)
+        );
         assert!(s.fork_completed_since("a", "journal", 110).unwrap());
         // Completions only count from `since` on.
         assert!(!s.fork_completed_since("a", "journal", 141).unwrap());
-        // A repeat notification (same task-id) stays matched, keeps first stamp.
-        assert!(s
-            .mark_spawn_terminal("a", Some("toolu_1"), None, "stopped", 150)
-            .unwrap());
+        // A repeat notification (same task-id) stays matched but does NOT
+        // transition again (the chain re-arm edge fires once), keeps first stamp.
+        assert_eq!(
+            s.mark_spawn_terminal("a", Some("toolu_1"), None, "stopped", 150)
+                .unwrap(),
+            (true, false)
+        );
         assert!(!s.fork_completed_since("a", "journal", 141).unwrap());
         assert!(s.fork_completed_since("a", "journal", 140).unwrap());
+    }
+
+    #[test]
+    fn chain_rearm_and_run_counting() {
+        let s = store();
+        seed_session(&s, "a", "/p", 100);
+        // Latch the fork for pause epoch 0, as wake-issuance does.
+        assert!(s.try_latch_fire("a", "goal", "idle-pause:0", 110).unwrap());
+        assert!(s.is_latched("a", "goal", "idle-pause:0").unwrap());
+        // Re-arm clears exactly that latch; a second re-arm is a no-op.
+        assert!(s.rearm_idle_latch("a", "goal", 0).unwrap());
+        assert!(!s.is_latched("a", "goal", "idle-pause:0").unwrap());
+        assert!(!s.rearm_idle_latch("a", "goal", 0).unwrap());
+        // Other forks/epochs are untouched.
+        assert!(s.try_latch_fire("a", "other", "idle-pause:0", 111).unwrap());
+        assert!(!s.rearm_idle_latch("a", "other", 1).unwrap());
+        assert!(s.is_latched("a", "other", "idle-pause:0").unwrap());
+
+        // Run counting since a baseline.
+        s.record_issued_run("a", "goal", "idle", None, 120).unwrap();
+        s.record_issued_run("a", "goal", "idle", None, 130).unwrap();
+        s.record_issued_run("a", "other", "idle", None, 130)
+            .unwrap();
+        assert_eq!(s.count_runs_since("a", "goal", 100).unwrap(), 2);
+        assert_eq!(s.count_runs_since("a", "goal", 125).unwrap(), 1);
+        assert_eq!(s.count_runs_since("a", "goal", 131).unwrap(), 0);
+        assert_eq!(s.last_issued_at("a", "goal").unwrap(), Some(130));
+        assert_eq!(s.last_issued_at("a", "never").unwrap(), None);
+    }
+
+    #[test]
+    fn active_gate_lifecycle() {
+        let s = store();
+        seed_session(&s, "a", "/p", 100);
+        assert_eq!(s.get_session("a").unwrap().unwrap().active_gate, None);
+        s.set_active_gate("a", "goal").unwrap();
+        assert_eq!(
+            s.get_session("a").unwrap().unwrap().active_gate,
+            Some("goal".to_string())
+        );
+        // The chain settling clears the gate and the baseline, epoch untouched.
+        s.set_pause_started_at_if_unset("a", 150).unwrap();
+        s.clear_active_gate("a").unwrap();
+        s.clear_pause_baseline("a").unwrap();
+        let row = s.get_session("a").unwrap().unwrap();
+        assert_eq!(row.active_gate, None);
+        assert_eq!(row.pause_started_at, None);
+        assert_eq!(row.pause_epoch, 0);
+        // Genuine user activity drops the gate too.
+        s.set_active_gate("a", "goal").unwrap();
+        s.bump_pause_epoch("a").unwrap();
+        assert_eq!(s.get_session("a").unwrap().unwrap().active_gate, None);
+
+        // Live-spawn probe for the gate belt.
+        assert!(!s.live_spawn_exists("a", "goal").unwrap());
+        s.record_spawn("a", "toolu_g", Some("goal"), 160).unwrap();
+        assert!(s.live_spawn_exists("a", "goal").unwrap());
+        let _ = s
+            .mark_spawn_terminal("a", Some("toolu_g"), None, "completed", 170)
+            .unwrap();
+        assert!(!s.live_spawn_exists("a", "goal").unwrap());
     }
 
     #[test]
@@ -1049,7 +1255,8 @@ mod tests {
         assert!(!s.is_fork_run_ref("ses_ordinary").unwrap());
         // Terminal runs stay recognized: a finished fork session going idle
         // again must not become schedulable.
-        s.mark_spawn_terminal("a", Some("ses_fork_run"), None, "completed", 120)
+        let _ = s
+            .mark_spawn_terminal("a", Some("ses_fork_run"), None, "completed", 120)
             .unwrap();
         assert!(s.is_fork_run_ref("ses_fork_run").unwrap());
     }

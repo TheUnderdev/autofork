@@ -29,6 +29,36 @@ pub const WAKE_MARKER: &str = "source: autofork";
 /// never drift.
 pub const SPAWN_CTX_PREFIX: &str = "Context for this run: fork '";
 
+/// The chain sentinel: a `chain: true` fork whose report *ends* with a line
+/// that is exactly this asks autofork to run it again once the parent session
+/// has digested the report. Only the fork's own final message decides — a run
+/// that omits the line ends the chain. Honored only for forks that opted in
+/// via `chain: true` frontmatter, and only up to the fork's `chain_limit`.
+/// Frozen forever once shipped: fork bodies in the wild reference it.
+pub const CONTINUE_SENTINEL: &str = "<<autofork:continue>>";
+
+/// Whether a fork report requests another run: its last non-empty line is
+/// exactly the [`CONTINUE_SENTINEL`]. Position-anchored on purpose — a report
+/// that merely *quotes* the sentinel mid-text does not chain.
+pub fn wants_continue(report: &str) -> bool {
+    report
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .is_some_and(|l| l.trim() == CONTINUE_SENTINEL)
+}
+
+/// `report` with a trailing [`CONTINUE_SENTINEL`] line removed (for clients
+/// that inject the report themselves and can hand the parent a clean text).
+/// Returns the report unchanged when it doesn't end with the sentinel.
+pub fn strip_continue(report: &str) -> &str {
+    if !wants_continue(report) {
+        return report;
+    }
+    let cut = report.rfind(CONTINUE_SENTINEL).unwrap_or(report.len());
+    report[..cut].trim_end()
+}
+
 /// Whether a submitted "prompt" is actually a non-waking continuation — an
 /// asyncRewake wake reminder (carries [`WAKE_MARKER`]) or a background-task
 /// completion notification — rather than genuine user input. This is the
@@ -63,6 +93,9 @@ pub struct DueFork {
     /// prompt tells the fork to load the skill first if it isn't already in
     /// context.
     pub skill: Option<String>,
+    /// `chain: true` frontmatter: the spawn prompt tells the fork it may end
+    /// its report with the [`CONTINUE_SENTINEL`] to request another run.
+    pub chain: bool,
 }
 
 /// A fork the daemon is holding back until its predecessors finish, named in
@@ -96,12 +129,22 @@ fn spawn_prompt(
         ),
         None => String::new(),
     };
+    let chain_line = if fork.chain {
+        format!(
+            " This fork may chain: if its goal needs another run after this one, end your \
+             report with a final line that is exactly {CONTINUE_SENTINEL} — autofork will \
+             run this fork again once the parent session has seen your report. When the \
+             goal is met (or nothing needs doing), do not emit that line; the chain ends."
+        )
+    } else {
+        String::new()
+    };
     format!(
         "Read the file {path} and follow the instructions in its body.{skill_line} \
          {SPAWN_CTX_PREFIX}{name}', trigger '{trigger}', parent session {session_id}, conversation \
          {conversation_id}, project root {project_root}. The conversation id is stable when \
          a session is resumed (a resumed session gets a fresh session id); key any \
-         per-conversation artifacts on it. Your final message is your report.",
+         per-conversation artifacts on it. Your final message is your report.{chain_line}",
         path = fork.path,
         name = fork.name,
         trigger = fork.trigger,
@@ -262,6 +305,7 @@ pub fn build_wake_forks(
             trigger: f.trigger.clone(),
             overlap: f.overlap,
             after: f.after.clone(),
+            chain: f.chain,
             prompt: spawn_prompt(f, session_id, conversation_id, project_root),
         })
         .collect()
@@ -298,7 +342,52 @@ mod tests {
             overlap,
             after: after.iter().map(|s| s.to_string()).collect(),
             skill: None,
+            chain: false,
         }
+    }
+
+    #[test]
+    fn continue_sentinel_anchors_on_the_last_line() {
+        assert!(wants_continue("goal not met yet\n<<autofork:continue>>"));
+        assert!(wants_continue("report\n\n  <<autofork:continue>>  \n\n"));
+        assert!(wants_continue(CONTINUE_SENTINEL));
+        // Mid-text mention (quoting the docs) does not chain.
+        assert!(!wants_continue(
+            "the sentinel is <<autofork:continue>>, which I did not emit\ndone"
+        ));
+        assert!(!wants_continue("plain report"));
+        assert!(!wants_continue(""));
+    }
+
+    #[test]
+    fn strip_continue_removes_only_a_trailing_sentinel() {
+        assert_eq!(
+            strip_continue("progress so far\n<<autofork:continue>>"),
+            "progress so far"
+        );
+        assert_eq!(
+            strip_continue("report\n\n<<autofork:continue>>\n"),
+            "report"
+        );
+        let quoted = "the sentinel is <<autofork:continue>>, not emitted\ndone";
+        assert_eq!(strip_continue(quoted), quoted);
+        assert_eq!(strip_continue(CONTINUE_SENTINEL), "");
+    }
+
+    #[test]
+    fn chain_fork_prompt_teaches_the_sentinel() {
+        let mut f = due("goal", &[], false);
+        f.chain = true;
+        let p = build_wake_payload("s", "conv-s", "/p", &[f.clone()], &[]);
+        assert!(p.contains(CONTINUE_SENTINEL));
+        assert!(p.contains("This fork may chain"));
+        // The structured spec mirrors the flag and the prompt wording.
+        let forks = build_wake_forks("s", "conv-s", "/p", &[f]);
+        assert!(forks[0].chain);
+        assert!(forks[0].prompt.contains(CONTINUE_SENTINEL));
+        // A non-chain fork's prompt never mentions the sentinel.
+        let p = build_wake_payload("s", "conv-s", "/p", &[due("j", &[], false)], &[]);
+        assert!(!p.contains(CONTINUE_SENTINEL));
     }
 
     #[test]

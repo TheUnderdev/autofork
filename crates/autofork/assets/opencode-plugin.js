@@ -6,7 +6,9 @@
 // copies of the conversation made with opencode's native session fork, which
 // reuse the parent's prompt cache (~100% measured) — and their reports are
 // injected back into the parent as no-reply messages the model sees on the
-// next turn.
+// next turn. Exception: a `chain: true` fork's report that ends with the
+// continue sentinel is injected as a real turn (the parent reacts to it),
+// and the daemon re-fires the fork once the turn settles — the goal loop.
 //
 // Transport: shells out to `autofork opencode hook <kind>` (JSON on stdin),
 // which owns daemon spawn and version handshakes. The idle long-poll is one
@@ -21,6 +23,27 @@ const TITLE_PREFIX = "autofork/";
 // marker can be lost to auto-titling, a failed update, or another plugin
 // instance, and a fork run mistaken for a real session breeds forks of forks.
 const SPAWN_CTX = "Context for this run: fork '";
+// The chain sentinel (CONTINUE_SENTINEL in autofork-core's wake.rs — keep in
+// sync). A `chain: true` fork whose report *ends* with this line asks to run
+// again: its report is injected as a real turn (the parent reacts to it) and
+// the completion frame carries `continue: true` so the daemon re-arms it.
+const CONTINUE = "<<autofork:continue>>";
+
+// Whether a report's last non-empty line is exactly the sentinel
+// (position-anchored: a report merely quoting it mid-text does not chain).
+function wantsContinue(text) {
+  const lines = text.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const t = lines[i].trim();
+    if (t) return t === CONTINUE;
+  }
+  return false;
+}
+
+function stripContinue(text) {
+  const cut = text.lastIndexOf(CONTINUE);
+  return cut < 0 ? text : text.slice(0, cut).trimEnd();
+}
 
 export const AutoforkPlugin = async ({ client, directory, worktree }) => {
   // Per-session tracking (parent sessions only).
@@ -35,6 +58,11 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
   // Sessions we determined are not ours to schedule (subagent children,
   // leftover fork sessions from a previous plugin life).
   const ignored = new Set();
+  // Parents about to receive a chain report as a *real* turn: that turn's
+  // busy transition must be reported as non-waking (it is autofork's own
+  // continuation, not user activity — a waking prompt-submit would bump the
+  // pause epoch and re-fire every idle fork).
+  const injectTurn = new Set();
   // Parked stop-wait subprocesses: sessionID -> proc.
   const parked = new Map();
   // Re-park backoff: sessionID -> {delay, lastParkAt}.
@@ -229,6 +257,7 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
           parent: parentID,
           fork: spec.name,
           trigger: spec.trigger,
+          chain: spec.chain === true,
           done: false,
         });
         liveByFork.set(spec.name, (liveByFork.get(spec.name) ?? 0) + 1);
@@ -295,6 +324,12 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
     } catch {
       // fall through with an empty report
     }
+    // A chain fork's run decides, per run, whether to continue: a report
+    // ending with the sentinel line asks for another. The sentinel is
+    // stripped — the parent sees a clean report — and honored only for
+    // `chain: true` forks (the daemon double-checks the definition too).
+    const chainNext = status === "completed" && run.chain && wantsContinue(report);
+    if (chainNext) report = stripContinue(report);
     if (status === "completed" && report) {
       reports.set(reportKey(run.parent, run.fork), report);
     }
@@ -304,18 +339,41 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
         : `(the fork run ${status}${report ? `; its last message:\n${report}` : ""})`;
     const block = `---\nsource: autofork\nfork: ${run.fork} (trigger: ${run.trigger}) — ${status}\n---\n${body}`;
     try {
-      await client.session.prompt({
-        path: { id: run.parent },
-        body: { noReply: true, parts: [{ type: "text", text: block }] },
-      });
+      if (chainNext) {
+        // The chain continues: inject the report as a REAL turn, so the
+        // parent model reacts to it (works toward the goal) instead of
+        // parking it for later. Flag the busy transition this starts as
+        // non-waking BEFORE prompting — the event can arrive mid-await.
+        // Pin the parent's own model/agent, like the fork prompt does.
+        const parent = sessionState(run.parent);
+        injectTurn.add(run.parent);
+        await client.session.promptAsync({
+          path: { id: run.parent },
+          body: {
+            ...(parent.model ? { model: parent.model } : {}),
+            ...(parent.agent ? { agent: parent.agent } : {}),
+            parts: [{ type: "text", text: block }],
+          },
+        });
+      } else {
+        await client.session.prompt({
+          path: { id: run.parent },
+          body: { noReply: true, parts: [{ type: "text", text: block }] },
+        });
+      }
     } catch {
-      // The parent may be gone; the completion still counts below.
+      // The parent may be gone; the completion still counts below. Never
+      // leave a stale non-waking flag behind for a turn that won't happen.
+      injectTurn.delete(run.parent);
     }
+    // `continue` rides even if the injection failed: the daemon re-arms the
+    // fork and the chain resumes from the parent's next idle poll.
     await call("fork-completed", {
       session_id: run.parent,
       fork: run.fork,
       run_ref: id,
       status,
+      ...(chainNext ? { continue: true } : {}),
     });
   }
 
@@ -362,12 +420,19 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
           await park(id);
         } else if (was !== "busy") {
           // Transition only: opencode republishes `busy` every tool
-          // round-trip, but one turn is one pause-ending activity. A genuine
-          // turn started (our report injections never start one): cancels any
-          // parked poll, begins a new pause. Then park a busy poll so
-          // `every:`/context forks can still fire mid-run.
+          // round-trip, but one turn is one pause-ending activity. Our
+          // zero-turn (noReply) report injections never start one; the one
+          // turn we DO start ourselves — a chain report — is flagged
+          // non-waking so it doesn't bump the pause epoch. Everything else
+          // is a genuine turn: cancels any parked poll, begins a new pause.
+          // Then park a busy poll so `every:`/context forks can still fire
+          // mid-run.
           await ensureStarted(id);
-          await call("prompt-submit", { session_id: id });
+          const nonWaking = injectTurn.delete(id);
+          await call("prompt-submit", {
+            session_id: id,
+            ...(nonWaking ? { waking: false } : {}),
+          });
           backoff.delete(id);
           await park(id);
         }
@@ -407,6 +472,7 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
         sessions.delete(id);
         ignored.delete(id);
         backoff.delete(id);
+        injectTurn.delete(id);
         return;
       }
     },

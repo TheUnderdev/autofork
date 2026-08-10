@@ -325,28 +325,55 @@ impl Daemon {
                     // foreign activity, and re-fired the idle fork forever
                     // after, once per fork run).
                     self.ingest_transcript(&ev);
-                    let store = self.store.lock().unwrap();
                     let status = ev.notif_status.as_deref().unwrap_or("");
-                    let matched = if autofork_core::notification::is_terminal_status(status) {
-                        store
-                            .mark_spawn_terminal(
-                                &ev.session_id,
-                                ev.notif_tool_use_id.as_deref(),
-                                ev.notif_task_id.as_deref(),
-                                status,
-                                t,
-                            )
-                            .unwrap_or(false)
-                    } else {
-                        store
-                            .is_fork_spawn(
-                                &ev.session_id,
-                                ev.notif_tool_use_id.as_deref(),
-                                ev.notif_task_id.as_deref(),
-                            )
-                            .unwrap_or(false)
+                    let (matched, transitioned) = {
+                        let store = self.store.lock().unwrap();
+                        if autofork_core::notification::is_terminal_status(status) {
+                            store
+                                .mark_spawn_terminal(
+                                    &ev.session_id,
+                                    ev.notif_tool_use_id.as_deref(),
+                                    ev.notif_task_id.as_deref(),
+                                    status,
+                                    t,
+                                )
+                                .unwrap_or((false, false))
+                        } else {
+                            let matched = store
+                                .is_fork_spawn(
+                                    &ev.session_id,
+                                    ev.notif_tool_use_id.as_deref(),
+                                    ev.notif_task_id.as_deref(),
+                                )
+                                .unwrap_or(false);
+                            (matched, false)
+                        }
                     };
-                    drop(store);
+                    // One of our own fork runs just settled: handle chain
+                    // re-arm (report ended with the sentinel) and gate
+                    // release. The `transitioned` edge fires once even though
+                    // the same notification is also seen in the transcript
+                    // delta.
+                    if transitioned {
+                        let fork = {
+                            let store = self.store.lock().unwrap();
+                            store
+                                .spawn_fork_name(
+                                    &ev.session_id,
+                                    ev.notif_tool_use_id.as_deref(),
+                                    ev.notif_task_id.as_deref(),
+                                )
+                                .unwrap_or(None)
+                        };
+                        if let Some(fork) = fork {
+                            self.on_own_fork_terminal(
+                                &ev.session_id,
+                                &fork,
+                                status,
+                                ev.notif_continue == Some(true),
+                            );
+                        }
+                    }
                     !matched && !self.recently_woke(&ev.session_id, t)
                 } else {
                     ev.waking
@@ -550,6 +577,19 @@ impl Daemon {
         let fire_instants: Vec<i64> = {
             let mut v: Vec<i64> = deadlines.iter().map(|&d| baseline + d as i64).collect();
             v.extend(every_times);
+            // An active gate silences the other idle forks; if its spawn was
+            // fumbled, the belt lifts it at issuance + grace — schedule an
+            // evaluation there, or a quiet session would never re-check and
+            // the held forks would stay silenced for the whole pause.
+            if let Some(g) = session.active_gate.as_deref() {
+                let issued = {
+                    let store = self.store.lock().unwrap();
+                    store.last_issued_at(&session.session_id, g).ok().flatten()
+                };
+                if let Some(at) = issued {
+                    v.push(at + crate::planner::gate_grace_secs() + 1);
+                }
+            }
             v.sort_unstable();
             v.dedup();
             v
@@ -634,24 +674,112 @@ impl Daemon {
     /// any `after` dependents this completion unblocked. (Claude Code gets the
     /// same effect from the completion notification's relay turn ending in a
     /// new Stop poll; opencode has no such turn, hence the nudge.)
+    ///
+    /// `cont`: the run's report ended with the chain sentinel — re-arm the
+    /// fork's once-per-pause latch (chain-gated) before the nudge, so the
+    /// re-parked poll selects it again.
     pub fn handle_fork_completed(
         self: &Arc<Self>,
         session_id: &str,
         fork: &str,
         run_ref: &str,
         status: &str,
+        cont: bool,
     ) -> ResponseBody {
         self.touch_busy();
-        {
+        let transitioned = {
             let store = self.store.lock().unwrap();
-            let matched = store
+            let (matched, transitioned) = store
                 .mark_spawn_terminal(session_id, Some(run_ref), None, status, now())
-                .unwrap_or(false);
-            tracing::debug!(session = %session_id, fork, run_ref, status, matched,
+                .unwrap_or((false, false));
+            tracing::debug!(session = %session_id, fork, run_ref, status, matched, cont,
                 "opencode fork completion");
+            transitioned
+        };
+        if transitioned {
+            self.on_own_fork_terminal(session_id, fork, status, cont);
         }
         self.cancel_wait(session_id);
         ResponseBody::Ack
+    }
+
+    /// One of the daemon's own fork runs reached a terminal status (the
+    /// `transitioned` edge — callers must dedupe on it, since the same
+    /// completion is often seen twice). Two duties:
+    ///
+    /// **Chain re-arm** — the run completed and its report ended with the
+    /// continue sentinel: clear the fork's once-per-pause idle latch so the
+    /// next parked poll re-selects it. No epoch bump and no baseline touch,
+    /// so every *other* idle fork stays exactly as it was, and the fork's
+    /// idle deadline (measured from the pause baseline) has long elapsed —
+    /// the re-fire is immediate once the session idles again. Honored only
+    /// when the fork's current definition opts in (`chain: true`) and its
+    /// wakes this pause stay under the chain limit.
+    ///
+    /// **Gate release** — the fork holds the session's gate and did NOT
+    /// re-arm (chain settled, run failed, or the limit tripped): drop the
+    /// gate and clear the pause baseline, so the held idle forks' deadlines
+    /// measure from the next Stop — the pause effectively begins now.
+    fn on_own_fork_terminal(&self, session_id: &str, fork_name: &str, status: &str, cont: bool) {
+        let (session, entry) = {
+            let store = self.store.lock().unwrap();
+            let session = store.get_session(session_id).ok().flatten();
+            let entry = store
+                .roster(session_id)
+                .ok()
+                .and_then(|roster| roster.into_iter().find(|e| e.fork_name == fork_name));
+            (session, entry)
+        };
+        let Some(session) = session else { return };
+        let def = entry
+            .and_then(|e| std::fs::read_to_string(&e.fork_path).ok())
+            .and_then(|content| {
+                use autofork_core::frontmatter::ForkParse;
+                match autofork_core::frontmatter::parse_fork_file(fork_name, &content) {
+                    ForkParse::Fork(parsed) => Some(parsed.def),
+                    _ => None,
+                }
+            });
+
+        let mut rearmed = false;
+        if cont && status == "completed" {
+            match &def {
+                Some(def) if def.chain => {
+                    let cfg = self.cfg_for(Some(&session.project_root));
+                    let limit = def.chain_limit.unwrap_or(cfg.chain_limit) as i64;
+                    let since = session.pause_started_at.unwrap_or(session.created_at);
+                    let store = self.store.lock().unwrap();
+                    let runs = store
+                        .count_runs_since(session_id, fork_name, since)
+                        .unwrap_or(0);
+                    if runs >= limit {
+                        tracing::warn!(session = %session_id, fork = fork_name, runs, limit,
+                            "chain limit reached, not re-arming");
+                    } else if store
+                        .rearm_idle_latch(session_id, fork_name, session.pause_epoch)
+                        .unwrap_or(false)
+                    {
+                        tracing::info!(session = %session_id, fork = fork_name, runs,
+                            "chain continue: idle latch re-armed");
+                        rearmed = true;
+                    }
+                }
+                _ => {
+                    tracing::debug!(session = %session_id, fork = fork_name,
+                        "continue sentinel from a fork without chain: true, ignoring");
+                }
+            }
+        }
+
+        // Gate release keys on the *persisted* gate, not the definition —
+        // a moved/edited fork file must not leave the gate wedged.
+        if !rearmed && session.active_gate.as_deref() == Some(fork_name) {
+            let store = self.store.lock().unwrap();
+            let _ = store.clear_active_gate(session_id);
+            let _ = store.clear_pause_baseline(session_id);
+            tracing::info!(session = %session_id, fork = fork_name, status,
+                "gate settled: releasing held idle forks, pause restarts");
+        }
     }
 
     /// Read the transcript delta (updating the stored offset): refresh the
@@ -667,40 +795,62 @@ impl Daemon {
         match crate::transcript::read_delta(transcript, session.transcript_offset) {
             Ok(delta) => {
                 let t = now();
-                let store = self.store.lock().unwrap();
-                for (tool_use_id, fork_name) in &delta.spawns {
-                    tracing::debug!(session = %ev.session_id, tool_use_id, fork = ?fork_name,
-                        "fork spawn observed");
-                    let _ =
-                        store.record_spawn(&ev.session_id, tool_use_id, fork_name.as_deref(), t);
-                }
-                for (tool_use_id, task_id) in &delta.task_ids {
-                    let _ = store.set_spawn_task_id(&ev.session_id, tool_use_id, task_id);
-                }
-                for n in &delta.notifications {
-                    let Some(status) = n
-                        .status
-                        .as_deref()
-                        .filter(|s| autofork_core::notification::is_terminal_status(s))
-                    else {
-                        continue;
-                    };
-                    if let Ok(true) = store.mark_spawn_terminal(
-                        &ev.session_id,
-                        n.tool_use_id.as_deref(),
-                        n.task_id.as_deref(),
-                        status,
-                        t,
-                    ) {
-                        tracing::debug!(session = %ev.session_id, status,
-                            tool_use_id = ?n.tool_use_id, "fork completion observed");
+                // (fork, status, continue_requested) for spawns this delta
+                // flipped terminal — processed after the lock drops, since
+                // the terminal handler takes its own locks.
+                let mut settled: Vec<(String, String, bool)> = Vec::new();
+                {
+                    let store = self.store.lock().unwrap();
+                    for (tool_use_id, fork_name) in &delta.spawns {
+                        tracing::debug!(session = %ev.session_id, tool_use_id, fork = ?fork_name,
+                            "fork spawn observed");
+                        let _ = store.record_spawn(
+                            &ev.session_id,
+                            tool_use_id,
+                            fork_name.as_deref(),
+                            t,
+                        );
                     }
+                    for (tool_use_id, task_id) in &delta.task_ids {
+                        let _ = store.set_spawn_task_id(&ev.session_id, tool_use_id, task_id);
+                    }
+                    for n in &delta.notifications {
+                        let Some(status) = n
+                            .status
+                            .as_deref()
+                            .filter(|s| autofork_core::notification::is_terminal_status(s))
+                        else {
+                            continue;
+                        };
+                        if let Ok((true, transitioned)) = store.mark_spawn_terminal(
+                            &ev.session_id,
+                            n.tool_use_id.as_deref(),
+                            n.task_id.as_deref(),
+                            status,
+                            t,
+                        ) {
+                            tracing::debug!(session = %ev.session_id, status,
+                                tool_use_id = ?n.tool_use_id, "fork completion observed");
+                            if transitioned {
+                                if let Ok(Some(fork)) = store.spawn_fork_name(
+                                    &ev.session_id,
+                                    n.tool_use_id.as_deref(),
+                                    n.task_id.as_deref(),
+                                ) {
+                                    settled.push((fork, status.to_string(), n.continue_requested));
+                                }
+                            }
+                        }
+                    }
+                    let _ = store.set_transcript_gauge(
+                        &ev.session_id,
+                        delta.new_offset,
+                        delta.prompt_tokens,
+                    );
                 }
-                let _ = store.set_transcript_gauge(
-                    &ev.session_id,
-                    delta.new_offset,
-                    delta.prompt_tokens,
-                );
+                for (fork, status, cont) in settled {
+                    self.on_own_fork_terminal(&ev.session_id, &fork, &status, cont);
+                }
                 delta.prompt_tokens.or(session.prompt_tokens)
             }
             Err(e) => {

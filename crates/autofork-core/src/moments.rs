@@ -116,8 +116,14 @@ pub fn match_moments(
                     now - base >= *interval_secs as i64 && pause_ok
                 }
                 (ForkMoment::Idle { deadline_secs }, ForkRunOn::Idle { after_secs }) => {
-                    let effective = after_secs.unwrap_or(default_idle_secs);
-                    effective > 0 && effective == *deadline_secs
+                    match after_secs {
+                        // Explicit deadline: 0 is legal — "at the first Stop
+                        // of the pause", the goal-fork recipe.
+                        Some(a) => a == deadline_secs,
+                        // Bare `idle` uses the configured default, where 0
+                        // means disabled.
+                        None => default_idle_secs > 0 && default_idle_secs == *deadline_secs,
+                    }
                 }
                 (ForkMoment::Context { prompt_tokens, .. }, ForkRunOn::ContextTokens(n)) => {
                     prompt_tokens >= n
@@ -150,7 +156,8 @@ pub fn match_moments(
 
 /// The distinct idle deadlines (seconds, ascending) the given forks need
 /// serviced: the default deadline when any fork uses a bare `idle`, plus
-/// every explicit `idle: <dur>`. Zero-duration deadlines are dropped.
+/// every explicit `idle: <dur>`. A zero *default* is "disabled" and dropped;
+/// an explicit `idle: 0s` is legal and fires at the pause's first Stop.
 pub fn idle_deadlines<'a>(
     forks: impl Iterator<Item = &'a ForkDef>,
     default_idle_secs: u64,
@@ -159,9 +166,15 @@ pub fn idle_deadlines<'a>(
     for fork in forks {
         for trigger in &fork.run_on {
             if let ForkRunOn::Idle { after_secs } = trigger {
-                let d = after_secs.unwrap_or(default_idle_secs);
-                if d > 0 && !out.contains(&d) {
-                    out.push(d);
+                let keep = match after_secs {
+                    Some(d) => Some(*d),
+                    None if default_idle_secs > 0 => Some(default_idle_secs),
+                    None => None,
+                };
+                if let Some(d) = keep {
+                    if !out.contains(&d) {
+                        out.push(d);
+                    }
                 }
             }
         }
@@ -250,6 +263,22 @@ mod tests {
             match_moments(&f, &[ForkMoment::Idle { deadline_secs: 0 }], 0, None, 0),
             None
         );
+    }
+
+    #[test]
+    fn explicit_zero_idle_fires_at_the_first_stop() {
+        // `idle: 0s` — the goal-fork recipe — fires at the pause's first
+        // Stop, unlike a zero *default* (which means disabled).
+        let f = fork(vec![ForkRunOn::Idle {
+            after_secs: Some(0),
+        }]);
+        assert_eq!(
+            match_moments(&f, &[ForkMoment::Idle { deadline_secs: 0 }], 240, None, 0),
+            Some(ForkRunOn::Idle {
+                after_secs: Some(0)
+            })
+        );
+        assert_eq!(idle_deadlines([f].iter(), 240), vec![0]);
     }
 
     #[test]

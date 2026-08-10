@@ -35,6 +35,10 @@ pub struct Config {
     /// Per-tag shared throttle (seconds): a minimum gap between wakes of any
     /// fork carrying that tag, across the project.
     pub tag_throttles: BTreeMap<String, u64>,
+    /// Default cap on chain runs of one fork within one pause, for `chain:
+    /// true` forks that don't set their own `chain_limit`. The belt against a
+    /// fork that never stops asking for another run.
+    pub chain_limit: u64,
 }
 
 impl Default for Config {
@@ -47,6 +51,7 @@ impl Default for Config {
             enable_tags: None,
             disable_tags: None,
             tag_throttles: BTreeMap::new(),
+            chain_limit: 25,
         }
     }
 }
@@ -63,6 +68,7 @@ struct RawConfig {
     disable_tags: Option<Vec<String>>,
     #[serde(default)]
     tag_throttles: BTreeMap<String, toml::Value>,
+    chain_limit: Option<toml::Value>,
     // ---- deprecated since v0.5: accepted, warned, ignored ----
     concurrency: Option<toml::Value>,
     fork_timeout: Option<toml::Value>,
@@ -118,6 +124,12 @@ fn apply_layer(cfg: &mut Config, raw: RawConfig, project_level: bool, warnings: 
     }
     if let Some(v) = raw.disable_tags {
         cfg.disable_tags = Some(v);
+    }
+    if let Some(v) = &raw.chain_limit {
+        match v {
+            toml::Value::Integer(n) if *n > 0 => cfg.chain_limit = *n as u64,
+            _ => warnings.push("'chain_limit' must be a positive integer, ignoring".into()),
+        }
     }
     // Like `models` once did: per-key extend so a project layer overrides the
     // home layer for the tags it names and inherits the rest.

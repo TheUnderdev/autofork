@@ -7,7 +7,8 @@
 //! notes, with a migration warning when they carry fork-like frontmatter.
 //!
 //! Supported top-level keys: `fork`, `description`, `run_on`, `throttle`,
-//! `after`, `priority`, `overlap`, `tags`. Unknown keys are ignored for
+//! `after`, `priority`, `overlap`, `tags`, `chain`, `chain_limit`, `gate`.
+//! Unknown keys are ignored for
 //! forward compatibility; invalid values warn and fall back rather than
 //! dropping the fork. The keys `delivery`, `model`, `allowed_tools`,
 //! `permission_mode` are parsed-and-ignored with a deprecation warning (v0.5
@@ -41,6 +42,20 @@ pub struct ForkDef {
     /// Free-form tags used by the per-session enable/disable filter. Empty
     /// when unset.
     pub tags: Vec<String>,
+    /// `chain: true`: each run of this fork may request another by ending its
+    /// report with the continue sentinel — the fork itself decides, per run,
+    /// whether its goal needs more work. Off by default; without it the
+    /// sentinel is ignored and the fork is never told about it.
+    pub chain: bool,
+    /// Maximum chain runs within one pause (safety cap). `None` falls back to
+    /// the config default.
+    pub chain_limit: Option<u64>,
+    /// `gate: true`: while this fork is running (and, with `chain: true`,
+    /// while its chain is unsettled), every other idle-triggered fork of the
+    /// session is held back; when it settles, the pause baseline resets so
+    /// the held forks' idle deadlines measure from that moment. The "goal
+    /// fork" key: goal work first, consolidation forks after.
+    pub gate: bool,
 }
 
 impl Default for ForkDef {
@@ -53,6 +68,9 @@ impl Default for ForkDef {
             priority: 0,
             overlap: false,
             tags: Vec::new(),
+            chain: false,
+            chain_limit: None,
+            gate: false,
         }
     }
 }
@@ -317,6 +335,12 @@ struct RawFork {
     overlap: Option<serde_yaml::Value>,
     #[serde(default)]
     tags: Option<serde_yaml::Value>,
+    #[serde(default)]
+    chain: Option<serde_yaml::Value>,
+    #[serde(default)]
+    chain_limit: Option<serde_yaml::Value>,
+    #[serde(default)]
+    gate: Option<serde_yaml::Value>,
     // Deprecated since v0.5: parsed only to warn, then ignored.
     #[serde(default)]
     delivery: Option<serde_yaml::Value>,
@@ -349,6 +373,9 @@ impl RawFork {
             || self.priority.is_some()
             || self.overlap.is_some()
             || self.tags.is_some()
+            || self.chain.is_some()
+            || self.chain_limit.is_some()
+            || self.gate.is_some()
             || self.delivery.is_some()
             || self.model.is_some()
             || self.allowed_tools.is_some()
@@ -535,6 +562,46 @@ pub fn parse_fork_file(name: &str, content: &str) -> ForkParse {
         }
     };
 
+    let chain = match &raw.chain {
+        None => false,
+        Some(serde_yaml::Value::Bool(b)) => *b,
+        Some(_) => {
+            warnings.push(format!(
+                "fork '{name}': chain must be true or false; using false"
+            ));
+            false
+        }
+    };
+
+    let chain_limit = match &raw.chain_limit {
+        None => None,
+        Some(v) => {
+            let parsed = parse_token_count(v).filter(|n| *n > 0);
+            if parsed.is_none() {
+                warnings.push(format!(
+                    "fork '{name}': chain_limit must be a positive integer, ignoring"
+                ));
+            }
+            parsed
+        }
+    };
+    if chain_limit.is_some() && !chain {
+        warnings.push(format!(
+            "fork '{name}': chain_limit without chain: true has no effect"
+        ));
+    }
+
+    let gate = match &raw.gate {
+        None => false,
+        Some(serde_yaml::Value::Bool(b)) => *b,
+        Some(_) => {
+            warnings.push(format!(
+                "fork '{name}': gate must be true or false; using false"
+            ));
+            false
+        }
+    };
+
     let tags = raw
         .tags
         .as_ref()
@@ -554,6 +621,9 @@ pub fn parse_fork_file(name: &str, content: &str) -> ForkParse {
             priority,
             overlap,
             tags,
+            chain,
+            chain_limit,
+            gate,
         },
         body: body.to_string(),
         warnings,
@@ -764,6 +834,48 @@ mod tests {
         let p = parse("---\nfork: true\npriority: high\n---\n");
         assert_eq!(p.def.priority, 0);
         assert!(p.warnings.iter().any(|w| w.contains("priority")));
+    }
+
+    #[test]
+    fn chain_parsing() {
+        assert!(!parse("---\nfork: true\n---\n").def.chain);
+        let p = parse("---\nfork: true\nchain: true\nchain_limit: 10\n---\n");
+        assert!(p.def.chain);
+        assert_eq!(p.def.chain_limit, Some(10));
+        assert!(p.warnings.is_empty());
+        // Invalid values warn and fall back.
+        let p = parse("---\nfork: true\nchain: always\n---\n");
+        assert!(!p.def.chain);
+        assert!(p.warnings.iter().any(|w| w.contains("chain must be")));
+        let p = parse("---\nfork: true\nchain: true\nchain_limit: 0\n---\n");
+        assert_eq!(p.def.chain_limit, None);
+        assert!(p.warnings.iter().any(|w| w.contains("chain_limit")));
+        // chain_limit without chain: true is called out.
+        let p = parse("---\nfork: true\nchain_limit: 5\n---\n");
+        assert!(p.warnings.iter().any(|w| w.contains("has no effect")));
+    }
+
+    #[test]
+    fn chain_alone_is_fork_like() {
+        assert!(matches!(
+            parse_fork_file("x", "---\nchain: true\n---\n"),
+            ForkParse::NotFork { fork_like: true }
+        ));
+    }
+
+    #[test]
+    fn gate_parsing() {
+        assert!(!parse("---\nfork: true\n---\n").def.gate);
+        let p = parse("---\nfork: true\nchain: true\ngate: true\n---\n");
+        assert!(p.def.gate);
+        assert!(p.warnings.is_empty());
+        // gate without chain is valid: it holds others until the run finishes.
+        let p = parse("---\nfork: true\ngate: true\n---\n");
+        assert!(p.def.gate);
+        assert!(p.warnings.is_empty());
+        let p = parse("---\nfork: true\ngate: maybe\n---\n");
+        assert!(!p.def.gate);
+        assert!(p.warnings.iter().any(|w| w.contains("gate must be")));
     }
 
     #[test]
