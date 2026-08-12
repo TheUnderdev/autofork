@@ -102,9 +102,10 @@ pub struct Event {
     /// The notification's `<status>` (`completed`/`failed`/`stopped`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notif_status: Option<String>,
-    /// The notification's `<result>` ends with the chain sentinel: the fork
-    /// asks to run again. Additive field; the daemon honors it only when the
-    /// completion matches one of its own spawns of a `chain: true` fork.
+    /// The notification's `<result>` carries the chain sentinel on a line of
+    /// its own: the fork asks to run again. Additive field; the daemon honors
+    /// it only when the completion matches one of its own spawns of a
+    /// `chain: true` fork.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notif_continue: Option<bool>,
     /// The session's context gauge in tokens, reported by clients that track

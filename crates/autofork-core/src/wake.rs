@@ -29,34 +29,61 @@ pub const WAKE_MARKER: &str = "source: autofork";
 /// never drift.
 pub const SPAWN_CTX_PREFIX: &str = "Context for this run: fork '";
 
-/// The chain sentinel: a `chain: true` fork whose report *ends* with a line
-/// that is exactly this asks autofork to run it again once the parent session
-/// has digested the report. Only the fork's own final message decides — a run
+/// The chain sentinel: a `chain: true` fork whose report carries this on a
+/// line of its own asks autofork to run it again once the parent session has
+/// digested the report. Only the fork's own final message decides — a run
 /// that omits the line ends the chain. Honored only for forks that opted in
 /// via `chain: true` frontmatter, and only up to the fork's `chain_limit`.
 /// Frozen forever once shipped: fork bodies in the wild reference it.
 pub const CONTINUE_SENTINEL: &str = "<<autofork:continue>>";
 
-/// Whether a fork report requests another run: its last non-empty line is
-/// exactly the [`CONTINUE_SENTINEL`]. Position-anchored on purpose — a report
-/// that merely *quotes* the sentinel mid-text does not chain.
-pub fn wants_continue(report: &str) -> bool {
-    report
-        .lines()
-        .rev()
-        .find(|l| !l.trim().is_empty())
-        .is_some_and(|l| l.trim() == CONTINUE_SENTINEL)
+/// Characters allowed around the sentinel on its line: markdown decoration
+/// (bold/italic/strikethrough/code-span markers, list and quote markers,
+/// brackets) and stray punctuation. Models regularly emit
+/// `**<<autofork:continue>>**` or a backtick-wrapped sentinel — which the
+/// client TUIs render as the bare marker, so the miss is invisible to the
+/// user. Any letter or digit on the line disqualifies it, which is what keeps
+/// prose that merely *quotes* the sentinel from chaining.
+const SENTINEL_DECORATION: &str = "`*_~>-:.!'\"()[]";
+
+/// Whether `line` is a sentinel line: it contains [`CONTINUE_SENTINEL`] and
+/// nothing else but whitespace/markdown decoration.
+fn is_sentinel_line(line: &str) -> bool {
+    let t = line.trim();
+    let Some(start) = t.find(CONTINUE_SENTINEL) else {
+        return false;
+    };
+    let deco = |s: &str| {
+        s.chars()
+            .all(|c| c.is_whitespace() || SENTINEL_DECORATION.contains(c))
+    };
+    deco(&t[..start]) && deco(&t[start + CONTINUE_SENTINEL.len()..])
 }
 
-/// `report` with a trailing [`CONTINUE_SENTINEL`] line removed (for clients
-/// that inject the report themselves and can hand the parent a clean text).
-/// Returns the report unchanged when it doesn't end with the sentinel.
-pub fn strip_continue(report: &str) -> &str {
+/// Whether a fork report requests another run: some line of the report is the
+/// [`CONTINUE_SENTINEL`] alone (markdown decoration around it tolerated).
+/// Deliberately liberal — the spawn prompt teaches the strict form (a final
+/// line that is exactly the sentinel), but models decorate it, and a missed
+/// sentinel silently ends a goal loop. A line with any other word on it does
+/// not chain, so prose quoting the sentinel mid-sentence stays inert.
+pub fn wants_continue(report: &str) -> bool {
+    report.lines().any(is_sentinel_line)
+}
+
+/// `report` with its sentinel line(s) removed (for clients that inject the
+/// report themselves and can hand the parent a clean text). Returns the
+/// report unchanged when it carries no sentinel line.
+pub fn strip_continue(report: &str) -> String {
     if !wants_continue(report) {
-        return report;
+        return report.to_string();
     }
-    let cut = report.rfind(CONTINUE_SENTINEL).unwrap_or(report.len());
-    report[..cut].trim_end()
+    report
+        .lines()
+        .filter(|l| !is_sentinel_line(l))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim_end()
+        .to_string()
 }
 
 /// Whether a submitted "prompt" is actually a non-waking continuation — an
@@ -347,20 +374,35 @@ mod tests {
     }
 
     #[test]
-    fn continue_sentinel_anchors_on_the_last_line() {
+    fn continue_sentinel_matches_a_standalone_line() {
         assert!(wants_continue("goal not met yet\n<<autofork:continue>>"));
         assert!(wants_continue("report\n\n  <<autofork:continue>>  \n\n"));
         assert!(wants_continue(CONTINUE_SENTINEL));
-        // Mid-text mention (quoting the docs) does not chain.
+        // Markdown decoration around the sentinel is tolerated: TUIs render
+        // it away, so a strict match misses what looks like a clean line.
+        assert!(wants_continue("report\n**<<autofork:continue>>**"));
+        assert!(wants_continue("report\n`<<autofork:continue>>`"));
+        assert!(wants_continue("report\n- <<autofork:continue>>."));
+        assert!(wants_continue("report\n> _<<autofork:continue>>_"));
+        // No longer position-anchored: a sentinel line followed by more
+        // report text still chains (models add wrap-up lines after it).
+        assert!(wants_continue(
+            "progress\n<<autofork:continue>>\nwill resume next run"
+        ));
+        // Mid-sentence mention (quoting the docs) does not chain: other
+        // words share the line.
         assert!(!wants_continue(
             "the sentinel is <<autofork:continue>>, which I did not emit\ndone"
+        ));
+        assert!(!wants_continue(
+            "end with <<autofork:continue>> to chain\ndone"
         ));
         assert!(!wants_continue("plain report"));
         assert!(!wants_continue(""));
     }
 
     #[test]
-    fn strip_continue_removes_only_a_trailing_sentinel() {
+    fn strip_continue_removes_sentinel_lines() {
         assert_eq!(
             strip_continue("progress so far\n<<autofork:continue>>"),
             "progress so far"
@@ -368,6 +410,14 @@ mod tests {
         assert_eq!(
             strip_continue("report\n\n<<autofork:continue>>\n"),
             "report"
+        );
+        assert_eq!(
+            strip_continue("report\n**<<autofork:continue>>**"),
+            "report"
+        );
+        assert_eq!(
+            strip_continue("progress\n<<autofork:continue>>\nresuming"),
+            "progress\nresuming"
         );
         let quoted = "the sentinel is <<autofork:continue>>, not emitted\ndone";
         assert_eq!(strip_continue(quoted), quoted);

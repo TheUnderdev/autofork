@@ -221,8 +221,8 @@ The same frontmatter keys apply; `autofork forks` shows the linked skill.
 
 ### Chain forks: the fork decides whether to run again
 
-A fork with `chain: true` is told, in its spawn prompt, about the **continue sentinel**: if it ends
-its report with a final line that is exactly
+A fork with `chain: true` is told, in its spawn prompt, about the **continue sentinel**: if its
+report carries, on a line of its own, the marker
 
 ```
 <<autofork:continue>>
@@ -240,13 +240,13 @@ Mechanics per client:
   sentinel additionally re-arms the fork's once-per-pause latch, so it fires again right after the
   relay turn settles. Nothing else changes: no epoch bump, so every *other* idle fork stays exactly
   as it was.
-- **opencode** — a sentinel-ending report is injected as a **real turn** (instead of the usual
+- **opencode** — a sentinel-carrying report is injected as a **real turn** (instead of the usual
   zero-turn no-reply message), so the parent model reacts to it; the completion frame carries
   `continue: true` and the daemon re-arms the fork the same way.
 
-Belts: the sentinel is honored only for `chain: true` forks (a fork that merely quotes it, or was
-never opted in, changes nothing — position-anchored on the last non-empty line, and the daemon
-re-checks the definition). A chain is capped at `chain_limit` runs per pause (frontmatter, falling
+Belts: the sentinel is honored only for `chain: true` forks (a fork that merely quotes it
+mid-sentence, or was never opted in, changes nothing — it must sit on a line of its own, though
+markdown decoration around it is tolerated, and the daemon re-checks the definition). A chain is capped at `chain_limit` runs per pause (frontmatter, falling
 back to the `chain_limit` config key, default 25). Your own next message always ends the chain —
 genuine activity starts a new pause and the fork re-evaluates on the next one.
 

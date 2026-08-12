@@ -36,10 +36,10 @@ pub struct TaskNotification {
     pub task_id: Option<String>,
     /// `completed` / `failed` / `stopped` — see [`is_terminal_status`].
     pub status: Option<String>,
-    /// The `<result>` payload ends with the chain sentinel: the fork asks to
-    /// run again. Only meaningful when the completion matches one of the
-    /// daemon's own spawns AND that fork opted in via `chain: true` — the
-    /// daemon checks both before acting.
+    /// The `<result>` payload carries the chain sentinel on a line of its
+    /// own: the fork asks to run again. Only meaningful when the completion
+    /// matches one of the daemon's own spawns AND that fork opted in via
+    /// `chain: true` — the daemon checks both before acting.
     pub continue_requested: bool,
 }
 
@@ -54,9 +54,9 @@ pub fn parse_task_notification(text: &str) -> Option<TaskNotification> {
     // Only read the envelope, never the payload: the <summary>/<result> tags
     // can quote arbitrary text (including other notifications), so stop at the
     // first closing of the envelope-level tags we care about. The one
-    // deliberate exception is the chain sentinel, position-anchored at the
-    // very end of the <result> payload (widest span, so quoted closers inside
-    // the report can't truncate it).
+    // deliberate exception is the chain sentinel, scanned as a standalone
+    // line anywhere in the <result> payload (widest span, so quoted closers
+    // inside the report can't truncate it).
     Some(TaskNotification {
         tool_use_id: tag_value(trimmed, "tool-use-id"),
         task_id: tag_value(trimmed, "task-id"),

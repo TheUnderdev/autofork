@@ -6,7 +6,7 @@
 // copies of the conversation made with opencode's native session fork, which
 // reuse the parent's prompt cache (~100% measured) — and their reports are
 // injected back into the parent as no-reply messages the model sees on the
-// next turn. Exception: a `chain: true` fork's report that ends with the
+// next turn. Exception: a `chain: true` fork's report that carries the
 // continue sentinel is injected as a real turn (the parent reacts to it),
 // and the daemon re-fires the fork once the turn settles — the goal loop.
 //
@@ -24,25 +24,39 @@ const TITLE_PREFIX = "autofork/";
 // instance, and a fork run mistaken for a real session breeds forks of forks.
 const SPAWN_CTX = "Context for this run: fork '";
 // The chain sentinel (CONTINUE_SENTINEL in autofork-core's wake.rs — keep in
-// sync). A `chain: true` fork whose report *ends* with this line asks to run
-// again: its report is injected as a real turn (the parent reacts to it) and
-// the completion frame carries `continue: true` so the daemon re-arms it.
+// sync). A `chain: true` fork whose report carries this on a line of its own
+// asks to run again: its report is injected as a real turn (the parent reacts
+// to it) and the completion frame carries `continue: true` so the daemon
+// re-arms it.
 const CONTINUE = "<<autofork:continue>>";
 
-// Whether a report's last non-empty line is exactly the sentinel
-// (position-anchored: a report merely quoting it mid-text does not chain).
+// Whitespace/markdown decoration allowed around the sentinel on its line
+// (keep in sync with SENTINEL_DECORATION in wake.rs): models regularly emit
+// `**<<autofork:continue>>**` or a backtick-wrapped sentinel, which the TUI
+// renders as the bare marker — a strict match misses what looks clean. Any
+// letter or digit disqualifies the line, so prose merely quoting the
+// sentinel does not chain.
+const DECORATION = /^[\s`*_~>\-:.!'"()\[\]]*$/;
+
+function isSentinelLine(line) {
+  const t = line.trim();
+  const i = t.indexOf(CONTINUE);
+  if (i < 0) return false;
+  return DECORATION.test(t.slice(0, i)) && DECORATION.test(t.slice(i + CONTINUE.length));
+}
+
+// Whether some line of the report is the sentinel alone (decoration
+// tolerated, any position — a missed sentinel silently ends a goal loop).
 function wantsContinue(text) {
-  const lines = text.split("\n");
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const t = lines[i].trim();
-    if (t) return t === CONTINUE;
-  }
-  return false;
+  return text.split("\n").some(isSentinelLine);
 }
 
 function stripContinue(text) {
-  const cut = text.lastIndexOf(CONTINUE);
-  return cut < 0 ? text : text.slice(0, cut).trimEnd();
+  return text
+    .split("\n")
+    .filter((l) => !isSentinelLine(l))
+    .join("\n")
+    .trimEnd();
 }
 
 export const AutoforkPlugin = async ({ client, directory, worktree }) => {
