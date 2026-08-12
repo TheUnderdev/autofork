@@ -405,8 +405,12 @@ mod tests {
         // marks, BOM) are deleted before matching — adjacent or embedded,
         // they make a visually clean sentinel fail an exact comparison.
         assert!(wants_continue("report\n\u{200B}<<autofork:continue>>"));
-        assert!(wants_continue("report\n<<autofork:cont\u{200D}inue>>\u{200E}"));
-        assert!(wants_continue("report\n\u{FEFF}<<autofork:continue>>\u{2060}"));
+        assert!(wants_continue(
+            "report\n<<autofork:cont\u{200D}inue>>\u{200E}"
+        ));
+        assert!(wants_continue(
+            "report\n\u{FEFF}<<autofork:continue>>\u{2060}"
+        ));
         assert!(wants_continue("report\n`<<autofork:continue>>`"));
         assert!(wants_continue("report\n- <<autofork:continue>>."));
         assert!(wants_continue("report\n> _<<autofork:continue>>_"));
