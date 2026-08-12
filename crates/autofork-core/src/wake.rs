@@ -46,10 +46,30 @@ pub const CONTINUE_SENTINEL: &str = "<<autofork:continue>>";
 /// prose that merely *quotes* the sentinel from chaining.
 const SENTINEL_DECORATION: &str = "`*_~>-:.!'\"()[]";
 
-/// Whether `line` is a sentinel line: it contains [`CONTINUE_SENTINEL`] and
-/// nothing else but whitespace/markdown decoration.
+/// Invisible format characters some models sprinkle into output (zero-width
+/// spaces/joiners, direction marks, word joiners, BOM, soft hyphen). No
+/// terminal shows them, `trim()` does not strip them, and `\s`-style
+/// whitespace classes don't match them — so one of these next to (or inside)
+/// the sentinel makes a visually clean line fail an exact match. Deleted
+/// before sentinel matching.
+fn is_invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}' | '\u{034F}' | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
+}
+
+/// Whether `line` is a sentinel line: after deleting invisible format
+/// characters, it contains [`CONTINUE_SENTINEL`] and nothing else but
+/// whitespace/markdown decoration.
 fn is_sentinel_line(line: &str) -> bool {
-    let t = line.trim();
+    let cleaned: String = line.chars().filter(|c| !is_invisible(*c)).collect();
+    let t = cleaned.trim();
     let Some(start) = t.find(CONTINUE_SENTINEL) else {
         return false;
     };
@@ -381,6 +401,12 @@ mod tests {
         // Markdown decoration around the sentinel is tolerated: TUIs render
         // it away, so a strict match misses what looks like a clean line.
         assert!(wants_continue("report\n**<<autofork:continue>>**"));
+        // Invisible format characters (zero-width space/joiner, direction
+        // marks, BOM) are deleted before matching — adjacent or embedded,
+        // they make a visually clean sentinel fail an exact comparison.
+        assert!(wants_continue("report\n\u{200B}<<autofork:continue>>"));
+        assert!(wants_continue("report\n<<autofork:cont\u{200D}inue>>\u{200E}"));
+        assert!(wants_continue("report\n\u{FEFF}<<autofork:continue>>\u{2060}"));
         assert!(wants_continue("report\n`<<autofork:continue>>`"));
         assert!(wants_continue("report\n- <<autofork:continue>>."));
         assert!(wants_continue("report\n> _<<autofork:continue>>_"));

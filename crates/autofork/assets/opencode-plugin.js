@@ -38,8 +38,16 @@ const CONTINUE = "<<autofork:continue>>";
 // sentinel does not chain.
 const DECORATION = /^[\s`*_~>\-:.!'"()\[\]]*$/;
 
+// Invisible format characters some models sprinkle into output (zero-width
+// spaces/joiners, direction marks, word joiners, BOM, soft hyphen — keep in
+// sync with is_invisible in wake.rs). No terminal shows them, trim() does not
+// strip them, and \s does not match them — one of these next to (or inside)
+// the sentinel makes a visually clean line fail an exact match. Deleted
+// before matching.
+const INVISIBLE = /[\u00AD\u034F\u180E\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFEFF]/g;
+
 function isSentinelLine(line) {
-  const t = line.trim();
+  const t = line.replace(INVISIBLE, "").trim();
   const i = t.indexOf(CONTINUE);
   if (i < 0) return false;
   return DECORATION.test(t.slice(0, i)) && DECORATION.test(t.slice(i + CONTINUE.length));
