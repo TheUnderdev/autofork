@@ -408,7 +408,8 @@ pub enum ForkParse {
 
 /// Split a markdown file into its `---`-delimited YAML frontmatter and body.
 /// Files without frontmatter are valid: their whole content is the body.
-fn split_frontmatter(content: &str) -> (Option<&str>, &str) {
+/// (Shared with the lifecycle-hook definition parser.)
+pub(crate) fn split_frontmatter(content: &str) -> (Option<&str>, &str) {
     let Some(rest) = content.strip_prefix("---") else {
         return (None, content);
     };

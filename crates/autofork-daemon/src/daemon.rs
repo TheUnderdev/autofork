@@ -167,6 +167,11 @@ impl Daemon {
         self.paths.base.join("forks")
     }
 
+    /// The user-level lifecycle-hooks root (`<base>/hooks`).
+    pub fn user_hooks_root(&self) -> PathBuf {
+        self.paths.base.join("hooks")
+    }
+
     /// The user-level `.claude` directory, whose `forks/` and `skills/`
     /// subdirs are extra discovery roots. `AUTOFORK_CLAUDE_DIR` overrides
     /// (tests use it to keep the real home directory out of fixtures).
@@ -239,14 +244,41 @@ impl Daemon {
                 }
                 pc.remove(&sid);
             }
-            let store = daemon.store.lock().unwrap();
-            if let Ok(Some(s)) = store.get_session(&sid) {
-                if s.status == SessionStatus::Open {
-                    tracing::info!(session = %sid, "stop-wait lost, closing session");
-                    let _ = store.close_session(&sid);
-                }
+            let open = {
+                let store = daemon.store.lock().unwrap();
+                matches!(store.get_session(&sid), Ok(Some(s)) if s.status == SessionStatus::Open)
+            };
+            if open {
+                tracing::info!(session = %sid, "stop-wait lost, closing session");
+                daemon.close_session_firing_hooks(&sid, "lost");
             }
         });
+    }
+
+    /// Close a session, firing its `session_end` lifecycle hooks exactly once
+    /// (only the call that transitions open → closed fires; racing close
+    /// paths — client end, poll loss, prune, timeout — are safe). Fork-run
+    /// sessions close silently. Returns whether this call closed it.
+    pub fn close_session_firing_hooks(self: &Arc<Self>, session_id: &str, reason: &str) -> bool {
+        let (row, transitioned) = {
+            let store = self.store.lock().unwrap();
+            let row = store.get_session(session_id).ok().flatten();
+            let transitioned = store.close_session(session_id).unwrap_or(false);
+            (row, transitioned)
+        };
+        if !transitioned {
+            return false;
+        }
+        let Some(row) = row else { return true };
+        if self.is_fork_run_session(session_id) {
+            return true;
+        }
+        crate::hooks::fire_matching(
+            self,
+            &crate::hooks::HookCtx::from_row(&row),
+            crate::hooks::HookEvent::SessionEnd { reason },
+        );
+        true
     }
 
     /// Whether a wake was issued for this session within the grace window.
@@ -287,19 +319,34 @@ impl Daemon {
         let disable_tags = ev.disable_tags.as_ref().map(|v| v.join(","));
         match ev.event {
             EventKind::SessionStart => {
-                let store = self.store.lock().unwrap();
-                let _ = store.upsert_session(
-                    &ev.session_id,
-                    &ev.project_root,
-                    &ev.cwd,
-                    ev.transcript_path.as_deref(),
-                    ev.model.as_deref(),
-                    enable_tags.as_deref(),
-                    disable_tags.as_deref(),
-                    t,
-                );
-                if let Some(w) = ev.context_window {
-                    let _ = store.set_context_window(&ev.session_id, w);
+                let newly_opened = {
+                    let store = self.store.lock().unwrap();
+                    let newly = store
+                        .upsert_session(
+                            &ev.session_id,
+                            &ev.project_root,
+                            &ev.cwd,
+                            ev.transcript_path.as_deref(),
+                            ev.model.as_deref(),
+                            enable_tags.as_deref(),
+                            disable_tags.as_deref(),
+                            ev.client.as_deref(),
+                            t,
+                        )
+                        .unwrap_or(false);
+                    if let Some(w) = ev.context_window {
+                        let _ = store.set_context_window(&ev.session_id, w);
+                    }
+                    newly
+                };
+                if newly_opened {
+                    crate::hooks::fire_matching(
+                        self,
+                        &crate::hooks::HookCtx::from_event(&ev),
+                        crate::hooks::HookEvent::SessionStart {
+                            source: ev.source.as_deref(),
+                        },
+                    );
                 }
                 ResponseBody::Ack
             }
@@ -379,18 +426,21 @@ impl Daemon {
                     ev.waking
                         .unwrap_or_else(|| !self.recently_woke(&ev.session_id, t))
                 };
-                {
+                let newly_opened = {
                     let store = self.store.lock().unwrap();
-                    let _ = store.upsert_session(
-                        &ev.session_id,
-                        &ev.project_root,
-                        &ev.cwd,
-                        ev.transcript_path.as_deref(),
-                        ev.model.as_deref(),
-                        enable_tags.as_deref(),
-                        disable_tags.as_deref(),
-                        t,
-                    );
+                    let newly = store
+                        .upsert_session(
+                            &ev.session_id,
+                            &ev.project_root,
+                            &ev.cwd,
+                            ev.transcript_path.as_deref(),
+                            ev.model.as_deref(),
+                            enable_tags.as_deref(),
+                            disable_tags.as_deref(),
+                            ev.client.as_deref(),
+                            t,
+                        )
+                        .unwrap_or(false);
                     let _ = store.set_last_activity(&ev.session_id, t);
                     // Genuine activity begins a new pause: advance the epoch
                     // (releasing per-pause idle latches), reset the baseline,
@@ -408,6 +458,20 @@ impl Daemon {
                             }
                         }
                     }
+                    newly
+                };
+                let ctx = crate::hooks::HookCtx::from_event(&ev);
+                // A session first seen mid-life (daemon restart, wiped state)
+                // still gets its session_start edge before the activity one.
+                if newly_opened {
+                    crate::hooks::fire_matching(
+                        self,
+                        &ctx,
+                        crate::hooks::HookEvent::SessionStart { source: None },
+                    );
+                }
+                if waking {
+                    crate::hooks::fire_matching(self, &ctx, crate::hooks::HookEvent::Activity);
                 }
                 // A turn is in flight either way: cancel any parked stop-wait so
                 // no wake fires mid-turn.
@@ -416,8 +480,10 @@ impl Daemon {
             }
             EventKind::SessionEnd => {
                 self.cancel_wait(&ev.session_id);
-                let store = self.store.lock().unwrap();
-                let _ = store.close_session(&ev.session_id);
+                self.close_session_firing_hooks(
+                    &ev.session_id,
+                    ev.reason.as_deref().unwrap_or("ended"),
+                );
                 ResponseBody::Ack
             }
             // Stop never arrives as a plain event (it is a StopWait long poll).
@@ -447,18 +513,21 @@ impl Daemon {
         let busy = ev.busy.unwrap_or(false);
         let enable_tags = ev.enable_tags.as_ref().map(|v| v.join(","));
         let disable_tags = ev.disable_tags.as_ref().map(|v| v.join(","));
-        {
+        let newly_opened = {
             let store = self.store.lock().unwrap();
-            let _ = store.upsert_session(
-                &ev.session_id,
-                &ev.project_root,
-                &ev.cwd,
-                ev.transcript_path.as_deref(),
-                ev.model.as_deref(),
-                enable_tags.as_deref(),
-                disable_tags.as_deref(),
-                t,
-            );
+            let newly = store
+                .upsert_session(
+                    &ev.session_id,
+                    &ev.project_root,
+                    &ev.cwd,
+                    ev.transcript_path.as_deref(),
+                    ev.model.as_deref(),
+                    enable_tags.as_deref(),
+                    disable_tags.as_deref(),
+                    ev.client.as_deref(),
+                    t,
+                )
+                .unwrap_or(false);
             let _ = store.set_last_activity(&ev.session_id, t);
             if let Some(w) = ev.context_window {
                 let _ = store.set_context_window(&ev.session_id, w);
@@ -468,6 +537,16 @@ impl Daemon {
             if !busy {
                 let _ = store.set_pause_started_at_if_unset(&ev.session_id, t);
             }
+            newly
+        };
+        // A session first seen at a Stop (daemon restart mid-session) still
+        // gets its session_start lifecycle-hook edge.
+        if newly_opened {
+            crate::hooks::fire_matching(
+                self,
+                &crate::hooks::HookCtx::from_event(&ev),
+                crate::hooks::HookEvent::SessionStart { source: None },
+            );
         }
         // Clients that track usage themselves (opencode) report the gauge on
         // the event; otherwise it comes from the transcript delta.
@@ -537,6 +616,47 @@ impl Daemon {
                 cfg.default_idle_deadline_secs,
             )
         };
+        // Idle lifecycle hooks: shell commands that fire once per pause after
+        // their deadline, WITHOUT resolving the poll — the session just stays
+        // parked (that is their point: "the session went idle but is still
+        // open"). None on a busy poll. The gate never holds them: they are
+        // infrastructure (leases), not context work.
+        let idle_hooks = if busy {
+            Vec::new()
+        } else {
+            let (hook_entries, _) =
+                autofork_core::hooks::discover_hooks(&session.cwd, Some(&self.user_hooks_root()));
+            crate::hooks::idle_hook_deadlines(&hook_entries, cfg.default_idle_deadline_secs)
+        };
+        let hook_ctx = crate::hooks::HookCtx::from_row(&session);
+        let fire_idle_hooks = |slf: &Arc<Self>, up_to: i64| {
+            for (entry, d) in &idle_hooks {
+                if baseline + *d as i64 > up_to {
+                    continue;
+                }
+                let fresh = {
+                    let store = slf.store.lock().unwrap();
+                    store
+                        .try_latch_fire(
+                            &session.session_id,
+                            &format!("hook:{}", entry.name),
+                            &format!("hook-idle-pause:{}:{d}", session.pause_epoch),
+                            up_to,
+                        )
+                        .unwrap_or(false)
+                };
+                if fresh {
+                    crate::hooks::execute(
+                        slf,
+                        &hook_ctx,
+                        entry,
+                        "idle",
+                        vec![("AUTOFORK_IDLE_SECS".to_string(), d.to_string())],
+                    );
+                }
+            }
+        };
+
         let every_times = {
             let ran: std::collections::HashMap<String, Option<i64>> = {
                 let store = self.store.lock().unwrap();
@@ -577,6 +697,9 @@ impl Daemon {
         let fire_instants: Vec<i64> = {
             let mut v: Vec<i64> = deadlines.iter().map(|&d| baseline + d as i64).collect();
             v.extend(every_times);
+            // Idle lifecycle hooks need their own evaluation instants — a
+            // hooks-only session would otherwise park with no timer at all.
+            v.extend(idle_hooks.iter().map(|(_, d)| baseline + *d as i64));
             // An active gate silences the other idle forks; if its spawn was
             // fumbled, the belt lifts it at issuance + grace — schedule an
             // evaluation there, or a quiet session would never re-check and
@@ -594,12 +717,16 @@ impl Daemon {
             v.dedup();
             v
         };
+        // Deadlines that elapsed before this poll parked (a re-park after a
+        // wake turn) fire their hooks right away; the latch dedupes.
+        fire_idle_hooks(self, now());
         let mut due = due_now(self);
         if !due {
             for &fire_at in &fire_instants {
                 let wait = (fire_at - now()).max(0) as u64;
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(wait)) => {
+                        fire_idle_hooks(self, now());
                         if due_now(self) { due = true; break; }
                     }
                     _ = &mut rx => return ResponseBody::Waited,

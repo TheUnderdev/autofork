@@ -28,8 +28,7 @@ pub async fn session_reaper(daemon: Arc<Daemon>) {
         };
         for sid in cutoffs {
             tracing::info!(session = %sid, "closing timed-out session");
-            let store = daemon.store.lock().unwrap();
-            let _ = store.close_session(&sid);
+            daemon.close_session_firing_hooks(&sid, "timeout");
         }
     }
 }

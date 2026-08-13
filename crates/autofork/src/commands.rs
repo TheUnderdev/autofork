@@ -259,6 +259,55 @@ pub fn list_forks(paths: &Paths, project: Option<std::path::PathBuf>) -> Result<
     Ok(())
 }
 
+/// List the lifecycle hooks visible from a directory. Pure filesystem
+/// discovery — no daemon round trip (the daemon re-discovers per firing
+/// anyway, so there is no daemon-side state to consult).
+pub fn list_hooks(paths: &Paths, project: Option<std::path::PathBuf>) -> Result<(), String> {
+    let cwd = project
+        .or_else(|| std::env::current_dir().ok())
+        .ok_or("cannot resolve cwd")?;
+    let user_hooks = paths.base.join("hooks");
+    let (entries, warnings) = autofork_core::hooks::discover_hooks(&cwd, Some(&user_hooks));
+    if entries.is_empty() && warnings.is_empty() {
+        println!(
+            "no lifecycle hooks discovered (looked for .autofork/hooks/ up from here and {})",
+            user_hooks.display()
+        );
+        return Ok(());
+    }
+    println!("lifecycle hooks visible from {} :", cwd.display());
+    for h in &entries {
+        println!(
+            "  {} — {}",
+            h.name,
+            h.parsed
+                .def
+                .description
+                .as_deref()
+                .unwrap_or("(no description)")
+        );
+        let on: Vec<String> = h.parsed.def.on.iter().map(|o| o.label()).collect();
+        println!(
+            "      on: {} | timeout: {}s",
+            if on.is_empty() {
+                "(nothing — never fires)".to_string()
+            } else {
+                on.join(", ")
+            },
+            h.parsed.def.timeout_secs
+        );
+        println!("      command: {}", h.parsed.def.command);
+        println!("      {}", h.path.display());
+        for w in &h.parsed.warnings {
+            println!("      warning: {w}");
+        }
+    }
+    for w in &warnings {
+        println!("  warning: {w}");
+    }
+    Ok(())
+}
+
 /// Manual runs can no longer spawn anything (forks are subagents of an
 /// interactive session). Instead we print the wake-style spawn instruction to
 /// paste into an interactive Claude Code session.

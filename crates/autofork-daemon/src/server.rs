@@ -265,14 +265,19 @@ fn status(daemon: &Arc<Daemon>) -> ResponseBody {
 /// process is somehow still alive, the next hook event reopens it.
 fn prune(daemon: &Arc<Daemon>) -> ResponseBody {
     let now = crate::daemon::now();
-    let store = daemon.store.lock().unwrap();
+    let stale: Vec<_> = {
+        let store = daemon.store.lock().unwrap();
+        store
+            .list_open_sessions()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| is_stale(daemon, s, now))
+            .collect()
+    };
     let mut sessions = Vec::new();
-    for s in store.list_open_sessions().unwrap_or_default() {
-        if !is_stale(daemon, &s, now) {
-            continue;
-        }
+    for s in stale {
         tracing::info!(session = %s.session_id, "pruning stale session");
-        let _ = store.close_session(&s.session_id);
+        daemon.close_session_firing_hooks(&s.session_id, "pruned");
         sessions.push(SessionInfo {
             session_id: s.session_id,
             project_root: s.project_root,

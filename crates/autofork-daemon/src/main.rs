@@ -1,4 +1,5 @@
 mod daemon;
+mod hooks;
 mod planner;
 mod server;
 mod sweep;

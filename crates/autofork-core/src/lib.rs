@@ -9,6 +9,7 @@ pub mod config;
 pub mod discovery;
 pub mod duration;
 pub mod frontmatter;
+pub mod hooks;
 pub mod moments;
 pub mod notification;
 pub mod project;

@@ -279,11 +279,71 @@ window still matter mid-goal). A gate whose wake was fumbled (no spawn ever obse
 a grace window (`AUTOFORK_GATE_GRACE_SECS`, default 180s) rather than silencing the session's
 forks for the whole pause; your own next message drops the gate immediately.
 
+## Lifecycle hooks
+
+Forks answer "run a model over this session's context at the right moment". **Lifecycle hooks**
+answer a different question: "run a *command* at a session's lifecycle moments" — no model, no
+fork, no context, no tokens. They exist for resource integrations that need to follow a session's
+life directly: workspace leases, seat locks, scratch-space allocation, external presence signals.
+Acquire on start, renew on activity, park on idle, release on end.
+
+A hook is a markdown file under `.autofork/hooks/` (per ancestor directory, nearest first, then
+user-level `~/.autofork/hooks/`; bare `<name>.md` or `<name>/HOOK.md`, same as forks). The body is
+documentation only.
+
+```markdown
+---
+hook: true
+description: keep the workspace lease alive
+on: [session_start, activity, "idle: 5m", session_end]
+command: lease-tool touch --session "$AUTOFORK_SESSION_ID"
+timeout: 30s
+---
+Renews this project's workspace lease while a session is alive, and releases
+it when the session ends. The lease TTL covers crashes.
+```
+
+The **daemon** runs `command` through `sh -c` in the session's launch directory, with the context
+in environment variables — so renewing or releasing a lease never involves spawning a model.
+
+Events (`on`):
+
+| event | fires | extra env |
+| --- | --- | --- |
+| `session_start` | a session registers (startup, resume, clear — any event that opens a session) | `AUTOFORK_SOURCE` (`startup`/`resume`/`clear`/`compact`, when known) |
+| `resume` | only a resumed session (`source: resume`; resumes arrive as a new session id) | `AUTOFORK_SOURCE` |
+| `activity` | each genuine user prompt (the same signal that starts a new pause) | — |
+| `idle` / `idle: <dur>` | the session has been idle that long — **once per pause**, while the session stays open and parked (bare `idle` uses `default_idle_deadline`) | `AUTOFORK_IDLE_SECS` |
+| `session_end` | the session ended, from any path | `AUTOFORK_END_REASON` |
+
+Every firing also carries `AUTOFORK_HOOK_NAME`, `AUTOFORK_EVENT`, `AUTOFORK_SESSION_ID` (the
+parent session id), `AUTOFORK_PROJECT_ROOT`, `AUTOFORK_CWD`, and `AUTOFORK_CLIENT` (`claude-code`
+or `opencode`).
+
+`AUTOFORK_END_REASON` values: what the client reported for a clean end (Claude Code:
+`clear`/`logout`/`prompt_input_exit`/`other`; opencode: `disposed` when the instance shuts down
+normally, `deleted` when the session is deleted), or the daemon's own liveness fallbacks: `lost`
+(the session's parked poll dropped and the grace window expired — the process likely died),
+`pruned` (`autofork prune`), `timeout` (the session-timeout reaper).
+
+**Design your integration around one honest caveat:** no callback can cover SIGKILL, a kernel
+panic, or power loss — and if the machine dies, the daemon dies too. `session_end` is best-effort
+cleanup that makes the common paths prompt; a lease **TTL plus renewal** (`activity`, or an
+`idle:` ping) must remain the fallback that reclaims resources after a crash. That split is
+intentional: autofork owns the heartbeat, your lease store owns expiry.
+
+Notes: a genuine user prompt starts a new pause, so `idle:` hooks re-arm exactly like idle forks;
+gate forks never hold hooks back (they are infrastructure, not context work); hook stdout/stderr
+go to the daemon log (`autofork logs`); a failing or timing-out hook is logged and otherwise
+inert. Fork-run sessions (opencode) never fire lifecycle hooks. `autofork hooks` lists what's
+discovered, with warnings.
+
 ## CLI
 
 ```
 autofork status          # daemon, sessions, recent wakes
 autofork forks           # forks visible from here, with warnings
+autofork hooks           # lifecycle hooks visible from here, with warnings
 autofork run <name>      # print the spawn instruction to paste into an interactive session
 autofork run --tag <tag> # print instructions for every fork carrying <tag>
 autofork logs [-f]       # daemon log

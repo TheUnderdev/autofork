@@ -87,6 +87,10 @@ struct OcInput {
     /// fork-completed: the run's report ended with the chain sentinel.
     #[serde(default, rename = "continue")]
     cont: Option<bool>,
+    /// session-end: why the session ended (`disposed` = the opencode
+    /// instance shut down cleanly; `deleted` = the session was deleted).
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 pub fn run_hook(kind: OcHookKind) {
@@ -113,6 +117,7 @@ fn run_hook_inner(kind: OcHookKind) -> Option<()> {
         cwd: input.directory.clone(),
         project_root: root.clone(),
         source: None,
+        reason: input.reason.clone(),
         model: input.model.clone(),
         enable_tags: crate::hook::tags_from_env("AUTOFORK_ENABLE_TAGS"),
         disable_tags: crate::hook::tags_from_env("AUTOFORK_DISABLE_TAGS"),

@@ -74,6 +74,47 @@ impl Harness {
         std::fs::write(path, content).unwrap();
     }
 
+    /// Write a lifecycle hook whose command appends one
+    /// `event|source|reason|idle_secs|session` line per firing to the
+    /// returned log file.
+    fn write_logging_hook(&self, rel: &str, on: &str) -> PathBuf {
+        let log = self.project.join(format!("{}.log", rel.replace('/', "_")));
+        let path = self.project.join(".autofork/hooks").join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            format!(
+                "---\nhook: true\non: {on}\n\
+                 command: printf '%s\\n' \"$AUTOFORK_EVENT|${{AUTOFORK_SOURCE:-}}|${{AUTOFORK_END_REASON:-}}|${{AUTOFORK_IDLE_SECS:-}}|$AUTOFORK_SESSION_ID\" >> \"{}\"\n\
+                 ---\nlease-keeper documentation\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        log
+    }
+
+    /// Poll `log` until it holds at least `n` lines (hook commands run
+    /// asynchronously); panics after `timeout`.
+    fn wait_for_hook_lines(&self, log: &PathBuf, n: usize, timeout: Duration) -> Vec<String> {
+        let start = Instant::now();
+        loop {
+            let lines: Vec<String> = std::fs::read_to_string(log)
+                .unwrap_or_default()
+                .lines()
+                .map(|l| l.to_string())
+                .collect();
+            if lines.len() >= n {
+                return lines;
+            }
+            assert!(
+                start.elapsed() < timeout,
+                "expected {n} hook lines, have {lines:?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     fn write_transcript(&self, tokens: u64) -> PathBuf {
         let path = self.project.join("transcript.jsonl");
         std::fs::write(
@@ -149,6 +190,7 @@ impl Harness {
             cwd: self.project.clone(),
             project_root: self.project.clone(),
             source: None,
+            reason: None,
             model: None,
             enable_tags: None,
             disable_tags: None,
@@ -1837,4 +1879,124 @@ fn gate_belt_lifts_a_fumbled_wake() {
     let payload = wake_payload(rx2.recv_timeout(Duration::from_secs(10)).unwrap());
     assert!(payload.contains("due: handover"), "{payload}");
     assert!(!payload.contains("due: goal"), "{payload}");
+}
+
+#[test]
+fn lifecycle_hooks_fire_across_the_session_life() {
+    // Long default idle deadline so no fork machinery interferes; the hook
+    // carries its own explicit idle duration.
+    let mut h = Harness::new("30m", "0");
+    let log = h.write_logging_hook(
+        "lease.md",
+        "[session_start, activity, \"idle: 1s\", session_end]",
+    );
+    h.start_daemon();
+
+    let mut start = h.event(EventKind::SessionStart, "s1");
+    start.source = Some("startup".into());
+    assert_ack(h.send_event(start));
+    let lines = h.wait_for_hook_lines(&log, 1, Duration::from_secs(5));
+    assert_eq!(lines[0], "session_start|startup|||s1");
+
+    // A repeat SessionStart for the same open session is not a new edge.
+    let mut again = h.event(EventKind::SessionStart, "s1");
+    again.source = Some("compact".into());
+    assert_ack(h.send_event(again));
+
+    assert_ack(h.send_event(h.prompt_submit("s1", true)));
+    let lines = h.wait_for_hook_lines(&log, 2, Duration::from_secs(5));
+    assert_eq!(lines[1], "activity||||s1");
+
+    // Park the idle poll: the idle hook fires after ~1s while the session
+    // stays open — the poll must NOT resolve (no forks are due).
+    let rx = h.park_stop_wait(h.event(EventKind::Stop, "s1"));
+    let lines = h.wait_for_hook_lines(&log, 3, Duration::from_secs(10));
+    assert_eq!(lines[2], "idle|||1|s1");
+    assert!(
+        rx.try_recv().is_err(),
+        "idle hook firing must not resolve the parked poll"
+    );
+
+    // A clean SessionEnd carries the client-reported reason.
+    let mut end = h.event(EventKind::SessionEnd, "s1");
+    end.reason = Some("logout".into());
+    assert_ack(h.send_event(end));
+    let lines = h.wait_for_hook_lines(&log, 4, Duration::from_secs(5));
+    assert_eq!(lines[3], "session_end||logout||s1");
+
+    // A second SessionEnd is not a new transition: no fifth line.
+    assert_ack(h.send_event(h.event(EventKind::SessionEnd, "s1")));
+    std::thread::sleep(Duration::from_millis(600));
+    assert_eq!(
+        h.wait_for_hook_lines(&log, 4, Duration::from_secs(1)).len(),
+        4
+    );
+}
+
+#[test]
+fn idle_hook_fires_once_per_pause_and_rearms_on_activity() {
+    let mut h = Harness::new("30m", "0");
+    let log = h.write_logging_hook("park.md", "[\"idle: 1s\"]");
+    h.start_daemon();
+
+    assert_ack(h.send_event(h.event(EventKind::SessionStart, "s1")));
+    let rx = h.park_stop_wait(h.event(EventKind::Stop, "s1"));
+    let lines = h.wait_for_hook_lines(&log, 1, Duration::from_secs(10));
+    assert_eq!(lines.len(), 1);
+
+    // A non-waking continuation (a wake turn ending) re-parks without a new
+    // pause: the hook is latched and must not fire again.
+    assert_ack(h.send_event(h.prompt_submit("s1", false)));
+    let _ = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let _rx2 = h.park_stop_wait(h.event(EventKind::Stop, "s1"));
+    std::thread::sleep(Duration::from_millis(1800));
+    assert_eq!(
+        h.wait_for_hook_lines(&log, 1, Duration::from_secs(1)).len(),
+        1
+    );
+
+    // Genuine activity starts a new pause: the next idle fires the hook again.
+    assert_ack(h.send_event(h.prompt_submit("s1", true)));
+    let _rx3 = h.park_stop_wait(h.event(EventKind::Stop, "s1"));
+    let lines = h.wait_for_hook_lines(&log, 2, Duration::from_secs(10));
+    assert_eq!(lines.len(), 2);
+}
+
+#[test]
+fn poll_loss_close_fires_session_end_with_reason_lost() {
+    let mut h = Harness::new("1s", "0").poll_grace_ms(300);
+    let log = h.write_logging_hook("cleanup.md", "[session_end]");
+    h.start_daemon();
+
+    assert_ack(h.send_event(h.event(EventKind::SessionStart, "s1")));
+    // The Claude process dies: its parked poll drops unanswered. After the
+    // grace the daemon closes the session — the crash-adjacent fallback path
+    // (a true SIGKILL/power loss may fire nothing at all; lease TTLs stay
+    // the last line of defense).
+    h.drop_stop_wait(h.event(EventKind::Stop, "s1"));
+    let lines = h.wait_for_hook_lines(&log, 1, Duration::from_secs(10));
+    assert_eq!(lines[0], "session_end||lost||s1");
+}
+
+#[test]
+fn resume_hook_fires_only_for_the_resume_source() {
+    let mut h = Harness::new("30m", "0");
+    let log = h.write_logging_hook("rejoin.md", "[resume]");
+    h.start_daemon();
+
+    let mut startup = h.event(EventKind::SessionStart, "s1");
+    startup.source = Some("startup".into());
+    assert_ack(h.send_event(startup));
+    // A resumed session arrives as a NEW session id with source: resume.
+    let mut resume = h.event(EventKind::SessionStart, "s2");
+    resume.source = Some("resume".into());
+    assert_ack(h.send_event(resume));
+
+    let lines = h.wait_for_hook_lines(&log, 1, Duration::from_secs(5));
+    assert_eq!(lines, vec!["resume|resume|||s2".to_string()]);
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(
+        h.wait_for_hook_lines(&log, 1, Duration::from_secs(1)).len(),
+        1
+    );
 }

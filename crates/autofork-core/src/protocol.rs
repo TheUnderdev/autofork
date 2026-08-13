@@ -73,6 +73,12 @@ pub struct Event {
     /// SessionStart source (`startup`/`resume`/`clear`/`compact`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// SessionEnd reason, when the client reports one (Claude Code:
+    /// `clear`/`logout`/`prompt_input_exit`/`other`; opencode:
+    /// `disposed`/`deleted`). Exposed to lifecycle hooks as
+    /// `AUTOFORK_END_REASON`. Additive field (no proto bump).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     /// The session's model id (SessionStart provides it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -309,6 +315,7 @@ mod tests {
                 cwd: "/p".into(),
                 project_root: "/p".into(),
                 source: None,
+                reason: None,
                 model: None,
                 enable_tags: None,
                 disable_tags: None,

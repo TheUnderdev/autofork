@@ -20,7 +20,7 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
-const SCHEMA_VERSION: i32 = 8;
+const SCHEMA_VERSION: i32 = 9;
 
 /// Split a comma-joined tag column back into a list (trimmed, empties
 /// dropped). `NULL` (unset) stays `None`.
@@ -64,6 +64,9 @@ pub struct SessionRow {
     /// forks, if any (set at its wake issuance, cleared when its run/chain
     /// settles or on genuine user activity).
     pub active_gate: Option<String>,
+    /// The harness the session's events come from (`opencode`; `None` =
+    /// Claude Code). Kept across events that omit it, like `model`.
+    pub client: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,13 +296,25 @@ impl Store {
                  COMMIT;",
             )?;
         }
+        if version < 9 {
+            // The harness the session's events come from (`opencode`; NULL =
+            // Claude Code), so lifecycle hooks can report it even from close
+            // paths that have no event in hand (reaper, prune, poll loss).
+            conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE sessions ADD COLUMN client TEXT;
+                 COMMIT;",
+            )?;
+        }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(Self { conn })
     }
 
     // ---- sessions ----
 
-    /// Register (or re-touch) a session as open.
+    /// Register (or re-touch) a session as open. Returns whether the session
+    /// was newly opened by this call (no row, or a closed row reopened) —
+    /// the `session_start` lifecycle-hook edge.
     #[allow(clippy::too_many_arguments)]
     pub fn upsert_session(
         &self,
@@ -310,8 +325,18 @@ impl Store {
         model: Option<&str>,
         enable_tags: Option<&str>,
         disable_tags: Option<&str>,
+        client: Option<&str>,
         now: i64,
-    ) -> rusqlite::Result<()> {
+    ) -> rusqlite::Result<bool> {
+        let was_open = self
+            .conn
+            .query_row(
+                "SELECT status FROM sessions WHERE session_id = ?1",
+                params![session_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .is_some_and(|s| s == "open");
         // `cwd` is pinned to the first event's value (first write wins): a
         // session's cwd drifts as its Bash tool `cd`s around, but the launch
         // directory is the stable per-session identity. `transcript_path` does
@@ -319,14 +344,16 @@ impl Store {
         // reflects the latest event, so it overwrites (a cleared env clears it).
         self.conn.execute(
             "INSERT INTO sessions (session_id, project_root, cwd, transcript_path, status,
-                                   last_activity, created_at, model, enable_tags, disable_tags)
-             VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?5, ?6, ?7, ?8)
+                                   last_activity, created_at, model, enable_tags, disable_tags,
+                                   client)
+             VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(session_id) DO UPDATE SET
                project_root = excluded.project_root,
                transcript_path = COALESCE(excluded.transcript_path, transcript_path),
                model = COALESCE(excluded.model, model),
                enable_tags = excluded.enable_tags,
                disable_tags = excluded.disable_tags,
+               client = COALESCE(excluded.client, client),
                status = 'open',
                last_activity = excluded.last_activity",
             params![
@@ -338,9 +365,10 @@ impl Store {
                 model,
                 enable_tags,
                 disable_tags,
+                client,
             ],
         )?;
-        Ok(())
+        Ok(!was_open)
     }
 
     pub fn get_session(&self, session_id: &str) -> rusqlite::Result<Option<SessionRow>> {
@@ -349,7 +377,7 @@ impl Store {
                 "SELECT session_id, project_root, cwd, transcript_path, status, last_activity,
                         transcript_offset, prompt_tokens, model, created_at,
                         enable_tags, disable_tags, pause_epoch, pause_started_at,
-                        context_window, active_gate
+                        context_window, active_gate, client
                  FROM sessions WHERE session_id = ?1",
                 params![session_id],
                 Self::row_to_session,
@@ -379,6 +407,7 @@ impl Store {
             pause_started_at: row.get(13)?,
             context_window: row.get::<_, Option<i64>>(14)?.map(|n| n as u64),
             active_gate: row.get(15)?,
+            client: row.get(16)?,
         })
     }
 
@@ -471,7 +500,7 @@ impl Store {
             "SELECT session_id, project_root, cwd, transcript_path, status, last_activity,
                     transcript_offset, prompt_tokens, model, created_at,
                     enable_tags, disable_tags, pause_epoch, pause_started_at,
-                    context_window, active_gate
+                    context_window, active_gate, client
              FROM sessions WHERE status = 'open' ORDER BY last_activity DESC",
         )?;
         let rows = stmt.query_map([], Self::row_to_session)?;
@@ -522,11 +551,14 @@ impl Store {
         Ok(())
     }
 
-    /// Close a session and clear its roster, latches, spawns and pending deps.
-    pub fn close_session(&self, session_id: &str) -> rusqlite::Result<()> {
+    /// Close a session and clear its roster, latches, spawns and pending
+    /// deps. Returns whether this call transitioned it open → closed (the
+    /// `session_end` lifecycle-hook edge; racing close paths fire once).
+    pub fn close_session(&self, session_id: &str) -> rusqlite::Result<bool> {
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "UPDATE sessions SET status = 'closed' WHERE session_id = ?1",
+        let n = tx.execute(
+            "UPDATE sessions SET status = 'closed'
+             WHERE session_id = ?1 AND status = 'open'",
             params![session_id],
         )?;
         for table in ["fork_roster", "fork_fires", "fork_spawns", "pending_deps"] {
@@ -535,7 +567,8 @@ impl Store {
                 params![session_id],
             )?;
         }
-        tx.commit()
+        tx.commit()?;
+        Ok(n > 0)
     }
 
     // ---- roster ----
@@ -968,6 +1001,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             now,
         )
         .unwrap();
@@ -1083,6 +1117,7 @@ mod tests {
             None,
             Some("ci,review"),
             Some("noisy"),
+            None,
             100,
         )
         .unwrap();
@@ -1097,6 +1132,7 @@ mod tests {
             "a",
             Path::new("/p"),
             Path::new("/p"),
+            None,
             None,
             None,
             None,
@@ -1325,12 +1361,66 @@ mod tests {
     }
 
     #[test]
+    fn upsert_reports_the_newly_opened_edge_and_close_the_transition() {
+        let s = store();
+        // First sight opens; a re-touch does not.
+        assert!(s
+            .upsert_session(
+                "a",
+                Path::new("/p"),
+                Path::new("/p"),
+                None,
+                None,
+                None,
+                None,
+                Some("opencode"),
+                100,
+            )
+            .unwrap());
+        assert!(!s
+            .upsert_session(
+                "a",
+                Path::new("/p"),
+                Path::new("/p"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                101,
+            )
+            .unwrap());
+        // The client sticks across events that omit it (latest non-null).
+        assert_eq!(
+            s.get_session("a").unwrap().unwrap().client.as_deref(),
+            Some("opencode")
+        );
+        // Close transitions exactly once; reopening reports newly-opened again.
+        assert!(s.close_session("a").unwrap());
+        assert!(!s.close_session("a").unwrap());
+        assert!(s
+            .upsert_session(
+                "a",
+                Path::new("/p"),
+                Path::new("/p"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                200,
+            )
+            .unwrap());
+    }
+
+    #[test]
     fn cwd_is_pinned_to_first_event() {
         let s = store();
         s.upsert_session(
             "a",
             Path::new("/home/proj"),
             Path::new("/home/proj"),
+            None,
             None,
             None,
             None,
@@ -1342,6 +1432,7 @@ mod tests {
             "a",
             Path::new("/home/proj"),
             Path::new("/home/proj/vendor/thing"),
+            None,
             None,
             None,
             None,

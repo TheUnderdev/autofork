@@ -407,7 +407,9 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
     dispose: async () => {
       const ends = [];
       for (const [id, s] of sessions) {
-        if (s.started) ends.push(call("session-end", { session_id: id }));
+        // `disposed` reaches session_end lifecycle hooks as
+        // AUTOFORK_END_REASON — the "opencode exited normally" callback.
+        if (s.started) ends.push(call("session-end", { session_id: id, reason: "disposed" }));
       }
       await Promise.allSettled(ends);
       for (const [, marker] of parked) {
@@ -489,7 +491,7 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
           return;
         }
         if (sessions.get(id)?.started) {
-          await call("session-end", { session_id: id });
+          await call("session-end", { session_id: id, reason: "deleted" });
         }
         sessions.delete(id);
         ignored.delete(id);

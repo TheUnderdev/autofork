@@ -33,6 +33,10 @@ struct HookInput {
     cwd: Option<PathBuf>,
     #[serde(default)]
     source: Option<String>,
+    /// The SessionEnd reason (`clear`/`logout`/`prompt_input_exit`/`other`),
+    /// forwarded so `session_end` lifecycle hooks can see it.
+    #[serde(default)]
+    reason: Option<String>,
     #[serde(default)]
     model: Option<String>,
     /// The submitted prompt (UserPromptSubmit). Used to tell genuine user
@@ -76,6 +80,7 @@ fn run_hook_inner(kind: HookKind) -> Option<()> {
         cwd: cwd.clone(),
         project_root: root.clone(),
         source: input.source.clone(),
+        reason: input.reason.clone(),
         model: input.model.clone(),
         enable_tags: enable_tags.clone(),
         disable_tags: disable_tags.clone(),

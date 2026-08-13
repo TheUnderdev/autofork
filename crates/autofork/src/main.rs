@@ -33,6 +33,16 @@ enum Command {
         #[arg(long)]
         project: Option<std::path::PathBuf>,
     },
+    /// List the lifecycle hooks visible from the current (or given) directory.
+    ///
+    /// Lifecycle hooks are daemon-run shell commands (no model, no fork) fired
+    /// at session moments — session_start, resume, activity, idle, session_end
+    /// — for resource integrations like workspace leases.
+    Hooks {
+        /// Project directory (defaults to the current directory).
+        #[arg(long)]
+        project: Option<std::path::PathBuf>,
+    },
     /// Print the spawn instruction for a fork (by name, or every fork carrying
     /// `--tag`) to paste into an interactive Claude Code session. v0.5 forks
     /// run as fork subagents, so autofork can no longer spawn them itself.
@@ -100,6 +110,7 @@ fn main() {
         Command::Hook { event } => hook::run_hook(event),
         Command::Status => exit_on_err(commands::status(&paths)),
         Command::Forks { project } => exit_on_err(commands::list_forks(&paths, project)),
+        Command::Hooks { project } => exit_on_err(commands::list_hooks(&paths, project)),
         Command::Run { name, tag } => exit_on_err(commands::run_fork(&paths, name, tag)),
         Command::Logs { follow } => exit_on_err(commands::logs(&paths, follow)),
         Command::Prune => exit_on_err(commands::prune(&paths)),
