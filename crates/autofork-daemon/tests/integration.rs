@@ -1835,7 +1835,9 @@ fn runaway_breaker_stops_an_epoch_pumped_chain() {
     // minting a fresh idle latch and resetting the per-pause chain counter —
     // so the goal fork re-fires forever with zero user input, surviving even
     // session close + resume. The wall-clock runaway breaker must stop it.
-    let mut h = Harness::new("1s", "0").wake_grace_secs(0).chain_grace_secs(0);
+    let mut h = Harness::new("1s", "0")
+        .wake_grace_secs(0)
+        .chain_grace_secs(0);
     h.append_config("runaway_limit = 2");
     h.write_fork(
         "goal.md",
