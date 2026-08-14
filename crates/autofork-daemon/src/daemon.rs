@@ -71,6 +71,15 @@ pub struct Daemon {
     /// (prompt-less) PromptSubmit shortly after a wake as a non-waking
     /// continuation (the daemon-side belt).
     pub wake_issued_at: Mutex<HashMap<String, i64>>,
+    /// When we last processed a chain continue for an opencode session. The
+    /// plugin injects the chain report as a real turn and flags it `waking:
+    /// false` — but only the instance that injected it. A duplicated event
+    /// stream (a second plugin instance, or opencode's own duplicated
+    /// session loops) reports the same turn as genuine activity, which resets
+    /// the pause counters the chain limit depends on — the observed runaway.
+    /// A `waking: true` PromptSubmit inside the grace window after a chain
+    /// continue is downgraded to non-waking.
+    pub chain_continued_at: Mutex<HashMap<String, i64>>,
     /// Sessions with a currently-parked stop-wait poll (a liveness heartbeat:
     /// the poll's hook subprocess dies with the Claude process). Values are
     /// reference counts, so the entry exists iff a poll is parked.
@@ -91,6 +100,18 @@ pub struct Daemon {
 /// `AUTOFORK_WAKE_GRACE_SECS` (tests shorten it).
 fn wake_grace_secs() -> i64 {
     std::env::var("AUTOFORK_WAKE_GRACE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20)
+}
+
+/// How long after a chain continue a `waking: true` PromptSubmit on an
+/// opencode session is downgraded to non-waking (the duplicated-event-stream
+/// dedupe). Kept short: a genuine user prompt landing inside it merely skips
+/// one pause-epoch bump, which the next genuine prompt supplies. Overridable
+/// via `AUTOFORK_CHAIN_GRACE_SECS` (tests shorten or zero it).
+fn chain_grace_secs() -> i64 {
+    std::env::var("AUTOFORK_CHAIN_GRACE_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(20)
@@ -149,6 +170,7 @@ impl Daemon {
             store: Mutex::new(store),
             waits: Mutex::new(HashMap::new()),
             wake_issued_at: Mutex::new(HashMap::new()),
+            chain_continued_at: Mutex::new(HashMap::new()),
             parked: Mutex::new(HashMap::new()),
             pending_close: Mutex::new(HashMap::new()),
             close_gen: AtomicU64::new(0),
@@ -290,6 +312,25 @@ impl Daemon {
             .is_some_and(|&at| t - at < wake_grace_secs())
     }
 
+    /// Record that a chain continue was just processed for a session (the
+    /// duplicated-event-stream dedupe window).
+    fn note_chain_continued(&self, session_id: &str) {
+        self.chain_continued_at
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string(), now());
+    }
+
+    /// Whether a chain continue was processed for this session within the
+    /// grace window.
+    fn recently_chain_continued(&self, session_id: &str, t: i64) -> bool {
+        self.chain_continued_at
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .is_some_and(|&at| t - at < chain_grace_secs())
+    }
+
     /// Whether this id names one of our own fork-run sessions. Such ids must
     /// never be registered or scheduled: a fork-run session that slips past
     /// the plugin's eligibility check (lost title marker, duplicate plugin
@@ -425,6 +466,27 @@ impl Daemon {
                 } else {
                     ev.waking
                         .unwrap_or_else(|| !self.recently_woke(&ev.session_id, t))
+                };
+                // Duplicated-event-stream dedupe: the turn a chain report
+                // injection starts is flagged non-waking only by the plugin
+                // instance that injected it. A second observer of the same
+                // session (another plugin instance, or opencode's own
+                // duplicated loops) reports that same turn as genuine
+                // activity — bumping the pause epoch, which re-arms every
+                // idle fork and resets the per-pause chain limit, turning a
+                // goal fork into a self-sustaining pump. Any waking
+                // PromptSubmit for an opencode session inside the chain
+                // grace window is downgraded to non-waking.
+                let waking = if waking
+                    && ev.client.as_deref() == Some("opencode")
+                    && self.recently_chain_continued(&ev.session_id, t)
+                {
+                    tracing::info!(session = %ev.session_id,
+                        "waking prompt inside the chain grace window — \
+                         treating it as the chain's own injected turn");
+                    false
+                } else {
+                    waking
                 };
                 let newly_opened = {
                     let store = self.store.lock().unwrap();
@@ -870,6 +932,13 @@ impl Daemon {
 
         let mut rearmed = false;
         if cont && status == "completed" {
+            // The plugin injects a continuing chain's report as a real turn
+            // before it reports the completion; open the dedupe window so
+            // duplicated observers of that turn don't classify it as user
+            // activity (see the PromptSubmit downgrade).
+            if session.client.as_deref() == Some("opencode") {
+                self.note_chain_continued(session_id);
+            }
             match &def {
                 Some(def) if def.chain => {
                     let cfg = self.cfg_for(Some(&session.project_root));
@@ -879,7 +948,19 @@ impl Daemon {
                     let runs = store
                         .count_runs_since(session_id, fork_name, since)
                         .unwrap_or(0);
-                    if runs >= limit {
+                    // The per-pause count above resets with the pause; the
+                    // wall-clock count cannot — the runaway backstop for
+                    // anything that pumps the pause epoch.
+                    let window = crate::planner::runaway_window_secs();
+                    let hourly = store
+                        .count_runs_since(session_id, fork_name, now() - window)
+                        .unwrap_or(0);
+                    if cfg.runaway_limit > 0 && hourly >= cfg.runaway_limit as i64 {
+                        tracing::warn!(session = %session_id, fork = fork_name,
+                            runs = hourly, limit = cfg.runaway_limit,
+                            "runaway breaker: chain hit its hourly run cap, not re-arming \
+                             (raise `runaway_limit` in config if this rate is intended)");
+                    } else if runs >= limit {
                         tracing::warn!(session = %session_id, fork = fork_name, runs, limit,
                             "chain limit reached, not re-arming");
                     } else if store

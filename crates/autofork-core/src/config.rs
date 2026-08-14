@@ -39,6 +39,13 @@ pub struct Config {
     /// true` forks that don't set their own `chain_limit`. The belt against a
     /// fork that never stops asking for another run.
     pub chain_limit: u64,
+    /// Runaway breaker: max wakes of one fork per session per rolling hour,
+    /// counted against wall-clock — immune to pause resets, session resumes,
+    /// and duplicated client event streams (the failure modes that defeat the
+    /// per-pause counters). `every:` triggers are exempt (their interval is an
+    /// explicit contract). 0 disables. Tripping it is loud (a warn log), never
+    /// silent.
+    pub runaway_limit: u64,
 }
 
 impl Default for Config {
@@ -52,6 +59,7 @@ impl Default for Config {
             disable_tags: None,
             tag_throttles: BTreeMap::new(),
             chain_limit: 25,
+            runaway_limit: 30,
         }
     }
 }
@@ -69,6 +77,7 @@ struct RawConfig {
     #[serde(default)]
     tag_throttles: BTreeMap<String, toml::Value>,
     chain_limit: Option<toml::Value>,
+    runaway_limit: Option<toml::Value>,
     // ---- deprecated since v0.5: accepted, warned, ignored ----
     concurrency: Option<toml::Value>,
     fork_timeout: Option<toml::Value>,
@@ -129,6 +138,13 @@ fn apply_layer(cfg: &mut Config, raw: RawConfig, project_level: bool, warnings: 
         match v {
             toml::Value::Integer(n) if *n > 0 => cfg.chain_limit = *n as u64,
             _ => warnings.push("'chain_limit' must be a positive integer, ignoring".into()),
+        }
+    }
+    if let Some(v) = &raw.runaway_limit {
+        match v {
+            // 0 is legal: it disables the breaker.
+            toml::Value::Integer(n) if *n >= 0 => cfg.runaway_limit = *n as u64,
+            _ => warnings.push("'runaway_limit' must be a non-negative integer, ignoring".into()),
         }
     }
     // Like `models` once did: per-key extend so a project layer overrides the
@@ -412,6 +428,22 @@ mod tests {
         let (cfg, warnings) = load_config(None, Some(home));
         assert_eq!(cfg.wake_debounce_secs, 0);
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn runaway_limit_parses_and_zero_disables() {
+        assert_eq!(Config::default().runaway_limit, 30);
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        fs::create_dir_all(home.join(".autofork")).unwrap();
+        fs::write(home.join(".autofork/config.toml"), "runaway_limit = 0\n").unwrap();
+        let (cfg, warnings) = load_config(None, Some(home));
+        assert_eq!(cfg.runaway_limit, 0);
+        assert!(warnings.is_empty());
+        fs::write(home.join(".autofork/config.toml"), "runaway_limit = -3\n").unwrap();
+        let (cfg, warnings) = load_config(None, Some(home));
+        assert_eq!(cfg.runaway_limit, 30);
+        assert_eq!(warnings.len(), 1);
     }
 
     #[test]

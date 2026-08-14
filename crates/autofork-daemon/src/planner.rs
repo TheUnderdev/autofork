@@ -187,6 +187,56 @@ pub fn select_forks(
                 continue;
             }
         }
+        // Daemon-side overlap gate: `overlap: false` with a live run of this
+        // fork still in flight (a spawn the registry hasn't seen go terminal)
+        // means skip. The client-side gates (the wake payload's skip line, the
+        // opencode plugin's in-memory live map) die with their instance and
+        // multiply with duplicated ones; the spawn registry is the one copy
+        // that survives both. Aged-out spawns (terminal status lost to a
+        // crash) stop blocking after `overlap_spawn_max_age_secs`.
+        if !parsed.def.overlap {
+            let live = {
+                let store = daemon.store.lock().unwrap();
+                store
+                    .live_spawn_newer_than(
+                        &session.session_id,
+                        &entry.fork_name,
+                        t - overlap_spawn_max_age_secs(),
+                    )
+                    .unwrap_or(false)
+            };
+            if live {
+                tracing::info!(session = %session.session_id, fork = %entry.fork_name,
+                    "a run is still in flight and overlap is false, skipping");
+                continue;
+            }
+        }
+        // Runaway breaker: a hard wall-clock cap on wakes of one fork, immune
+        // to the counters a runaway can reset (pause epochs, baselines,
+        // per-pause chain limits). Guards against self-sustaining loops — a
+        // duplicated client event stream misreporting autofork's own turns as
+        // user activity re-arms every idle fork each cycle, and a chain fork
+        // then pumps the session forever with zero user input. `every:`
+        // triggers are exempt: their interval is an explicit contract.
+        if cfg.runaway_limit > 0 && !matches!(trigger, ForkRunOn::Every { .. }) {
+            let recent = {
+                let store = daemon.store.lock().unwrap();
+                store
+                    .count_runs_since(
+                        &session.session_id,
+                        &entry.fork_name,
+                        t - runaway_window_secs(),
+                    )
+                    .unwrap_or(0)
+            };
+            if recent >= cfg.runaway_limit as i64 {
+                tracing::warn!(session = %session.session_id, fork = %entry.fork_name,
+                    runs = recent, limit = cfg.runaway_limit,
+                    "runaway breaker: fork hit its hourly run cap, skipping \
+                     (raise `runaway_limit` in config if this rate is intended)");
+                continue;
+            }
+        }
         selected.push(SelectedFork {
             name: entry.fork_name.clone(),
             path: entry.fork_path.clone(),
@@ -219,6 +269,26 @@ pub(crate) fn gate_grace_secs() -> i64 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(180)
+}
+
+/// How old a live (non-terminal) spawn may be and still block an `overlap:
+/// false` fork from re-firing. Runs finish in minutes; a spawn this stale
+/// almost certainly lost its terminal status to a crash. Overridable via
+/// `AUTOFORK_OVERLAP_SPAWN_MAX_AGE_SECS` (tests shorten it).
+fn overlap_spawn_max_age_secs() -> i64 {
+    std::env::var("AUTOFORK_OVERLAP_SPAWN_MAX_AGE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30 * 60)
+}
+
+/// The rolling window the runaway breaker counts runs against. Overridable
+/// via `AUTOFORK_RUNAWAY_WINDOW_SECS` (tests shorten it).
+pub(crate) fn runaway_window_secs() -> i64 {
+    std::env::var("AUTOFORK_RUNAWAY_WINDOW_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3600)
 }
 
 /// While a `gate: true` fork's run/chain is unsettled, hold every other

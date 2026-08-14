@@ -24,6 +24,7 @@ struct Harness {
     poll_grace_ms: Option<u64>,
     wake_grace_secs: Option<u64>,
     gate_grace_secs: Option<u64>,
+    chain_grace_secs: Option<u64>,
 }
 
 impl Harness {
@@ -50,6 +51,7 @@ impl Harness {
             poll_grace_ms: None,
             wake_grace_secs: None,
             gate_grace_secs: None,
+            chain_grace_secs: None,
         }
     }
 
@@ -66,6 +68,22 @@ impl Harness {
     fn gate_grace_secs(mut self, secs: u64) -> Self {
         self.gate_grace_secs = Some(secs);
         self
+    }
+
+    fn chain_grace_secs(mut self, secs: u64) -> Self {
+        self.chain_grace_secs = Some(secs);
+        self
+    }
+
+    /// Append one raw line to the daemon's user config (call before
+    /// `start_daemon`).
+    fn append_config(&self, line: &str) {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(self.home.join("config.toml"))
+            .unwrap();
+        writeln!(f, "{line}").unwrap();
     }
 
     fn write_fork(&self, rel: &str, content: &str) {
@@ -159,6 +177,9 @@ impl Harness {
         }
         if let Some(secs) = self.gate_grace_secs {
             cmd.env("AUTOFORK_GATE_GRACE_SECS", secs.to_string());
+        }
+        if let Some(secs) = self.chain_grace_secs {
+            cmd.env("AUTOFORK_CHAIN_GRACE_SECS", secs.to_string());
         }
         let child = cmd.spawn().unwrap();
         self.daemon = Some(child);
@@ -1804,6 +1825,192 @@ fn opencode_continue_field_rearms_and_settles() {
         rx3.recv_timeout(Duration::from_millis(2500)).is_err(),
         "chain re-fired after settling"
     );
+}
+
+#[test]
+fn runaway_breaker_stops_an_epoch_pumped_chain() {
+    // The incident replay: duplicated opencode session loops (an interrupted
+    // stream leaves a zombie loop behind) report autofork's own chain turns
+    // as genuine user activity. Every such report bumps the pause epoch —
+    // minting a fresh idle latch and resetting the per-pause chain counter —
+    // so the goal fork re-fires forever with zero user input, surviving even
+    // session close + resume. The wall-clock runaway breaker must stop it.
+    let mut h = Harness::new("1s", "0").wake_grace_secs(0).chain_grace_secs(0);
+    h.append_config("runaway_limit = 2");
+    h.write_fork(
+        "goal.md",
+        "---\nfork: true\nrun_on: [idle]\nchain: true\n---\nGOAL",
+    );
+    h.start_daemon();
+    assert_ack(h.send_event(oc_event(&h, EventKind::SessionStart, "oc1")));
+
+    let pump = |h: &Harness| {
+        // The zombie loop's busy transition: a waking PromptSubmit the chain
+        // grace is disabled from downgrading (this test exercises the breaker
+        // alone).
+        let mut ev = oc_event(h, EventKind::PromptSubmit, "oc1");
+        ev.waking = Some(true);
+        assert_ack(h.send_event(ev));
+    };
+
+    // Cycle 1: wake → run → continue → pump.
+    let rx = h.park_stop_wait(oc_event(&h, EventKind::Stop, "oc1"));
+    let forks = wake_forks(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert_eq!(forks[0].name, "goal");
+    assert_ack(h.request(RequestBody::ForkSpawned {
+        session_id: "oc1".into(),
+        fork: "goal".into(),
+        run_ref: "ses_g1".into(),
+    }));
+    assert_ack(h.request(RequestBody::ForkCompleted {
+        session_id: "oc1".into(),
+        fork: "goal".into(),
+        run_ref: "ses_g1".into(),
+        status: "completed".into(),
+        cont: Some(true),
+    }));
+    pump(&h);
+
+    // Cycle 2: the pumped epoch re-fires the fork (the per-pause counters
+    // have been defeated — this is the runaway in motion).
+    let rx2 = h.park_stop_wait(oc_event(&h, EventKind::Stop, "oc1"));
+    let forks = wake_forks(rx2.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert_eq!(forks[0].name, "goal");
+    assert_ack(h.request(RequestBody::ForkSpawned {
+        session_id: "oc1".into(),
+        fork: "goal".into(),
+        run_ref: "ses_g2".into(),
+    }));
+    assert_ack(h.request(RequestBody::ForkCompleted {
+        session_id: "oc1".into(),
+        fork: "goal".into(),
+        run_ref: "ses_g2".into(),
+        status: "completed".into(),
+        cont: Some(true),
+    }));
+    pump(&h);
+
+    // Cycle 3: two runs inside the window — the breaker refuses a third no
+    // matter how many fresh pauses the pump mints.
+    let rx3 = h.park_stop_wait(oc_event(&h, EventKind::Stop, "oc1"));
+    assert!(
+        rx3.recv_timeout(Duration::from_millis(2500)).is_err(),
+        "runaway breaker failed: the epoch-pumped chain re-fired past the cap"
+    );
+}
+
+#[test]
+fn chain_grace_downgrades_duplicate_activity_reports() {
+    // A duplicated observer (second plugin instance / duplicated session
+    // loop) reports the chain's own injected turn as `waking: true`. Inside
+    // the chain grace window that report must be downgraded, so the pause —
+    // and with it the per-pause chain limit — survives the duplicate.
+    let mut h = Harness::new("1s", "0").wake_grace_secs(0);
+    h.write_fork(
+        "goal.md",
+        "---\nfork: true\nrun_on: [idle]\nchain: true\nchain_limit: 2\n---\nGOAL",
+    );
+    h.start_daemon();
+    assert_ack(h.send_event(oc_event(&h, EventKind::SessionStart, "oc1")));
+
+    let duplicate_report = |h: &Harness| {
+        let mut ev = oc_event(h, EventKind::PromptSubmit, "oc1");
+        ev.waking = Some(true);
+        assert_ack(h.send_event(ev));
+    };
+
+    // Cycle 1: wake → run → continue → duplicate waking report (downgraded).
+    let rx = h.park_stop_wait(oc_event(&h, EventKind::Stop, "oc1"));
+    let forks = wake_forks(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert_eq!(forks[0].name, "goal");
+    assert_ack(h.request(RequestBody::ForkSpawned {
+        session_id: "oc1".into(),
+        fork: "goal".into(),
+        run_ref: "ses_g1".into(),
+    }));
+    assert_ack(h.request(RequestBody::ForkCompleted {
+        session_id: "oc1".into(),
+        fork: "goal".into(),
+        run_ref: "ses_g1".into(),
+        status: "completed".into(),
+        cont: Some(true),
+    }));
+    duplicate_report(&h);
+
+    // Cycle 2: the chain re-fires within the SAME pause.
+    let rx2 = h.park_stop_wait(oc_event(&h, EventKind::Stop, "oc1"));
+    let forks = wake_forks(rx2.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert_eq!(forks[0].name, "goal");
+    assert_ack(h.request(RequestBody::ForkSpawned {
+        session_id: "oc1".into(),
+        fork: "goal".into(),
+        run_ref: "ses_g2".into(),
+    }));
+    assert_ack(h.request(RequestBody::ForkCompleted {
+        session_id: "oc1".into(),
+        fork: "goal".into(),
+        run_ref: "ses_g2".into(),
+        status: "completed".into(),
+        cont: Some(true),
+    }));
+    duplicate_report(&h);
+
+    // chain_limit (2 per pause) now binds, because the duplicates were
+    // downgraded and the pause was never reset. Without the grace the second
+    // duplicate would have minted a fresh pause and the chain would re-fire.
+    let rx3 = h.park_stop_wait(oc_event(&h, EventKind::Stop, "oc1"));
+    assert!(
+        rx3.recv_timeout(Duration::from_millis(2500)).is_err(),
+        "duplicate activity report reset the pause and defeated chain_limit"
+    );
+}
+
+#[test]
+fn overlap_false_holds_across_pause_resets() {
+    // Daemon-side overlap gate: with a run of the fork still in flight, a new
+    // pause (fresh epoch, fresh idle latch) must not fire it again. The
+    // client-side overlap gates live in plugin-instance memory and multiply
+    // with duplicated instances; the spawn registry is the copy that counts.
+    let mut h = Harness::new("1s", "0").wake_grace_secs(0);
+    h.write_fork("journal.md", "---\nfork: true\nrun_on: [idle]\n---\nJ");
+    h.start_daemon();
+    assert_ack(h.send_event(oc_event(&h, EventKind::SessionStart, "oc1")));
+
+    // Wake 1, run in flight (spawned, not completed).
+    let rx = h.park_stop_wait(oc_event(&h, EventKind::Stop, "oc1"));
+    let forks = wake_forks(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert_eq!(forks[0].name, "journal");
+    assert_ack(h.request(RequestBody::ForkSpawned {
+        session_id: "oc1".into(),
+        fork: "journal".into(),
+        run_ref: "ses_j1".into(),
+    }));
+
+    // Genuine user activity starts a new pause; the fresh latch would
+    // normally let the fork fire again — the live spawn must block it.
+    let mut ev = oc_event(&h, EventKind::PromptSubmit, "oc1");
+    ev.waking = Some(true);
+    assert_ack(h.send_event(ev));
+    let rx2 = h.park_stop_wait(oc_event(&h, EventKind::Stop, "oc1"));
+    assert!(
+        rx2.recv_timeout(Duration::from_millis(2500)).is_err(),
+        "overlap: false fork re-fired while its run was still in flight"
+    );
+
+    // The run settles: the next pause fires it again.
+    assert_ack(h.request(RequestBody::ForkCompleted {
+        session_id: "oc1".into(),
+        fork: "journal".into(),
+        run_ref: "ses_j1".into(),
+        status: "completed".into(),
+        cont: None,
+    }));
+    let mut ev = oc_event(&h, EventKind::PromptSubmit, "oc1");
+    ev.waking = Some(true);
+    assert_ack(h.send_event(ev));
+    let rx3 = h.park_stop_wait(oc_event(&h, EventKind::Stop, "oc1"));
+    let forks = wake_forks(rx3.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert_eq!(forks[0].name, "journal");
 }
 
 #[test]

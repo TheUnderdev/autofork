@@ -250,6 +250,31 @@ markdown decoration around it is tolerated, and the daemon re-checks the definit
 back to the `chain_limit` config key, default 25). Your own next message always ends the chain —
 genuine activity starts a new pause and the fork re-evaluates on the next one.
 
+### Runaway protection
+
+The per-pause counters above assume the daemon can tell genuine user activity from autofork's own
+turns. A duplicated client event stream can defeat that assumption — observed live with an opencode
+bug that left several agentic loops running for one session after a network interruption: each
+zombie loop reported the chain's own injected turns as fresh user activity, every report minted a
+new pause (re-arming every idle fork and resetting the chain counter), and the goal fork pumped the
+session forever, surviving even close + resume because both opencode's session id and the daemon's
+state persist. Three daemon-side guards hold the line (daemon-side because the daemon is the one
+singleton with persistent state — client-side guards die with their plugin instance and multiply
+with duplicated ones):
+
+- **The runaway breaker** (`runaway_limit`, default 30; 0 disables): a hard wall-clock cap on wakes
+  of one fork per session per rolling hour, counted against the persisted run log — immune to pause
+  resets, session resumes, and duplicated event streams. Enforced at selection and at chain re-arm;
+  tripping it is a `warn` in the daemon log, never silent. `every:` triggers are exempt (their
+  interval is an explicit contract — an `every: 1m` fork is allowed to be a cron).
+- **The chain grace window** (`AUTOFORK_CHAIN_GRACE_SECS`, default 20s): a `waking` prompt on an
+  opencode session arriving right after a chain continue is treated as the chain's own injected
+  turn, not user activity — deduping the duplicated observers' reports of that turn.
+- **The daemon-side overlap gate**: an `overlap: false` fork with a run still in flight (a spawn
+  the registry hasn't seen go terminal) is skipped at selection, whatever client-side gates think.
+  A spawn whose terminal status was lost to a crash stops blocking after
+  `AUTOFORK_OVERLAP_SPAWN_MAX_AGE_SECS` (default 30m).
+
 ### Goal forks: `gate: true`
 
 A **goal fork** combines the pieces: fire immediately after every one of your turns, keep working
@@ -368,6 +393,7 @@ session_timeout = "12h"        # close sessions idle longer than this
 quiet_period = "20m"           # daemon self-exit after this much nothing (global only)
 wake_debounce = "5s"           # batch near-simultaneous forks into one wake; 0 answers immediately
 chain_limit = 25               # default cap on chain runs per pause (see chain forks)
+runaway_limit = 30             # hard cap on wakes of one fork per session per rolling hour; 0 disables
 enable_tags = ["ci"]           # default tag whitelist (see below)
 disable_tags = ["noisy"]       # default tag blocklist (see below)
 

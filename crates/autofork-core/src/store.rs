@@ -466,6 +466,26 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// Whether the session has a live (non-terminal) spawn of this fork
+    /// recorded at or after `min_spawned_at` — the daemon-side `overlap:
+    /// false` gate. The age floor keeps a run whose terminal status was lost
+    /// (client crash mid-run) from wedging the fork forever.
+    pub fn live_spawn_newer_than(
+        &self,
+        session_id: &str,
+        fork_name: &str,
+        min_spawned_at: i64,
+    ) -> rusqlite::Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM fork_spawns
+             WHERE session_id = ?1 AND fork_name = ?2 AND status = 'spawned'
+               AND spawned_at >= ?3",
+            params![session_id, fork_name, min_spawned_at],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
     /// When this fork's latest wake was issued in this session, if ever.
     pub fn last_issued_at(
         &self,
