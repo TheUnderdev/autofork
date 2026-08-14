@@ -438,21 +438,32 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
   // Startup sweep: delete fork-run sessions left behind — crashed or failed
   // runs, and the accumulation from autofork versions that never cleaned up.
   // Root sessions carrying our title marker, untouched for SWEEP_AGE_MS,
-  // cannot be live runs. Fire-and-forget: a failed sweep must never break
-  // the plugin, and the next instance start retries anyway.
+  // cannot be live runs. The server pages session.list at 100, newest first,
+  // so a plain list hides any real backlog below the window: prefilter by
+  // the title marker server-side (`search` is a LIKE on the title;
+  // startsWith below stays authoritative) and re-list until a full pass
+  // deletes nothing, so one startup drains everything. Fire-and-forget: a
+  // failed sweep must never break the plugin, and the next instance start
+  // retries anyway.
   if (!KEEP_FORK_SESSIONS) {
     (async () => {
       const cutoff = Date.now() - SWEEP_AGE_MS;
-      const all = (await client.session.list())?.data ?? [];
-      for (const info of all) {
-        if (info?.parentID || !info?.title?.startsWith(TITLE_PREFIX)) continue;
-        if ((info.time?.updated ?? Infinity) > cutoff) continue;
-        if (forkRuns.has(info.id)) continue;
-        try {
-          await client.session.delete({ path: { id: info.id } });
-        } catch {
-          // best-effort per session
+      for (;;) {
+        const page =
+          (await client.session.list({ query: { search: TITLE_PREFIX, limit: 200 } }))?.data ?? [];
+        let deleted = 0;
+        for (const info of page) {
+          if (info?.parentID || !info?.title?.startsWith(TITLE_PREFIX)) continue;
+          if ((info.time?.updated ?? Infinity) > cutoff) continue;
+          if (forkRuns.has(info.id)) continue;
+          try {
+            await client.session.delete({ path: { id: info.id } });
+            deleted++;
+          } catch {
+            // best-effort per session
+          }
         }
+        if (deleted === 0) break;
       }
     })().catch(() => {});
   }
