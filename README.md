@@ -482,8 +482,12 @@ session lifecycle events and talks to the same autofork daemon; when a fork come
    turn is spent; your model sees the report block (`source: autofork`) on your next exchange,
 4. reports the completion to the daemon, which releases any `after` dependents.
 
-Fork-run sessions are titled `autofork/<fork> (<trigger>)` in the session list; delete them freely,
-the report already lives in your session.
+Fork-run sessions are titled `autofork/<fork> (<trigger>)` in the session list while they run, and
+are **deleted automatically** once the report is delivered — each run is a full copy of your
+conversation, and left around they silt up opencode's database at one session per fork per pause.
+Failed runs stick around so you can read what went wrong; a sweep at instance start removes any
+leftovers (failures, crashes, sessions from older autofork versions) untouched for an hour. Set
+`AUTOFORK_KEEP_FORK_SESSIONS=1` in opencode's environment to keep every run's session instead.
 
 `every:` triggers get their strongest form here: the plugin parks a poll even while the session is
 **busy**, so an `every: 1h` fork fires in the middle of an hour-long run — the fork copies the

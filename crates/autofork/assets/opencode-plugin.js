@@ -9,6 +9,8 @@
 // next turn. Exception: a `chain: true` fork's report that carries the
 // continue sentinel is injected as a real turn (the parent reacts to it),
 // and the daemon re-fires the fork once the turn settles — the goal loop.
+// A run's session is deleted once its report is delivered (startup sweep
+// for leftovers), so fork runs never accumulate in opencode's database.
 //
 // Transport: shells out to `autofork opencode hook <kind>` (JSON on stdin),
 // which owns daemon spawn and version handshakes. The idle long-poll is one
@@ -17,6 +19,20 @@
 
 const BIN = process.env.AUTOFORK_OPENCODE_BIN || "autofork";
 const TITLE_PREFIX = "autofork/";
+// Every fork run is a full-history copy of the parent conversation, so a
+// working session breeds one stored session per fork per pause — left around
+// they silt up opencode's database fast. A completed run's session is
+// deleted as soon as its report is delivered; failed runs are kept for
+// inspection and cleared by the startup sweep below, once old. Set this env
+// var (in opencode's environment) to keep every run's session instead —
+// debugging a fork usually means reading its session.
+const KEEP_FORK_SESSIONS = !!process.env.AUTOFORK_KEEP_FORK_SESSIONS;
+// Leftover fork-run sessions untouched for this long are removed by the
+// startup sweep: crashed runs, kept failed runs, and the pile from autofork
+// versions that never cleaned up. Runs finish in minutes, so an hour of
+// silence also protects a concurrent opencode instance's in-flight runs —
+// their events never reach this instance.
+const SWEEP_AGE_MS = 60 * 60 * 1000;
 // The daemon-built fork prompt's fingerprint (SPAWN_CTX_PREFIX in
 // autofork-core's wake.rs — keep in sync). A session whose last user message
 // carries it is one of our fork runs, whatever its title says: the title
@@ -318,6 +334,14 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
             run_ref: forkedID,
             status: "failed",
           });
+          // The copy never ran — nothing in it worth keeping.
+          if (!KEEP_FORK_SESSIONS) {
+            try {
+              await client.session.delete({ path: { id: forkedID } });
+            } catch {
+              // best-effort; the startup sweep is the backstop
+            }
+          }
         }
       }
     }
@@ -397,6 +421,40 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
       status,
       ...(chainNext ? { continue: true } : {}),
     });
+    // The run's session has served its purpose — the report is in the parent
+    // and the daemon has the completion (its spawn registry keeps the run
+    // ref, deletion here doesn't weaken the fork-of-forks guard). "stopped"
+    // means the session is already gone; failed runs stay readable until the
+    // startup sweep ages them out.
+    if (!KEEP_FORK_SESSIONS && status === "completed") {
+      try {
+        await client.session.delete({ path: { id } });
+      } catch {
+        // best-effort; the startup sweep is the backstop
+      }
+    }
+  }
+
+  // Startup sweep: delete fork-run sessions left behind — crashed or failed
+  // runs, and the accumulation from autofork versions that never cleaned up.
+  // Root sessions carrying our title marker, untouched for SWEEP_AGE_MS,
+  // cannot be live runs. Fire-and-forget: a failed sweep must never break
+  // the plugin, and the next instance start retries anyway.
+  if (!KEEP_FORK_SESSIONS) {
+    (async () => {
+      const cutoff = Date.now() - SWEEP_AGE_MS;
+      const all = (await client.session.list())?.data ?? [];
+      for (const info of all) {
+        if (info?.parentID || !info?.title?.startsWith(TITLE_PREFIX)) continue;
+        if ((info.time?.updated ?? Infinity) > cutoff) continue;
+        if (forkRuns.has(info.id)) continue;
+        try {
+          await client.session.delete({ path: { id: info.id } });
+        } catch {
+          // best-effort per session
+        }
+      }
+    })().catch(() => {});
   }
 
   return {
