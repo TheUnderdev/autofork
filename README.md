@@ -87,6 +87,10 @@ matches). macOS (arm64/x64) and Linux (x64/arm64) are covered.
 
 For local development: `claude --plugin-dir ./plugin` inside this repo.
 
+The binaries are also on crates.io — `cargo install autofork autofork-daemon` — but note that
+installs only the CLI and daemon, not the plugin (hooks, marketplace wiring); the plugin install
+above is the supported path.
+
 ## Writing forks
 
 Forks are discovered upward from your project directory and at the user level, from three
