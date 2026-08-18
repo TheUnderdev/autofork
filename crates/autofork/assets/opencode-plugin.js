@@ -137,14 +137,17 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
 
   async function call(kind, payload, marker) {
     try {
+      // The payload rides as a preassembled buffer, not incremental
+      // stdin.write()/end() calls: the Bun bundled with opencode 2 no longer
+      // flushes that pattern reliably, so the hook subprocess never saw EOF
+      // and blocked forever reading stdin — silencing the whole integration.
+      // A buffer is written and closed by Bun itself, on every Bun vintage.
       const proc = Bun.spawn([BIN, "opencode", "hook", kind], {
-        stdin: "pipe",
+        stdin: new TextEncoder().encode(JSON.stringify({ directory, worktree, ...payload })),
         stdout: "pipe",
         stderr: "ignore",
       });
       if (marker) marker.proc = proc;
-      proc.stdin.write(JSON.stringify({ directory, worktree, ...payload }));
-      proc.stdin.end();
       const out = await new Response(proc.stdout).text();
       await proc.exited;
       if (!out.trim()) return null;

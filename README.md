@@ -485,7 +485,8 @@ the session's own model.
 
 autofork also runs forks in [opencode](https://opencode.ai) sessions — same fork files, same
 daemon, same schedule semantics (throttles, tags, `after` dependencies, once-per-pause idle
-latching). Install the bridge plugin once:
+latching). Both opencode 1.x and opencode 2 are supported by the same plugin (as of v0.15.2 —
+earlier versions hang silently on opencode 2). Install the bridge plugin once:
 
 ```
 autofork opencode install     # writes ~/.config/opencode/plugin/autofork.js
@@ -493,6 +494,12 @@ autofork opencode install     # writes ~/.config/opencode/plugin/autofork.js
 
 then restart opencode (plugins load at instance start). `autofork opencode uninstall` removes it;
 `autofork doctor` reports whether the installed copy is current.
+
+Note for opencode 2: sessions are commonly hosted by a long-lived background server (`opencode
+serve` / the shared daemon the CLI attaches to), and each resident process stays frozen at the
+plugin version it loaded at startup. After `autofork opencode install`, restart *every* opencode
+process — the TUIs *and* any background `opencode serve` daemons — or they keep running the old
+plugin.
 
 ### How opencode forks run
 
