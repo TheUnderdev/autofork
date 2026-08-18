@@ -1,6 +1,8 @@
 [package]
 name = "autofork-daemon"
 description = "The autofork daemon: session tracking, fork moments, fork execution"
+keywords = ["autofork", "claude-code", "opencode", "agents", "daemon"]
+categories = ["development-tools", "command-line-utilities"]
 version.workspace = true
 edition.workspace = true
 license.workspace = true

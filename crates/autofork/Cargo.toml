@@ -1,6 +1,9 @@
 [package]
 name = "autofork"
 description = "autofork CLI: Claude Code hook entrypoint and daemon control"
+keywords = ["autofork", "claude-code", "opencode", "agents", "cli"]
+categories = ["development-tools", "command-line-utilities"]
+readme = "../../README.md"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
