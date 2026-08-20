@@ -161,10 +161,7 @@ fn print_sessions_header(info: &StatusInfo) {
         );
     }
     if !info.running.is_empty() {
-        println!(
-            "fork runs in flight (closing their session loses their reports; \
-             opencode runs die with the instance, other clients' runs finish their work):"
-        );
+        println!("fork runs in flight:");
         for r in &info.running {
             println!(
                 "  {} — session {} — started {}",
