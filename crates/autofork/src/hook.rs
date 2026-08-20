@@ -166,6 +166,9 @@ fn run_hook_inner(kind: HookKind) -> Option<()> {
                 // runs each fork as a `claude -p --fork-session` subprocess,
                 // spools the report for silent delivery at the next prompt,
                 // and re-parks until the wait is cancelled by activity.
+                // Fork children run the PARENT Claude Code process's exact
+                // binary (captured now — the poll outlives reparenting).
+                crate::runner::set_harness_bin(crate::client::parent_exe());
                 let resume_target = input
                     .transcript_path
                     .as_deref()
@@ -234,6 +237,7 @@ fn run_hook_inner(kind: HookKind) -> Option<()> {
                         &cwd,
                         None,
                         None,
+                        crate::client::parent_exe().as_deref(),
                         &forks,
                     );
                 }

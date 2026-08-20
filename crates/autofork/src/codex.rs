@@ -195,6 +195,8 @@ fn run_hook_inner(kind: CxHookKind) -> Option<()> {
             spawn_waiter(&paths, &input, &cwd);
         }
         CxHookKind::Stop => {
+            // Fork children must run the parent codex's exact binary.
+            set_codex_bin(crate::client::parent_exe());
             // Goal fast path. Ask the daemon — with a short budget, since a
             // codex Stop hook holds the whole session — whether any chain
             // fork is due at this very Stop. `PeekDue` stamps only what it
@@ -293,6 +295,7 @@ fn run_hook_inner(kind: CxHookKind) -> Option<()> {
                             &cwd,
                             input.model.as_deref(),
                             input.permission_mode.as_deref(),
+                            crate::client::parent_exe().as_deref(),
                             &forks,
                         );
                     }
@@ -356,8 +359,10 @@ fn spawn_waiter(paths: &Paths, input: &CxInput, cwd: &Path) {
     let Ok(log2) = log.try_clone() else { return };
 
     // The hook's parent is the codex process itself (codex spawns hook
-    // commands directly, no shell) — the waiter's liveness anchor.
+    // commands directly, no shell) — the waiter's liveness anchor AND the
+    // exact binary fork children must run.
     let codex_pid = std::os::unix::process::parent_id();
+    let codex_exe = crate::client::parent_exe();
 
     let mut cmd = Command::new(exe);
     cmd.arg("codex")
@@ -378,6 +383,9 @@ fn spawn_waiter(paths: &Paths, input: &CxInput, cwd: &Path) {
     }
     if let Some(p) = &input.permission_mode {
         cmd.arg("--permission-mode").arg(p);
+    }
+    if let Some(b) = &codex_exe {
+        cmd.arg("--codex-bin").arg(b);
     }
     #[cfg(unix)]
     {
@@ -533,10 +541,12 @@ pub struct WaiterArgs {
     pub cwd: PathBuf,
     pub model: Option<String>,
     pub permission_mode: Option<String>,
+    pub codex_bin: Option<PathBuf>,
 }
 
 /// `autofork codex waiter`: the per-session poll owner and fork executor.
 pub fn run_waiter(args: WaiterArgs) {
+    set_codex_bin(args.codex_bin.clone());
     let Some(paths) = Paths::from_env() else {
         return;
     };
@@ -665,8 +675,26 @@ fn waiter_loop(paths: &Paths, args: &WaiterArgs) {
 // Fork execution
 // ---------------------------------------------------------------------------
 
+/// The codex binary fork children run: env override, else the PARENT codex
+/// process's own executable (captured at the hook/waiter entrypoint), else
+/// PATH. Multi-install machines make plain PATH lookup resolve a different
+/// codex than the one the session runs.
+static CODEX_BIN: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+pub(crate) fn set_codex_bin(bin: Option<PathBuf>) {
+    let _ = CODEX_BIN.set(bin);
+}
+
 fn codex_bin() -> String {
-    std::env::var("AUTOFORK_CODEX_BIN").unwrap_or_else(|_| "codex".to_string())
+    std::env::var("AUTOFORK_CODEX_BIN")
+        .ok()
+        .or_else(|| {
+            CODEX_BIN
+                .get()
+                .and_then(|b| b.as_ref())
+                .map(|p| p.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "codex".to_string())
 }
 
 /// Map the parent's permission mode onto `codex exec` sandbox flags.

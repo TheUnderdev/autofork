@@ -91,6 +91,11 @@ struct OcInput {
     /// instance shut down cleanly; `deleted` = the session was deleted).
     #[serde(default)]
     reason: Option<String>,
+    /// session-end: the opencode process's own executable
+    /// (`process.execPath` from the plugin), so flush-on-close runs the SAME
+    /// opencode the session ran — PATH may resolve a different install.
+    #[serde(default)]
+    bin: Option<PathBuf>,
 }
 
 pub fn run_hook(kind: OcHookKind) {
@@ -210,6 +215,7 @@ fn run_hook_inner(kind: OcHookKind) -> Option<()> {
                         &input.directory,
                         input.model.as_deref(),
                         None,
+                        input.bin.as_deref(),
                         &forks,
                     );
                 }

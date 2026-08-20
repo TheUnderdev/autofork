@@ -246,6 +246,48 @@ fn spawn_daemon_locked(paths: &Paths, deadline: Instant) -> Result<(), ClientErr
     Ok(())
 }
 
+/// The executable path of this process's PARENT — the harness that spawned
+/// the hook (Claude Code, codex, opencode). Fork children must run the SAME
+/// binary the user's session runs: multi-install machines (a standalone
+/// opencode under an aliased wrapper, several claude/codex checkouts) make
+/// PATH lookup resolve a different program than the parent. `None` when the
+/// platform lookup fails — callers fall back to the PATH name.
+pub(crate) fn parent_exe() -> Option<std::path::PathBuf> {
+    let ppid = std::os::unix::process::parent_id();
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link(format!("/proc/{ppid}/exe")).ok()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // proc_pidpath from libproc (part of libSystem — no extra linking).
+        extern "C" {
+            fn proc_pidpath(
+                pid: libc::c_int,
+                buffer: *mut libc::c_void,
+                buffersize: u32,
+            ) -> libc::c_int;
+        }
+        let mut buf = [0u8; 4096];
+        let n = unsafe {
+            proc_pidpath(
+                ppid as libc::c_int,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len() as u32,
+            )
+        };
+        if n <= 0 {
+            return None;
+        }
+        let path = std::str::from_utf8(&buf[..n as usize]).ok()?;
+        Some(std::path::PathBuf::from(path))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::semver_lt;

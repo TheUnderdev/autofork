@@ -96,6 +96,8 @@ enum Command {
         model: Option<String>,
         #[arg(long)]
         permission_mode: Option<String>,
+        #[arg(long)]
+        bin: Option<std::path::PathBuf>,
     },
     /// Ask the daemon to exit (it restarts on the next hook event).
     StopDaemon {
@@ -158,6 +160,8 @@ enum CodexCommand {
         model: Option<String>,
         #[arg(long)]
         permission_mode: Option<String>,
+        #[arg(long)]
+        codex_bin: Option<std::path::PathBuf>,
     },
 }
 
@@ -193,6 +197,7 @@ fn main() {
                 cwd,
                 model,
                 permission_mode,
+                codex_bin,
             } => codex::run_waiter(codex::WaiterArgs {
                 session,
                 rollout,
@@ -200,6 +205,7 @@ fn main() {
                 cwd,
                 model,
                 permission_mode,
+                codex_bin,
             }),
         },
         Command::FinalRun {
@@ -210,7 +216,11 @@ fn main() {
             specs,
             model,
             permission_mode,
+            bin,
         } => {
+            // Fork children run the harness binary the closing session ran.
+            runner::set_harness_bin(bin.clone());
+            codex::set_codex_bin(bin);
             let parsed: Vec<autofork_core::protocol::WakeFork> = std::fs::read_to_string(&specs)
                 .ok()
                 .and_then(|s| serde_json::from_str(&s).ok())

@@ -29,8 +29,29 @@ use std::time::Duration;
 /// `AUTOFORK_CLAUDE_FORK_TIMEOUT_SECS`.
 const FORK_TIMEOUT_SECS: u64 = 1800;
 
+/// The harness binary this process's forks must run — the PARENT process's
+/// own executable, captured at the entrypoint (hook ppid / --bin arg). Fork
+/// children must run the SAME program the user's session runs: PATH lookup
+/// resolves a different install on multi-install machines (wrapper functions,
+/// ~/.aisuite-style standalone checkouts, several versions side by side).
+static HARNESS_BIN: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+
+pub fn set_harness_bin(bin: Option<std::path::PathBuf>) {
+    let _ = HARNESS_BIN.set(bin);
+}
+
+fn harness_bin() -> Option<String> {
+    HARNESS_BIN
+        .get()
+        .and_then(|b| b.as_ref())
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
 fn claude_bin() -> String {
-    std::env::var("AUTOFORK_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string())
+    std::env::var("AUTOFORK_CLAUDE_BIN")
+        .ok()
+        .or_else(harness_bin)
+        .unwrap_or_else(|| "claude".to_string())
 }
 
 fn fork_timeout() -> Duration {
@@ -314,6 +335,7 @@ pub fn spawn_final_runner(
     cwd: &std::path::Path,
     parent_model: Option<&str>,
     parent_permission_mode: Option<&str>,
+    harness_bin: Option<&std::path::Path>,
     specs: &[WakeFork],
 ) {
     if specs.is_empty() {
@@ -363,6 +385,9 @@ pub fn spawn_final_runner(
     }
     if let Some(m) = parent_permission_mode {
         cmd.arg("--permission-mode").arg(m);
+    }
+    if let Some(b) = harness_bin {
+        cmd.arg("--bin").arg(b);
     }
     #[cfg(unix)]
     {
@@ -451,8 +476,10 @@ fn run_final_opencode(
         }
         None => candidates.push(None),
     }
-    let opencode_bin =
-        std::env::var("AUTOFORK_OPENCODE_BIN").unwrap_or_else(|_| "opencode".to_string());
+    let opencode_bin = std::env::var("AUTOFORK_OPENCODE_BIN")
+        .ok()
+        .or_else(harness_bin)
+        .unwrap_or_else(|| "opencode".to_string());
     let mut status = "failed";
     let mut report = String::new();
     for model in &candidates {
