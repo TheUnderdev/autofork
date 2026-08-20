@@ -659,16 +659,18 @@ daemon. When a fork comes due it:
    thread that inherits the full history without touching your session,
 2. runs the fork instruction as that thread's first turn, headless, with your session's model
    and a sandbox matching your session's permission mode,
-3. delivers the report into your session through codex's **durable message queue**
-   (`thread/queue/add`) — your own codex process picks it up within seconds of the session being
-   idle, and the report block (`source: autofork`) arrives as a message your model reads,
+3. spools the report with the daemon; the UserPromptSubmit hook delivers it **silently** as
+   `additionalContext` on your next prompt — your model sees the report block
+   (`source: autofork`), your transcript shows nothing, and no turn is spent reacting to it
+   (the same quiet delivery as Claude Code's headless runner; before v0.19.2 reports rode
+   codex's message queue, which drains as a synthetic user turn the model then answers),
 4. reports the completion to the daemon, which releases any `after` dependents; the fork's
    thread is then **deleted** (failed runs are kept for inspection —
    `AUTOFORK_KEEP_FORK_SESSIONS=1` keeps everything).
 
-Because the queued report arrives as a real turn, your model reacts to every fork report (on
-Claude Code the completion notification behaves the same way). Chain forks work unchanged: a
-report carrying the continue sentinel re-arms the fork after your session digests the report.
+Chain forks work unchanged: a report carrying the continue sentinel re-arms the fork after your
+session digests it (a continuing goal iteration is still injected as a same-turn continuation —
+see the fast path below).
 
 ### The goal fast path (codex Stop hook)
 

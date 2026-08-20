@@ -630,4 +630,80 @@ mod tests {
         assert_eq!(cfg.default_idle_deadline_secs, 600);
         assert_eq!(warnings.len(), 1);
     }
+
+    #[test]
+    fn fork_models_flat_and_by_parent_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        fs::create_dir_all(home.join(".autofork")).unwrap();
+        fs::write(
+            home.join(".autofork/config.toml"),
+            "[fork_models]\n\
+             codex = \"gpt-5.6-luna\"\n\
+             opencode = [\"a\", \"b\"]\n\
+             \n\
+             [fork_models.\"claude-code\"]\n\
+             opus = \"sonnet\"\n\
+             fable = [\"sonnet\", \"haiku\"]\n\
+             default = \"haiku\"\n",
+        )
+        .unwrap();
+        let (cfg, warnings) = load_config(None, Some(home));
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        // Flat entries ignore the parent model entirely.
+        assert_eq!(
+            cfg.fork_models
+                .get("codex")
+                .unwrap()
+                .resolve(Some("gpt-5.6-sol")),
+            ["gpt-5.6-luna".to_string()]
+        );
+        assert_eq!(
+            cfg.fork_models.get("opencode").unwrap().resolve(None),
+            ["a".to_string(), "b".to_string()]
+        );
+
+        // By-parent-model: exact match, fallback list, and the "default" catch-all.
+        let cc = cfg.fork_models.get("claude-code").unwrap();
+        assert_eq!(cc.resolve(Some("opus")), ["sonnet".to_string()]);
+        assert_eq!(
+            cc.resolve(Some("fable")),
+            ["sonnet".to_string(), "haiku".to_string()]
+        );
+        assert_eq!(cc.resolve(Some("some-other-model")), ["haiku".to_string()]);
+        assert_eq!(cc.resolve(None), ["haiku".to_string()]);
+    }
+
+    #[test]
+    fn fork_models_by_parent_model_without_default_falls_through_to_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        fs::create_dir_all(home.join(".autofork")).unwrap();
+        fs::write(
+            home.join(".autofork/config.toml"),
+            "[fork_models.\"claude-code\"]\nopus = \"sonnet\"\n",
+        )
+        .unwrap();
+        let (cfg, warnings) = load_config(None, Some(home));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let cc = cfg.fork_models.get("claude-code").unwrap();
+        assert!(cc.resolve(Some("haiku")).is_empty(), "no default entry set");
+    }
+
+    #[test]
+    fn fork_models_bad_shapes_warn_and_are_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        fs::create_dir_all(home.join(".autofork")).unwrap();
+        fs::write(
+            home.join(".autofork/config.toml"),
+            "fork_models = { codex = 5 }\n",
+        )
+        .unwrap();
+        let (cfg, warnings) = load_config(None, Some(home));
+        assert!(cfg.fork_models.get("codex").is_none());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("fork_models.codex"), "{warnings:?}");
+    }
 }

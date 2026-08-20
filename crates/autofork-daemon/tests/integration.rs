@@ -2609,3 +2609,51 @@ fn wake_forks_carry_model_fallback_lists() {
     assert_eq!(forks[0].model.as_deref(), Some("gpt-5.6-luna"));
     assert_eq!(forks[0].model_fallbacks, vec!["gpt-5.5".to_string()]);
 }
+
+#[test]
+fn fork_models_resolve_by_parent_model_with_default_catchall() {
+    // [fork_models.<client>] can be a table keyed by the SESSION's own
+    // (parent) model, with "default" as the catch-all for a parent model
+    // with no explicit entry -- lets a big/expensive parent point fork runs
+    // at a different (cheaper) model than a small/cheap parent does.
+    let mut h = Harness::new("1s", "0");
+    h.append_config("[fork_models.\"claude-code\"]");
+    h.append_config("opus = \"sonnet\"");
+    h.append_config("fable = [\"sonnet\", \"haiku\"]");
+    h.append_config("default = \"haiku\"");
+    h.write_fork("journal.md", "---\nfork: true\nrun_on: [idle]\n---\nJ");
+    h.start_daemon();
+
+    // Claude Code session (no client tag) reporting "opus" as its model:
+    // exact match in the by-parent-model table.
+    let mut start = h.event(EventKind::SessionStart, "cc-opus");
+    start.model = Some("opus".to_string());
+    assert_ack(h.send_event(start));
+    let mut stop = h.event(EventKind::Stop, "cc-opus");
+    stop.model = Some("opus".to_string());
+    let rx = h.park_stop_wait(stop);
+    let forks = wake_forks(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert_eq!(forks[0].model.as_deref(), Some("sonnet"));
+    assert!(forks[0].model_fallbacks.is_empty());
+
+    // "fable" parent: fallback list.
+    let mut start = h.event(EventKind::SessionStart, "cc-fable");
+    start.model = Some("fable".to_string());
+    assert_ack(h.send_event(start));
+    let mut stop = h.event(EventKind::Stop, "cc-fable");
+    stop.model = Some("fable".to_string());
+    let rx = h.park_stop_wait(stop);
+    let forks = wake_forks(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert_eq!(forks[0].model.as_deref(), Some("sonnet"));
+    assert_eq!(forks[0].model_fallbacks, vec!["haiku".to_string()]);
+
+    // Unlisted parent model: falls through to "default".
+    let mut start = h.event(EventKind::SessionStart, "cc-other");
+    start.model = Some("some-future-model".to_string());
+    assert_ack(h.send_event(start));
+    let mut stop = h.event(EventKind::Stop, "cc-other");
+    stop.model = Some("some-future-model".to_string());
+    let rx = h.park_stop_wait(stop);
+    let forks = wake_forks(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert_eq!(forks[0].model.as_deref(), Some("haiku"));
+}

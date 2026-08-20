@@ -173,6 +173,15 @@ fn run_hook_inner(kind: CxHookKind) -> Option<()> {
                 spawn_daemon_detached(&paths);
                 return Some(());
             };
+            // Deliver spooled fork reports silently as additionalContext —
+            // the model sees them with this prompt, the transcript doesn't.
+            if let Ok(ResponseBody::Reports { blocks }) = client.request(RequestBody::TakeReports {
+                session_id: input.session_id.clone(),
+            }) {
+                if !blocks.is_empty() {
+                    print_additional_context(&blocks);
+                }
+            }
             let mut ev = event(EventKind::PromptSubmit);
             // Sniff the prompt: our queued fork reports carry the wake marker
             // and are non-waking continuations, everything else is genuine
@@ -198,8 +207,19 @@ fn run_hook_inner(kind: CxHookKind) -> Option<()> {
                 session_id: input.session_id.clone(),
             }) {
                 Ok(ResponseBody::Due { forks }) if !forks.is_empty() => forks,
-                _ => return Some(()), // nothing due / old daemon: stay silent
+                other => {
+                    debug_log(&format!(
+                        "stop hook: peek_due empty for {} -> {other:?}",
+                        input.session_id
+                    ));
+                    return Some(()); // nothing due / old daemon: stay silent
+                }
             };
+            debug_log(&format!(
+                "stop hook: peek_due {} -> {} fork(s)",
+                input.session_id,
+                due.len()
+            ));
             set_stop_rollout(input.transcript_path.clone());
             let mut blocks = Vec::new();
             for spec in due {
@@ -233,14 +253,10 @@ fn run_hook_inner(kind: CxHookKind) -> Option<()> {
                 } else {
                     // Settled (goal met) or failed: the loop is over, so
                     // hold NOTHING — no blocking, no injected continuation
-                    // the parent would have to acknowledge. The report goes
-                    // through the normal queue like any other fork's.
-                    if let Err(e) = queue_message(&input.session_id, &block) {
-                        eprintln!(
-                            "[codex-stop] fork '{}' settle report queue failed: {e}",
-                            spec.name
-                        );
-                    }
+                    // the parent would have to acknowledge. The report is
+                    // spooled and arrives silently as additionalContext on
+                    // the next prompt, like every other codex fork report.
+                    spool_report(&paths, &input.session_id, &spec.name, &block);
                 }
                 cleanup_run(&outcome);
             }
@@ -769,12 +785,7 @@ fn run_fork_inner(
         )
     };
     let block = report_block(&spec.name, &spec.trigger, outcome.status, &body);
-    if let Err(e) = queue_message(session, &block) {
-        eprintln!(
-            "[codex-waiter] fork '{}' report delivery failed: {e}",
-            spec.name
-        );
-    }
+    spool_report(paths, session, &spec.name, &block);
     cleanup_run(&outcome);
 }
 
@@ -1207,10 +1218,35 @@ pub(crate) fn run_final_codex(
             outcome.report.clone()
         };
         let block = report_block(&spec.name, &spec.trigger, outcome.status, &body);
-        let _ = queue_message(session, &block);
+        // Codex session ids survive resume, so the spool reaches the session
+        // if it is ever picked back up.
+        spool_report(paths, session, &spec.name, &block);
     }
     cleanup_run(&outcome);
     (outcome.status == "completed" && !outcome.report.is_empty()).then(|| outcome.report.clone())
+}
+
+/// Print spooled fork reports as UserPromptSubmit additionalContext (exit-0
+/// JSON on stdout; codex uses Claude Code's hook output shape). Truncated to
+/// stay under codex's additional-context budget.
+fn print_additional_context(blocks: &[String]) {
+    const CAP: usize = 9_800;
+    let mut text = blocks.join("\n\n");
+    if text.len() > CAP {
+        let mut cut = CAP;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
+        text.push_str("\n[…report truncated to fit the context budget]");
+    }
+    let out = serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": text,
+        }
+    });
+    println!("{out}");
 }
 
 /// Send a ForkSpawned (completion=None) or ForkCompleted frame.
@@ -1351,25 +1387,24 @@ pub(crate) fn uuid_v4() -> String {
     )
 }
 
-/// Queue a message into a codex thread — codex's own durable queue, drained
-/// by the owning process when the thread next goes idle.
-fn queue_message(thread_id: &str, text: &str) -> Result<(), String> {
-    let mut srv = AppServer::start().inspect_err(|e| {
-        debug_log(&format!("queue_message app-server start failed: {e}"));
-    })?;
-    let res = srv.request(
-        "thread/queue/add",
-        serde_json::json!({
-            "threadId": thread_id,
-            "clientUserMessageId": uuid_v4(),
-            "input": [{"type": "text", "text": text, "textElements": []}],
-        }),
-    );
-    match &res {
-        Ok(_) => debug_log(&format!("queue_message ok thread={thread_id}")),
-        Err(e) => debug_log(&format!("queue_message failed thread={thread_id}: {e}")),
-    }
-    res.map(|_| ())
+/// Spool a fork report with the daemon for silent delivery: the codex
+/// UserPromptSubmit hook takes the spool and injects it as
+/// `additionalContext` on the session's next prompt — the model sees it,
+/// the transcript shows nothing, and no turn is spent reacting to it.
+/// (Until v0.19.2 reports rode codex's message queue instead, which drains
+/// as a synthetic USER turn the model then answers — one wasted
+/// acknowledgment turn per report.)
+fn spool_report(paths: &Paths, session: &str, fork: &str, text: &str) {
+    let Ok(mut client) = Client::connect_or_spawn(paths, Duration::from_secs(5)) else {
+        debug_log(&format!("spool_report connect failed fork={fork}"));
+        return;
+    };
+    let res = client.request(RequestBody::SpoolReport {
+        session_id: session.to_string(),
+        fork: fork.to_string(),
+        text: text.to_string(),
+    });
+    debug_log(&format!("spool_report fork={fork} -> {res:?}"));
 }
 
 // ---------------------------------------------------------------------------
