@@ -282,9 +282,8 @@ Mechanics per client:
   zero-turn no-reply message), so the parent model reacts to it; the completion frame carries
   `continue: true` and the daemon re-arms the fork the same way.
 
-Belts: the sentinel is honored only for `chain: true` forks (a fork that merely quotes it
-mid-sentence, or was never opted in, changes nothing — it must sit on a line of its own, though
-markdown decoration around it is tolerated, and the daemon re-checks the definition). A chain is capped at `chain_limit` runs per pause (frontmatter, falling
+Belts: the sentinel is honored only for `chain: true` forks (a fork never opted in changes
+nothing however it phrases its report, and the daemon re-checks the definition). A chain is capped at `chain_limit` runs per pause (frontmatter, falling
 back to the `chain_limit` config key, default 25). Your own next message always ends the chain —
 genuine activity starts a new pause and the fork re-evaluates on the next one.
 
