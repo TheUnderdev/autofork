@@ -30,12 +30,13 @@
 //!   codex injects the report as a continuation prompt and the parent reacts
 //!   in the same turn. The daemon reserves such forks for this path on codex
 //!   sessions so the waiter's poll can't race it.
-//! - **Cache-copy runs**: codex keys the OpenAI prompt cache on the thread
-//!   id, so a native `exec fork` reads the inherited history cold. When a
-//!   run uses the parent's model and the parent rollout is self-contained,
-//!   the run resumes a copy of the rollout (original id kept) inside a
-//!   throwaway `CODEX_HOME` instead — same cache key, warm prefix, parent
-//!   untouched. Preflight failures fall back to the native fork.
+//! - **Cache-copy runs** (opt-in, `AUTOFORK_CODEX_CACHE_COPY=1`): codex keys
+//!   the OpenAI prompt cache on the thread id, so a native `exec fork` reads
+//!   the inherited history cold. With the opt-in, a run on the parent's
+//!   model whose rollout is self-contained resumes a copy of the rollout
+//!   (original id kept) inside a throwaway `CODEX_HOME` — same cache key,
+//!   warm prefix, parent untouched. Preflight failures fall back to the
+//!   native fork.
 //!
 //! Codex hooks are trust-gated (untrusted hooks are silently skipped), so
 //! `autofork codex install` both merges our hooks into `$CODEX_HOME/hooks.json`
@@ -792,9 +793,9 @@ fn stop_hook_rollout() -> Option<PathBuf> {
 ///   rollout is self-contained): copy the rollout into a throwaway
 ///   `CODEX_HOME` keeping the original session id and `codex exec resume` it
 ///   there. Same id → same cache key → the parent's warm prefix is reused
-///   (~93% measured); the parent's real home is untouched. Falls back to the
-///   native fork whenever the preflight fails, and can be disabled outright
-///   with `AUTOFORK_CODEX_NO_CACHE_COPY=1`.
+///   (~93% measured); the parent's real home is untouched. Opt-in via
+///   `AUTOFORK_CODEX_CACHE_COPY=1` (the default is the plain native fork),
+///   and falls back to the native fork whenever the preflight fails.
 #[allow(clippy::too_many_arguments)]
 fn execute_run_with_rollout(
     paths: &Paths,
@@ -813,11 +814,15 @@ fn execute_run_with_rollout(
     };
     let sandbox = resolve_sandbox(spec.mode.as_deref(), parent_permission_mode);
 
-    let copy_home = if same_model && std::env::var_os("AUTOFORK_CODEX_NO_CACHE_COPY").is_none() {
-        rollout.and_then(|r| prepare_cache_copy(paths, session, r))
-    } else {
-        None
-    };
+    // Cache-copy runs are opt-in (`AUTOFORK_CODEX_CACHE_COPY=1` in codex's
+    // environment): the default matches opencode's semantics — every run is
+    // a plain native fork, and the cache trick is an extra you ask for.
+    let copy_home =
+        if same_model && std::env::var_os("AUTOFORK_CODEX_CACHE_COPY").is_some_and(|v| v == "1") {
+            rollout.and_then(|r| prepare_cache_copy(paths, session, r))
+        } else {
+            None
+        };
     debug_log(&format!(
         "execute_run fork={} session={session} rollout={rollout:?} copy={}",
         spec.name,

@@ -1,13 +1,13 @@
 # autofork
 
 **Forks for Claude Code, opencode and Codex CLI.** When your session goes idle — or its context crosses a
-threshold —
-autofork has the session's own model spawn *forks*: background **fork subagents** that inherit the
-full conversation, do work with tools, and report back, all without interrupting you.
+threshold — autofork runs *forks*: background copies of the full conversation that do work with
+tools, on the model you pick for them, and report back — without interrupting you, and (by
+default) without leaving a single visible trace in your session.
 
 Think of a fork as a background thought your agent has while you're away: update the project
-journal, distill notes, groom a TODO list, re-check an assumption — running in the background with
-the fork's report arriving as a completion notification your agent relays when it's done.
+journal, distill notes, groom a TODO list, re-check an assumption — running quietly in the
+background, with the report slipped into your agent's context on your next exchange.
 
 > forks are **not** skills. A skill is something the model chooses to load and follow. A fork is
 > something the *harness* schedules at lifecycle moments the model never sees. A fork fires because
@@ -16,26 +16,30 @@ the fork's report arriving as a completion notification your agent relays when i
 > fork stays a fork: the attachment only names the fork after the skill and makes sure the fork
 > sees the skill's instructions when it runs.)
 
-## How a fork fires (v0.5)
-
-autofork no longer runs forks as headless subprocesses. Instead:
+## How a fork fires
 
 1. When a turn ends, an **asyncRewake `Stop` hook** long-polls the autofork daemon in the
    background without blocking your session.
 2. When forks come due (an idle deadline elapses, or a context threshold was crossed), the daemon
-   answers the poll with a **wake payload** and the hook exits 2 — which wakes the idle session and
-   shows the payload as a system reminder.
-3. The woken model reads the payload and calls the **Agent tool with `subagent_type: "fork"`** for
-   each due fork — background subagents that inherit the entire conversation. Measured first-request
-   cache on such a fork: **cache_read 31,681 / cache_creation 326 — ~99% of the parent prefix
-   reused.**
-4. Each fork runs in the background; its completion notification wakes the session again on its own,
-   and the model relays the fork's report. **Delivery is native** — no report queue, no context
-   injection.
+   answers the poll with the due forks.
+3. **By default (v0.18, `fork_runner = "headless"`)** the hook consumes the wake itself: each fork
+   runs as a `claude -p --resume <conversation> --fork-session` subprocess — a true fork of your
+   conversation, executed outside your session, on whatever model the fork (or `[fork_models]`)
+   names. Its report is spooled and delivered **silently** as `additionalContext` on your next
+   prompt. Nothing about forks ever appears in your conversation — the same quiet semantics as
+   opencode.
+4. **Opt-in (`fork_runner = "subagent"`)**: the cache-preserving alternative. The hook exits 2,
+   which wakes the idle session with a spawn payload; the session's own model calls the **Agent
+   tool with `subagent_type: "fork"`** per due fork — background subagents that inherit the whole
+   conversation with ~99% prompt-cache reuse (measured: cache_read 31,681 / cache_creation 326).
+   The trade: the wake turn, the spawn calls and the completion relays are all visible turns in
+   your conversation, and the forks run on your session's model (overrides don't apply).
 
-Because the `fork` subagent type only exists in interactive sessions, **v0.5 is interactive-only by
-design**; headless/`-p` and postmortem forks are gone. A fork inherits the session's **permissions
-and model** — there is nothing to grant or override.
+Headless forks of an interactive session read the inherited history cache-cold (Claude Code
+stamps request prefixes per mode) — which cheap fork models make irrelevant; that is the default
+posture: quiet first, cache tricks by explicit opt-in. A subagent-mode fork inherits the
+session's **permissions and model**; a headless fork takes `mode:`/`[fork_modes]` (default
+`acceptEdits`).
 
 ## Requirements
 
@@ -430,7 +434,7 @@ disable_tags = ["noisy"]       # default tag blocklist (see below)
 [tag_throttles]                # min gap between wakes of any fork carrying a tag
 ci = "1h"
 
-fork_runner = "subagent"       # Claude Code execution mode: "subagent" | "headless" (see below)
+fork_runner = "headless"       # Claude Code execution mode; "subagent" opts into cache-preserving visible forks
 
 [fork_models]                  # default fork model per client; a fork's own `model:` wins
 "claude-code" = "haiku"
@@ -448,24 +452,26 @@ the wake cleanly and stamps no throttles.
 
 ### The headless runner (Claude Code)
 
-By default, Claude Code forks run as **fork subagents** spawned by your session's own model: the
-wake reminder, the spawn calls and the completion relays are all turns in your conversation. That
-buys near-total prompt-cache reuse — and costs visible noise.
+`fork_runner = "headless"` — the default since v0.18 — is the opencode-style quiet mode: the
+parked Stop hook consumes wakes itself and runs each fork as a
+`claude -p --resume <conversation> --fork-session` subprocess — a true fork of your conversation,
+run outside your session. Reports are spooled and delivered **silently** on your next prompt
+(hook `additionalContext`: your model sees them, your transcript doesn't show them). Nothing
+about forks ever appears in your conversation.
 
-`fork_runner = "headless"` is the opencode-style quiet mode: the parked Stop hook consumes wakes
-itself and runs each fork as a `claude -p --resume <conversation> --fork-session` subprocess — a
-true fork of your conversation, run outside your session. Reports are spooled and delivered
-**silently** on your next prompt (hook `additionalContext`: your model sees them, your transcript
-doesn't show them). Nothing about forks ever appears in your conversation.
-
-The trade: a headless fork of an interactive session cannot reuse its prompt cache (Claude Code
-stamps request prefixes per mode), so each run reads the inherited history cold — which is why
-headless pairs naturally with cheap fork models (`[fork_models]`, above): pay haiku input prices
-for the copy instead of burning your session's model on a journal update. Runs default to
+A headless fork of an interactive session cannot reuse its prompt cache (Claude Code stamps
+request prefixes per mode), so each run reads the inherited history cold — which is why headless
+pairs naturally with cheap fork models (`[fork_models]`, above): pay small-model input prices for
+the copy instead of burning your session's model on a journal update. Runs default to
 `--permission-mode acceptEdits` (headless runs can't answer permission prompts); set a fork's
 `mode:` or `[fork_modes]` for more or less. Chain forks work, with one semantic shift: the parent
 only sees reports at your next prompt, so a goal loop advances between your messages rather than
 autonomously.
+
+`fork_runner = "subagent"` opts back into the pre-v0.18 behavior: the session's own model spawns
+fork subagents (near-total prompt-cache reuse, forks on the session's model) at the price of
+visible wake/spawn/relay turns. Pick it when cache reuse on the big model matters more to you
+than a quiet conversation.
 
 ### Tag filtering
 
@@ -659,15 +665,15 @@ instantly and stays on the waiter path.
 ### Cache economics on codex
 
 A codex thread fork gets a fresh thread id, and codex keys the OpenAI prompt cache on it — so a
-native fork run reads the inherited history **cold** (measured: `cached_input_tokens: 0`).
-autofork therefore runs a fork the cheap way when it can: if the run uses the parent's model and
-the parent's rollout is a self-contained plain-JSONL file, the run is executed as a **cache
-copy** — the rollout is copied into a throwaway `CODEX_HOME` keeping its session id, and resumed
-there. Same id → same prompt-cache key → the parent's warm prefix is reused (~93% measured), and
-the parent's real home is never touched. The preflight fails closed to the native fork
-(compressed rollouts, paginated history, reference-backed forks), and
-`AUTOFORK_CODEX_NO_CACHE_COPY=1` disables the copy path outright. A fork on a *different* model
-is a different cache anyway, so it always uses the native fork.
+fork run reads the inherited history **cold** (measured: `cached_input_tokens: 0`). That is the
+default and it mirrors opencode's semantics: every run is a plain native fork. If you want the
+cache back, opt in with `AUTOFORK_CODEX_CACHE_COPY=1` (in codex's environment): a run that uses
+the parent's model and whose rollout is a self-contained plain-JSONL file is then executed as a
+**cache copy** — the rollout is copied into a throwaway `CODEX_HOME` keeping its session id and
+resumed there. Same id → same prompt-cache key → the parent's warm prefix is reused (~93%
+measured), and the parent's real home is never touched. The preflight fails closed to the native
+fork (compressed rollouts, paginated history, reference-backed forks), and a fork on a
+*different* model is a different cache anyway, so it always uses the native fork.
 
 Requires codex >= 0.148 (lifecycle hooks, `codex exec fork`, the queue RPC, and Stop-hook
 blocking — all verified against that release).

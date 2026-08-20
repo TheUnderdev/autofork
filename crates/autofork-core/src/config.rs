@@ -55,13 +55,16 @@ pub struct Config {
     /// permission mode (claude-code headless runner), sandbox (codex), agent
     /// (opencode). A fork's own `mode:` wins.
     pub fork_modes: BTreeMap<String, String>,
-    /// How Claude Code fork runs execute: `"subagent"` (the session's own
-    /// model spawns fork subagents — cache-hot, but the wake/spawn/relay
-    /// turns are visible in your conversation) or `"headless"` (the parked
-    /// Stop hook runs `claude -p --fork-session` subprocesses itself and
-    /// reports arrive silently as additionalContext on your next prompt —
-    /// the opencode-style quiet mode; forks of interactive sessions pay a
-    /// cold prompt cache, which cheap fork models make irrelevant).
+    /// How Claude Code fork runs execute. The default, `"headless"`, is the
+    /// opencode-style quiet mode: the parked Stop hook runs
+    /// `claude -p --fork-session` subprocesses itself and reports arrive
+    /// silently as additionalContext on your next prompt — nothing about
+    /// forks ever appears in your conversation. `"subagent"` is the opt-in
+    /// cache-preserving alternative: the session's own model spawns fork
+    /// subagents (near-total prompt-cache reuse), at the price of visible
+    /// wake/spawn/relay turns. Headless forks of interactive sessions read
+    /// the inherited history cache-cold, which cheap fork models
+    /// (`[fork_models]`) make irrelevant.
     pub fork_runner: ForkRunner,
 }
 
@@ -69,8 +72,8 @@ pub struct Config {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ForkRunner {
     #[default]
-    Subagent,
     Headless,
+    Subagent,
 }
 
 impl Default for Config {
@@ -87,7 +90,7 @@ impl Default for Config {
             runaway_limit: 30,
             fork_models: BTreeMap::new(),
             fork_modes: BTreeMap::new(),
-            fork_runner: ForkRunner::Subagent,
+            fork_runner: ForkRunner::Headless,
         }
     }
 }

@@ -31,7 +31,9 @@ impl Env {
         std::fs::create_dir_all(project.join(".autofork/forks")).unwrap();
         std::fs::write(
             home.join("config.toml"),
-            format!("default_idle_deadline = \"{idle}\"\nquiet_period = \"1h\"\nwake_debounce = \"0\"\n"),
+            // These tests assert the subagent (exit-2 wake) behavior; the
+            // shipped default is headless, so pin the runner explicitly.
+            format!("default_idle_deadline = \"{idle}\"\nquiet_period = \"1h\"\nwake_debounce = \"0\"\nfork_runner = \"subagent\"\n"),
         )
         .unwrap();
         Self {
@@ -390,4 +392,158 @@ fn hook_never_fails_on_garbage_stdin() {
             "hook {event} broke on garbage stdin"
         );
     }
+}
+
+/// A mock daemon for the headless runner: answers Hello, the FIRST StopWait
+/// with the given wake, every later StopWait with Waited (ends the loop), and
+/// records every other frame it receives.
+fn mock_headless_daemon(
+    socket: PathBuf,
+    wake: ResponseBody,
+) -> (
+    thread::JoinHandle<()>,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    let frames = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = frames.clone();
+    let handle = thread::spawn(move || {
+        let listener = UnixListener::bind(&socket).unwrap();
+        // The hook holds its poll connection open while the runner opens
+        // short-lived frame connections concurrently: thread per connection.
+        let woke = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        listener.set_nonblocking(true).unwrap();
+        let mut workers = Vec::new();
+        while Instant::now() < deadline && !done.load(std::sync::atomic::Ordering::SeqCst) {
+            let Ok((stream, _)) = listener.accept() else {
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            };
+            stream.set_nonblocking(false).unwrap();
+            let captured = captured.clone();
+            let wake = wake.clone();
+            let woke = woke.clone();
+            let done = done.clone();
+            workers.push(thread::spawn(move || {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut writer = stream;
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                    let req: Request = match serde_json::from_str(line.trim()) {
+                        Ok(r) => r,
+                        Err(_) => break,
+                    };
+                    let body = match &req.body {
+                        RequestBody::Hello { .. } => ResponseBody::HelloInfo {
+                            version: "999.0.0".into(),
+                        },
+                        RequestBody::StopWait(_) => {
+                            if woke.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                                done.store(true, std::sync::atomic::Ordering::SeqCst);
+                                ResponseBody::Waited
+                            } else {
+                                wake.clone()
+                            }
+                        }
+                        other => {
+                            captured
+                                .lock()
+                                .unwrap()
+                                .push(serde_json::to_string(other).unwrap());
+                            ResponseBody::Ack
+                        }
+                    };
+                    let resp = Response {
+                        proto: PROTO_VERSION,
+                        id: req.id,
+                        body,
+                    };
+                    let _ = writer.write_all(encode(&resp).unwrap().as_bytes());
+                    line.clear();
+                }
+            }));
+        }
+        for w in workers {
+            let _ = w.join();
+        }
+    });
+    (handle, frames)
+}
+
+#[test]
+fn headless_wake_runs_forks_and_spools_reports() {
+    // The default runner: a wake is consumed by the hook itself — no exit 2,
+    // no stderr payload — the fork runs as a subprocess (stubbed here), its
+    // report is spooled, and the completion frame follows.
+    let env = Env::new("1h");
+    // Flip this Env to the headless default and stub the claude binary.
+    std::fs::write(
+        env.home.join("config.toml"),
+        "default_idle_deadline = \"1h\"\nquiet_period = \"1h\"\n",
+    )
+    .unwrap();
+    let stub = env.project.join("claude-stub.sh");
+    std::fs::write(
+        &stub,
+        "#!/bin/sh\nprintf '{\"session_id\":\"fork-1\",\"result\":\"STUB REPORT\",\"is_error\":false}'\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let wake = ResponseBody::Wake {
+        payload: "unused by the headless runner".into(),
+        forks: Some(vec![autofork_core::protocol::WakeFork {
+            name: "journal".into(),
+            path: "/x/journal.md".into(),
+            trigger: "idle".into(),
+            overlap: false,
+            after: Vec::new(),
+            chain: false,
+            model: Some("stub-model".into()),
+            mode: None,
+            prompt: "Read the file /x/journal.md".into(),
+        }]),
+    };
+    let (daemon, frames) = mock_headless_daemon(env.socket.clone(), wake);
+    wait_for_socket(&env.socket);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_autofork"))
+        .args(["hook", "stop-wait"])
+        .env("AUTOFORK_HOME", &env.home)
+        .env("AUTOFORK_SOCKET", &env.socket)
+        .env("AUTOFORK_CLAUDE_BIN", &stub)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(env.hook_input("s-headless").to_string().as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "headless never exits 2");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).trim().is_empty(),
+        "headless prints no wake payload"
+    );
+    daemon.join().unwrap();
+
+    let frames = frames.lock().unwrap().join("\n");
+    assert!(frames.contains("\"fork_spawned\""), "{frames}");
+    assert!(
+        frames.contains("\"spool_report\"") && frames.contains("STUB REPORT"),
+        "{frames}"
+    );
+    assert!(
+        frames.contains("\"fork_completed\"") && frames.contains("completed"),
+        "{frames}"
+    );
 }
