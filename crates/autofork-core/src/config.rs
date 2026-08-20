@@ -702,7 +702,7 @@ mod tests {
         )
         .unwrap();
         let (cfg, warnings) = load_config(None, Some(home));
-        assert!(cfg.fork_models.get("codex").is_none());
+        assert!(!cfg.fork_models.contains_key("codex"));
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("fork_models.codex"), "{warnings:?}");
     }
