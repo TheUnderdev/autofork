@@ -214,6 +214,19 @@ fn run_attempt(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    // Detach from the controlling terminal: closing the parent's terminal
+    // window SIGHUPs the process group, and a fork's WORK should survive the
+    // session closing even when its report cannot.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
 
     match cmd.spawn() {
         Ok(mut child) => {

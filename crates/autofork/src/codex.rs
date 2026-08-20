@@ -1000,6 +1000,18 @@ fn attempt_run(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    // Detach from the controlling terminal (see the claude runner): the
+    // run's work survives a closed terminal even when its report cannot.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
