@@ -926,14 +926,23 @@ impl Store {
     /// Fork runs with a recorded spawn and no terminal status yet, oldest
     /// first: the in-flight set (`autofork status` shows it so a user can
     /// tell whether closing the session would interrupt anything).
-    pub fn list_live_spawns(&self) -> rusqlite::Result<Vec<(String, String, i64)>> {
+    /// Only spawns younger than `min_spawned_at` count: a non-terminal row
+    /// older than the overlap age floor is a run whose completion the daemon
+    /// missed (a crash, or an unmatched notification) — the scheduler
+    /// already ignores it, so status must not present it as running.
+    pub fn list_live_spawns(
+        &self,
+        min_spawned_at: i64,
+    ) -> rusqlite::Result<Vec<(String, String, i64)>> {
         let mut stmt = self.conn.prepare(
             "SELECT session_id, COALESCE(fork_name, tool_use_id), spawned_at
-             FROM fork_spawns WHERE terminal_at IS NULL
+             FROM fork_spawns WHERE terminal_at IS NULL AND spawned_at > ?1
              ORDER BY spawned_at ASC",
         )?;
         let rows = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .query_map(params![min_spawned_at], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }

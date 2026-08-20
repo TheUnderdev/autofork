@@ -262,7 +262,7 @@ fn status(daemon: &Arc<Daemon>) -> ResponseBody {
         })
         .collect();
     let running = store
-        .list_live_spawns()
+        .list_live_spawns(crate::daemon::now() - crate::planner::overlap_spawn_max_age_secs())
         .unwrap_or_default()
         .into_iter()
         .map(|(session_id, fork, spawned_at)| RunInfo {

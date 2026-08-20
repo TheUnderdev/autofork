@@ -431,7 +431,7 @@ pub(crate) fn gate_grace_secs() -> i64 {
 /// false` fork from re-firing. Runs finish in minutes; a spawn this stale
 /// almost certainly lost its terminal status to a crash. Overridable via
 /// `AUTOFORK_OVERLAP_SPAWN_MAX_AGE_SECS` (tests shorten it).
-fn overlap_spawn_max_age_secs() -> i64 {
+pub(crate) fn overlap_spawn_max_age_secs() -> i64 {
     std::env::var("AUTOFORK_OVERLAP_SPAWN_MAX_AGE_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
