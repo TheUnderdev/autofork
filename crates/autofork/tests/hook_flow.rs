@@ -484,9 +484,13 @@ fn headless_wake_runs_forks_and_spools_reports() {
     )
     .unwrap();
     let stub = env.project.join("claude-stub.sh");
+    let argv_log = env.project.join("claude-argv.txt");
     std::fs::write(
         &stub,
-        "#!/bin/sh\nprintf '{\"session_id\":\"fork-1\",\"result\":\"STUB REPORT\",\"is_error\":false}'\n",
+        format!(
+            "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> {}; done\nprintf '{{\"session_id\":\"fork-1\",\"result\":\"STUB REPORT\",\"is_error\":false}}'\n",
+            argv_log.display()
+        ),
     )
     .unwrap();
     #[cfg(unix)]
@@ -547,4 +551,11 @@ fn headless_wake_runs_forks_and_spools_reports() {
         frames.contains("\"fork_completed\"") && frames.contains("completed"),
         "{frames}"
     );
+
+    // A `--resume` restores the session-scoped Stop hook `/goal` installs, and
+    // in a headless fork that hook refuses the stop: the run never ends and no
+    // report is ever captured. Flag settings turn hooks off for the fork.
+    let argv = std::fs::read_to_string(&argv_log).unwrap();
+    assert!(argv.contains("--settings"), "{argv}");
+    assert!(argv.contains(r#"{"disableAllHooks":true}"#), "{argv}");
 }

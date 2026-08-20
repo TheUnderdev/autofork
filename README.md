@@ -486,7 +486,12 @@ request prefixes per mode), so each run reads the inherited history cold — whi
 pairs naturally with cheap fork models (`[fork_models]`, above): pay small-model input prices for
 the copy instead of burning your session's model on a journal update. Runs default to
 `--permission-mode acceptEdits` (headless runs can't answer permission prompts); set a fork's
-`mode:` or `[fork_modes]` for more or less.
+`mode:` or `[fork_modes]` for more or less. Runs also carry
+`--settings '{"disableAllHooks":true}'`: a `--resume` restores the session-scoped Stop hook that
+Claude Code's own `/goal` installs, and inside a headless fork that hook refuses the stop — the
+run never ends, its report (sentinel included) is never captured, and the fork drifts into doing
+the parent's work. Disabling hooks in the fork also keeps a throwaway reviewer from firing your
+lifecycle hooks; set `AUTOFORK_FORK_HOOKS=1` if a fork of yours depends on one.
 
 One report never waits for your next prompt: a `chain: true` run that asks to continue. There the
 parent is the worker and the loop only advances once it has seen the report, so the parked hook

@@ -240,6 +240,21 @@ fn run_attempt(
     // mode that lets typical consolidation forks do their file work.
     cmd.arg("--permission-mode")
         .arg(spec.mode.as_deref().unwrap_or("acceptEdits"));
+    // Session-scoped Stop hooks outlive the session that set them: Claude
+    // Code restores the one `/goal` installs from the transcript on every
+    // `--resume`, and `--fork-session` is a resume. Inside a headless fork
+    // that hook refuses the stop — the run never terminates, so no report is
+    // captured, no `<<autofork:continue>>` sentinel survives, the parent is
+    // never woken, and the fork wanders off doing the parent's work against
+    // the parent's own workspace. `disableAllHooks` in flag settings gates
+    // the restore (the resume path checks the same gate `/goal` itself does)
+    // and keeps the fork from firing the user's settings/plugin hooks, which
+    // a throwaway reviewer has no business triggering anyway — autofork's own
+    // hooks already no-op on AUTOFORK_FORK=1. `AUTOFORK_FORK_HOOKS=1` opts
+    // back in for anyone whose forks depend on a hook.
+    if std::env::var_os("AUTOFORK_FORK_HOOKS").is_none() {
+        cmd.arg("--settings").arg(r#"{"disableAllHooks":true}"#);
+    }
     cmd.arg(prompt)
         .current_dir(cwd)
         .env("AUTOFORK_FORK", "1")
