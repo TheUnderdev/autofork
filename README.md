@@ -102,9 +102,12 @@ kinds of places:
 
 - `.autofork/forks/` trees (autofork's own layout), plus the user-level `~/.autofork/forks/`
 - `.claude/forks/` trees — a `forks/` dir next to your skills dir — plus `~/.claude/forks/`
-- **skill folders**: a `FORK.md` next to a `SKILL.md` inside `.claude/skills/**` (or
-  `~/.claude/skills/`) defines a fork named after the skill — see
-  [Skill-attached forks](#skill-attached-forks) below
+- **skill folders**: a `FORK.md` next to a `SKILL.md` inside `.claude/skills/**` or
+  `.agents/skills/**` (and the user-level `~/.claude/skills/`, `~/.agents/skills/` — codex's
+  native skills location) defines a fork named after the skill — see
+  [Skill-attached forks](#skill-attached-forks) below. Roots are deduped by canonical path, so
+  the common setup where `~/.agents/skills` and `~/.claude/skills` are symlinks to one shared
+  tree discovers each fork exactly once — no double firing.
 
 Project definitions win name collisions over user-level ones (nearest first). Inside a forks
 root, two layouts mix freely (subfolders are just organization):
@@ -155,7 +158,7 @@ a missing marker can't silently disable a real fork. `fork: false` is an explici
 | `chain` | `true` — a run may request another by ending its report with `<<autofork:continue>>` | `false` |
 | `chain_limit` | max chain runs within one pause | config `chain_limit` (25) |
 | `gate` | `true` — hold the other idle forks while this fork's run/chain is unsettled | `false` |
-| `model` | model for this fork's runs: a scalar, or a map keyed by client (`claude-code:` / `opencode:` / `codex:`) | config `[fork_models]`, else inherit the session's |
+| `model` | model for this fork's runs: a value or a fallback list (`[sonnet, haiku]` — a failed run retries on the next), scalar or keyed by client (`claude-code:` / `opencode:` / `codex:`) | config `[fork_models]`, else inherit the session's |
 | `mode` | operation mode for the runs (permission mode / codex sandbox / opencode agent), scalar or client map | config `[fork_modes]`, else the client default |
 
 `model:` and `mode:` (v0.17) exist because a fork rarely needs the parent
@@ -166,9 +169,9 @@ client explicitly:
 
 ```yaml
 model:
-  claude-code: haiku
-  opencode: anthropic/claude-haiku-4-5
-  codex: gpt-5.1-codex-mini
+  claude-code: [sonnet, haiku]        # fallback list: a failed run retries on the next
+  opencode: github-copilot/gemini-3.7-flash
+  codex: gpt-5.6-luna
 mode:
   codex: workspace-write
 ```
@@ -435,11 +438,12 @@ disable_tags = ["noisy"]       # default tag blocklist (see below)
 ci = "1h"
 
 fork_runner = "headless"       # Claude Code execution mode; "subagent" opts into cache-preserving visible forks
+flush_on_close = false         # run the pause's unrun idle forks when a session ends (see below)
 
 [fork_models]                  # default fork model per client; a fork's own `model:` wins
-"claude-code" = "haiku"
-opencode = "anthropic/claude-haiku-4-5"
-codex = "gpt-5.1-codex-mini"
+"claude-code" = ["sonnet", "haiku"]   # one id, or a fallback list tried in order
+opencode = "github-copilot/gemini-3.7-flash"
+codex = "gpt-5.6-luna"
 
 [fork_modes]                   # default operation mode per client; a fork's `mode:` wins
 "claude-code" = "acceptEdits"  # headless-runner permission mode
@@ -472,6 +476,18 @@ autonomously.
 fork subagents (near-total prompt-cache reuse, forks on the session's model) at the price of
 visible wake/spawn/relay turns. Pick it when cache reuse on the big model matters more to you
 than a quiet conversation.
+
+### Flush on close
+
+`flush_on_close = true` closes the classic gap "I quit before the idle deadline, so the
+consolidation forks never ran": when a session ends, every idle fork that hadn't yet fired this
+pause runs **immediately**, executed by a detached end-runner that outlives the session — a
+`claude -p --fork-session`, `codex exec fork`, or `opencode run --fork` of the on-disk
+conversation, in `after`/priority order with report piping. Throttles, tag filters and the
+runaway breaker still apply, so a fork that already ran recently stays quiet. Reports go where
+they can: Claude Code spools them under the conversation (delivered if you resume it), codex
+queues them into the thread (same), opencode runs are work-only. Off by default — with it on,
+closing a session costs a burst of fork runs, which should be a choice you made.
 
 ### Tag filtering
 

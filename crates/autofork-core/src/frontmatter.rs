@@ -30,17 +30,20 @@ use std::collections::BTreeMap;
 pub enum ClientScoped {
     #[default]
     Unset,
-    Scalar(String),
-    PerClient(BTreeMap<String, String>),
+    /// One or more candidates, tried in order (a plain string is a
+    /// single-candidate list).
+    Scalar(Vec<String>),
+    PerClient(BTreeMap<String, Vec<String>>),
 }
 
 impl ClientScoped {
-    /// The value for a given client name; a scalar applies to every client.
-    pub fn resolve(&self, client: &str) -> Option<&str> {
+    /// The candidate list for a given client name, first choice first; a
+    /// scalar applies to every client. Empty slice = unset for this client.
+    pub fn resolve(&self, client: &str) -> &[String] {
         match self {
-            ClientScoped::Unset => None,
-            ClientScoped::Scalar(s) => Some(s),
-            ClientScoped::PerClient(m) => m.get(client).map(String::as_str),
+            ClientScoped::Unset => &[],
+            ClientScoped::Scalar(s) => s,
+            ClientScoped::PerClient(m) => m.get(client).map(Vec::as_slice).unwrap_or(&[]),
         }
     }
 
@@ -50,16 +53,40 @@ impl ClientScoped {
 
     /// One-line display form for `autofork forks`.
     pub fn display(&self) -> Option<String> {
+        let list = |v: &[String]| {
+            if v.len() == 1 {
+                v[0].clone()
+            } else {
+                format!("[{}]", v.join(", "))
+            }
+        };
         match self {
             ClientScoped::Unset => None,
-            ClientScoped::Scalar(s) => Some(s.clone()),
+            ClientScoped::Scalar(s) => Some(list(s)),
             ClientScoped::PerClient(m) => Some(
                 m.iter()
-                    .map(|(k, v)| format!("{k}: {v}"))
+                    .map(|(k, v)| format!("{k}: {}", list(v)))
                     .collect::<Vec<_>>()
                     .join(", "),
             ),
         }
+    }
+}
+
+/// Parse a string-or-list-of-strings YAML value into a candidate list.
+fn parse_candidates(v: &serde_yaml::Value) -> Option<Vec<String>> {
+    match v {
+        serde_yaml::Value::String(s) if !s.trim().is_empty() => Some(vec![s.trim().to_string()]),
+        serde_yaml::Value::Sequence(seq) => {
+            let out: Vec<String> = seq
+                .iter()
+                .filter_map(|e| e.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            (!out.is_empty() && out.len() == seq.len()).then_some(out)
+        }
+        _ => None,
     }
 }
 
@@ -72,21 +99,16 @@ fn parse_client_scoped(
     warnings: &mut Vec<String>,
 ) -> ClientScoped {
     match v {
-        serde_yaml::Value::String(s) if !s.trim().is_empty() => {
-            ClientScoped::Scalar(s.trim().to_string())
-        }
         serde_yaml::Value::Mapping(m) => {
             let mut out = BTreeMap::new();
             for (k, val) in m {
-                match (k.as_str(), val.as_str()) {
-                    (Some(client), Some(value))
-                        if !client.trim().is_empty() && !value.trim().is_empty() =>
-                    {
-                        out.insert(client.trim().to_string(), value.trim().to_string());
+                match (k.as_str(), parse_candidates(val)) {
+                    (Some(client), Some(candidates)) if !client.trim().is_empty() => {
+                        out.insert(client.trim().to_string(), candidates);
                     }
                     _ => warnings.push(format!(
-                        "fork '{name}': {key} map entries must be 'client: value' strings; \
-                         skipping one"
+                        "fork '{name}': {key} map entries must be 'client: value' (or a list \
+                         of fallback values); skipping one"
                     )),
                 }
             }
@@ -99,12 +121,16 @@ fn parse_client_scoped(
                 ClientScoped::PerClient(out)
             }
         }
-        _ => {
-            warnings.push(format!(
-                "fork '{name}': {key} must be a string or a client-keyed map, ignoring"
-            ));
-            ClientScoped::Unset
-        }
+        other => match parse_candidates(other) {
+            Some(candidates) => ClientScoped::Scalar(candidates),
+            None => {
+                warnings.push(format!(
+                    "fork '{name}': {key} must be a string, a list of strings, or a \
+                     client-keyed map of them, ignoring"
+                ));
+                ClientScoped::Unset
+            }
+        },
     }
 }
 
@@ -884,7 +910,7 @@ mod tests {
         assert!(p.warnings.iter().any(|w| w.contains("delivery")));
         assert!(p.warnings.iter().any(|w| w.contains("allowed_tools")));
         // `model:` is live again since v0.17 — no warning, parsed.
-        assert_eq!(p.def.model, ClientScoped::Scalar("haiku".into()));
+        assert_eq!(p.def.model, ClientScoped::Scalar(vec!["haiku".into()]));
         assert!(!p.warnings.iter().any(|w| w.contains("'model'")));
     }
 
@@ -892,24 +918,42 @@ mod tests {
     fn model_and_mode_scalar_or_client_map() {
         let p = parse("---\nfork: true\nmodel: haiku\nmode: acceptEdits\n---\n");
         assert!(p.warnings.is_empty());
-        assert_eq!(p.def.model.resolve("claude-code"), Some("haiku"));
-        assert_eq!(p.def.model.resolve("codex"), Some("haiku")); // scalar = every client
-        assert_eq!(p.def.mode.resolve("opencode"), Some("acceptEdits"));
+        assert_eq!(p.def.model.resolve("claude-code"), ["haiku".to_string()]);
+        assert_eq!(p.def.model.resolve("codex"), ["haiku".to_string()]); // scalar = every client
+        assert_eq!(p.def.mode.resolve("opencode"), ["acceptEdits".to_string()]);
 
         let p = parse(
             "---\nfork: true\nmodel:\n  claude-code: haiku\n  codex: gpt-5.1-codex-mini\n---\n",
         );
         assert!(p.warnings.is_empty());
-        assert_eq!(p.def.model.resolve("claude-code"), Some("haiku"));
-        assert_eq!(p.def.model.resolve("codex"), Some("gpt-5.1-codex-mini"));
-        assert_eq!(p.def.model.resolve("opencode"), None); // unnamed client = inherit
+        assert_eq!(p.def.model.resolve("claude-code"), ["haiku".to_string()]);
+        assert_eq!(
+            p.def.model.resolve("codex"),
+            ["gpt-5.1-codex-mini".to_string()]
+        );
+        assert!(p.def.model.resolve("opencode").is_empty()); // unnamed client = inherit
         assert_eq!(
             p.def.model.display().as_deref(),
             Some("claude-code: haiku, codex: gpt-5.1-codex-mini")
         );
 
-        // Junk shapes warn and fall back to Unset — never drop the fork.
+        // Fallback lists, scalar and per-client.
+        let p = parse("---\nfork: true\nmodel:\n  claude-code: [sonnet, haiku]\n---\n");
+        assert!(p.warnings.is_empty());
+        assert_eq!(
+            p.def.model.resolve("claude-code"),
+            ["sonnet".to_string(), "haiku".to_string()]
+        );
         let p = parse("---\nfork: true\nmodel: [a, b]\n---\n");
+        assert!(p.warnings.is_empty());
+        assert_eq!(
+            p.def.model.resolve("codex"),
+            ["a".to_string(), "b".to_string()]
+        );
+        assert_eq!(p.def.model.display().as_deref(), Some("[a, b]"));
+
+        // Junk shapes warn and fall back to Unset — never drop the fork.
+        let p = parse("---\nfork: true\nmodel: {claude-code: {x: y}}\n---\n");
         assert!(p.warnings.iter().any(|w| w.contains("model")));
         assert!(!p.def.model.is_set());
     }

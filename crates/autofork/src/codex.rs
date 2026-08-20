@@ -242,6 +242,32 @@ fn run_hook_inner(kind: CxHookKind) -> Option<()> {
             println!("{out}");
         }
         CxHookKind::SessionEnd => {
+            // `flush_on_close`: take the unrun idle forks before the close
+            // purges the roster; a detached end-runner executes them via
+            // native thread forks of the on-disk conversation.
+            let flush = {
+                let (cfg, _w) =
+                    autofork_core::config::load_config_at(Some(&root), &paths.user_config());
+                cfg.flush_on_close
+            };
+            if flush {
+                if let Ok(mut c) = Client::connect(&paths, Duration::from_secs(3)) {
+                    if let Ok(ResponseBody::Due { forks }) = c.request(RequestBody::TakeFinalRuns {
+                        session_id: input.session_id.clone(),
+                    }) {
+                        crate::runner::spawn_final_runner(
+                            &paths,
+                            "codex",
+                            &input.session_id,
+                            &input.session_id,
+                            &cwd,
+                            input.model.as_deref(),
+                            input.permission_mode.as_deref(),
+                            &forks,
+                        );
+                    }
+                }
+            }
             // Tombstone first: the waiter must not re-park for a dead session.
             let _ = std::fs::write(waiter_tombstone(&paths, &input.session_id), b"");
             let mut client = Client::connect_or_spawn(&paths, Duration::from_secs(5)).ok()?;
@@ -807,8 +833,61 @@ fn execute_run_with_rollout(
     spec: &WakeFork,
     prompt: &str,
 ) -> RunOutcome {
-    let model = spec.model.as_deref().or(parent_model);
-    let same_model = match spec.model.as_deref() {
+    // Model candidates, tried in order: a failed run retries on the next one.
+    let mut candidates: Vec<Option<String>> = Vec::new();
+    match &spec.model {
+        Some(m) => {
+            candidates.push(Some(m.clone()));
+            candidates.extend(spec.model_fallbacks.iter().cloned().map(Some));
+        }
+        None => candidates.push(None),
+    }
+    let last = candidates.len() - 1;
+    for (i, candidate) in candidates.iter().enumerate() {
+        let outcome = attempt_run(
+            paths,
+            session,
+            rollout,
+            cwd,
+            parent_model,
+            parent_permission_mode,
+            spec,
+            prompt,
+            candidate.as_deref(),
+            i == last,
+        );
+        if outcome.status == "completed" || i == last {
+            return outcome;
+        }
+        eprintln!(
+            "[codex-fork] '{}' failed on model {:?}; retrying on {:?}",
+            spec.name,
+            candidate,
+            candidates[i + 1]
+        );
+        cleanup_run(&outcome);
+    }
+    unreachable!("candidates is never empty");
+}
+
+/// One execution attempt on one model candidate. A non-final failed attempt
+/// still settles its own spawn frame (status `failed`) so the daemon never
+/// holds a dangling run — the retry is a brand-new run in its eyes.
+#[allow(clippy::too_many_arguments)]
+fn attempt_run(
+    paths: &Paths,
+    session: &str,
+    rollout: Option<&Path>,
+    cwd: &Path,
+    parent_model: Option<&str>,
+    parent_permission_mode: Option<&str>,
+    spec: &WakeFork,
+    prompt: &str,
+    candidate: Option<&str>,
+    _final_attempt: bool,
+) -> RunOutcome {
+    let model = candidate.or(parent_model);
+    let same_model = match candidate {
         None => true,
         Some(m) => Some(m) == parent_model,
     };
@@ -1076,6 +1155,44 @@ fn debug_log(msg: &str) {
             let _ = writeln!(f, "[{}] {msg}", std::process::id());
         }
     }
+}
+
+/// One flush-on-close codex run: a native thread fork of the closed session
+/// (rollouts are on disk; nothing needs the process). The report goes into
+/// codex's durable queue — it reaches the user if they ever resume the
+/// thread — and the fork thread is deleted as usual.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_final_codex(
+    paths: &Paths,
+    session: &str,
+    cwd: &Path,
+    parent_model: Option<&str>,
+    parent_permission_mode: Option<&str>,
+    spec: WakeFork,
+    carried: &str,
+) -> Option<String> {
+    let prompt = format!("{}{}", spec.prompt, carried);
+    let outcome = execute_run_with_rollout(
+        paths,
+        session,
+        None,
+        cwd,
+        parent_model,
+        parent_permission_mode,
+        &spec,
+        &prompt,
+    );
+    if outcome.status == "completed" {
+        let body = if outcome.report.is_empty() {
+            "(the fork finished without a report)".to_string()
+        } else {
+            outcome.report.clone()
+        };
+        let block = report_block(&spec.name, &spec.trigger, outcome.status, &body);
+        let _ = queue_message(session, &block);
+    }
+    cleanup_run(&outcome);
+    (outcome.status == "completed" && !outcome.report.is_empty()).then(|| outcome.report.clone())
 }
 
 /// Send a ForkSpawned (completion=None) or ForkCompleted frame.

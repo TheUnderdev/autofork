@@ -75,6 +75,13 @@ pub enum RequestBody {
     /// UserPromptSubmit hook to deliver them as additionalContext. Additive
     /// frame; old daemons answer `Error`, treated as "none".
     TakeReports { session_id: String },
+    /// `flush_on_close`: the SessionEnd hook asks for every idle fork that
+    /// has not yet fired this pause; the daemon selects (throttles, tags and
+    /// the runaway breaker still apply), stamps, and returns them ALL — roots
+    /// and dependents — in execution order, `after` report-piping preds
+    /// filled in, for a detached end-runner to execute after the session
+    /// dies. Answered with `Due`. Additive frame.
+    TakeFinalRuns { session_id: String },
     /// Ask the daemon to exit. With `drain`, it finishes cleanly first.
     /// Frozen shape — never change.
     Shutdown { drain: bool },
@@ -292,6 +299,10 @@ pub struct WakeFork {
     /// session's model. Additive field (no proto bump).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Fallback models tried in order when a run on `model` fails ("if the
+    /// first option is not available, the next one is used"). Additive.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_fallbacks: Vec<String>,
     /// Operation mode for the run, resolved like `model` (permission mode /
     /// sandbox / agent, per client). `None` = the client's default. Additive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -403,6 +414,7 @@ mod tests {
                     after: Vec::new(),
                     chain: false,
                     model: None,
+                    model_fallbacks: Vec::new(),
                     mode: None,
                     prompt: "Read the file /x/journal.md".into(),
                 }]),

@@ -186,6 +186,34 @@ fn run_hook_inner(kind: OcHookKind) -> Option<()> {
         }
         OcHookKind::SessionEnd => {
             let mut client = Client::connect_or_spawn(&paths, Duration::from_secs(5)).ok()?;
+            // `flush_on_close`: the end-runner continues forks of the closed
+            // session via `opencode run -s <id> --fork` (self-hosted, no live
+            // instance needed). Reports have nowhere to be delivered — the
+            // runs' work is the point; the plugin's startup sweep cleans the
+            // leftover fork sessions by their spawn-prompt fingerprint.
+            let flush = {
+                let (cfg, _w) =
+                    autofork_core::config::load_config_at(Some(&root), &paths.user_config());
+                cfg.flush_on_close
+            };
+            if flush {
+                if let Ok(ResponseBody::Due { forks }) =
+                    client.request(RequestBody::TakeFinalRuns {
+                        session_id: input.session_id.clone(),
+                    })
+                {
+                    crate::runner::spawn_final_runner(
+                        &paths,
+                        "opencode",
+                        &input.session_id,
+                        &input.session_id,
+                        &input.directory,
+                        input.model.as_deref(),
+                        None,
+                        &forks,
+                    );
+                }
+            }
             let _ = client.request(RequestBody::Event(event(EventKind::SessionEnd)));
         }
         OcHookKind::ForkSpawned => {

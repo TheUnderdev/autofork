@@ -80,25 +80,34 @@ pub fn fork_roots(
 /// The skills roots relevant to `dir` (scanned only for skill-attached
 /// `FORK.md` files): each ancestor's `.claude/skills`, nearest first, then
 /// `claude_dir`'s `skills/`.
-fn skill_roots(dir: &Path, claude_dir: Option<&Path>) -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    let start = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-    let mut cur = Some(start.as_path());
-    while let Some(d) = cur {
-        let candidate = d.join(".claude").join("skills");
-        if candidate.is_dir() {
-            roots.push(candidate);
-        }
-        cur = d.parent();
-    }
-    if let Some(claude) = claude_dir {
-        let candidate = claude.join("skills");
+fn skill_roots(dir: &Path, claude_dir: Option<&Path>, agents_dir: Option<&Path>) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    // Roots are deduped by canonical path: setups symlink skills dirs into
+    // each other (e.g. `~/.agents/skills` -> `~/.claude/skills`, so codex and
+    // Claude Code share one skills tree) and a fork must never be discovered
+    // twice through two spellings of the same directory.
+    let mut push = |candidate: PathBuf| {
         let c = candidate
             .canonicalize()
             .unwrap_or_else(|_| candidate.clone());
         if c.is_dir() && !roots.contains(&c) {
             roots.push(c);
         }
+    };
+    let start = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let mut cur = Some(start.as_path());
+    while let Some(d) = cur {
+        push(d.join(".claude").join("skills"));
+        push(d.join(".agents").join("skills"));
+        cur = d.parent();
+    }
+    if let Some(claude) = claude_dir {
+        push(claude.join("skills"));
+    }
+    // The user-level `.agents` dir (codex's native skills location), resolved
+    // by the caller (`AUTOFORK_AGENTS_DIR` override, else `~/.agents`).
+    if let Some(agents) = agents_dir {
+        push(agents.join("skills"));
     }
     roots
 }
@@ -121,13 +130,14 @@ pub fn discover_forks(
     dir: &Path,
     user_forks_root: Option<&Path>,
     claude_dir: Option<&Path>,
+    agents_dir: Option<&Path>,
 ) -> (Vec<ForkEntry>, Vec<String>) {
     let mut entries: Vec<ForkEntry> = Vec::new();
     let mut warnings = Vec::new();
     for root in fork_roots(dir, user_forks_root, claude_dir) {
         scan_forks_dir(&root, &root, 0, &mut entries, &mut warnings);
     }
-    for root in skill_roots(dir, claude_dir) {
+    for root in skill_roots(dir, claude_dir, agents_dir) {
         scan_skills_dir(&root, &root, 0, &mut entries, &mut warnings);
     }
     (entries, warnings)
@@ -171,8 +181,15 @@ fn insert_entry(
             return;
         }
     };
-    // Only real forks reserve a name / shadow others.
+    // Only real forks reserve a name / shadow others. The same FILE reached
+    // through two root spellings (symlinked skills dirs) is not a collision —
+    // skip it silently.
     if let Some(existing) = entries.iter().find(|e| e.name == name) {
+        let same_file = existing.path.canonicalize().ok().is_some()
+            && existing.path.canonicalize().ok() == path.canonicalize().ok();
+        if same_file {
+            return;
+        }
         if existing.path != path {
             warnings.push(format!(
                 "fork '{name}' at {} shadowed by {}",
@@ -297,7 +314,7 @@ mod tests {
         write(&root.join(".autofork/forks/.hidden.md"), "x");
         write(&root.join(".autofork/forks/readme.txt"), "x");
 
-        let (entries, warnings) = discover_forks(&root, None, None);
+        let (entries, warnings) = discover_forks(&root, None, None, None);
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["cleanup", "journal"]);
         assert!(warnings.is_empty(), "warnings: {warnings:?}");
@@ -331,7 +348,7 @@ mod tests {
         );
         write(&root.join(".autofork/forks/plain.md"), "just notes");
 
-        let (entries, warnings) = discover_forks(&root, None, None);
+        let (entries, warnings) = discover_forks(&root, None, None, None);
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["real"]);
         assert_eq!(warnings.len(), 1);
@@ -366,7 +383,8 @@ mod tests {
         );
         fs::create_dir_all(&inner).unwrap();
 
-        let (entries, warnings) = discover_forks(&inner, Some(&home.join(".autofork/forks")), None);
+        let (entries, warnings) =
+            discover_forks(&inner, Some(&home.join(".autofork/forks")), None, None);
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["local", "shared", "user"]);
         let shared = entries.iter().find(|e| e.name == "shared").unwrap();
@@ -384,7 +402,7 @@ mod tests {
             &root.join(".autofork/forks/good.md"),
             "---\nfork: true\n---\nfine",
         );
-        let (entries, warnings) = discover_forks(&root, None, None);
+        let (entries, warnings) = discover_forks(&root, None, None, None);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "good");
         assert_eq!(warnings.len(), 1);
@@ -393,7 +411,7 @@ mod tests {
     #[test]
     fn no_autofork_dir_is_empty() {
         let tmp = tempfile::tempdir().unwrap();
-        let (entries, warnings) = discover_forks(tmp.path(), None, None);
+        let (entries, warnings) = discover_forks(tmp.path(), None, None, None);
         assert!(entries.is_empty());
         assert!(warnings.is_empty());
     }
@@ -417,7 +435,7 @@ mod tests {
             "---\nfork: true\n---\nbody",
         );
 
-        let (entries, warnings) = discover_forks(&root, None, Some(&claude));
+        let (entries, warnings) = discover_forks(&root, None, Some(&claude), None);
         let mut names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         names.sort_unstable();
         assert_eq!(names, vec!["cleanup", "global", "journal"]);
@@ -462,7 +480,7 @@ mod tests {
             "---\nfork: true\n---\nfork body",
         );
 
-        let (entries, warnings) = discover_forks(&root, None, Some(&claude));
+        let (entries, warnings) = discover_forks(&root, None, Some(&claude), None);
         let mut names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         names.sort_unstable();
         assert_eq!(names, vec!["diary", "feedback", "global-skill"]);
@@ -506,12 +524,52 @@ mod tests {
             &root.join(".claude/skills/feedback/FORK.md"),
             "---\nfork: true\ndescription: from skill\n---\nbody",
         );
-        let (entries, warnings) = discover_forks(&root, None, None);
+        let (entries, warnings) = discover_forks(&root, None, None, None);
         assert_eq!(entries.len(), 1);
         assert_eq!(
             entries[0].parsed.def.description.as_deref(),
             Some("from forks dir")
         );
         assert_eq!(warnings.len(), 1, "collision warns: {warnings:?}");
+    }
+}
+
+#[cfg(test)]
+mod symlink_tests {
+    use super::*;
+
+    #[test]
+    fn symlinked_skills_roots_discover_each_fork_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        // Real tree under .claude/skills; .agents/skills is a symlink to it —
+        // the codex/claude-code shared-skills setup.
+        let skill = home.join(".claude/skills/journal");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "# journal skill\n").unwrap();
+        std::fs::write(
+            skill.join("FORK.md"),
+            "---\nfork: true\nrun_on: [idle]\n---\nJ",
+        )
+        .unwrap();
+        std::fs::create_dir_all(home.join(".agents")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(home.join(".claude/skills"), home.join(".agents/skills"))
+            .unwrap();
+
+        let project = home.join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let (entries, warnings) = discover_forks(
+            &project,
+            None,
+            Some(&home.join(".claude")),
+            Some(&home.join(".agents")),
+        );
+        let journal: Vec<_> = entries.iter().filter(|e| e.name == "journal").collect();
+        assert_eq!(journal.len(), 1, "one fork through two symlinked roots");
+        assert!(
+            !warnings.iter().any(|w| w.contains("shadowed")),
+            "symlink duplicates must not warn: {warnings:?}"
+        );
     }
 }

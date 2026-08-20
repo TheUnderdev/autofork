@@ -146,6 +146,8 @@ pub struct DueFork {
     /// Model for the run, already resolved for the session's client (fork
     /// `model:` over config `[fork_models]`). `None` = inherit the session's.
     pub model: Option<String>,
+    /// Fallback models tried in order when a run on `model` fails.
+    pub model_fallbacks: Vec<String>,
     /// Operation mode for the run, resolved like `model`.
     pub mode: Option<String>,
 }
@@ -359,6 +361,7 @@ pub fn build_wake_forks(
             after: f.after.clone(),
             chain: f.chain,
             model: f.model.clone(),
+            model_fallbacks: f.model_fallbacks.clone(),
             mode: f.mode.clone(),
             prompt: spawn_prompt(f, session_id, conversation_id, project_root),
         })
@@ -398,6 +401,7 @@ mod tests {
             skill: None,
             chain: false,
             model: None,
+            model_fallbacks: Vec::new(),
             mode: None,
         }
     }

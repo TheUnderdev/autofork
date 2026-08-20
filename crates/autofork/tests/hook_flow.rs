@@ -505,6 +505,7 @@ fn headless_wake_runs_forks_and_spools_reports() {
             after: Vec::new(),
             chain: false,
             model: Some("stub-model".into()),
+            model_fallbacks: Vec::new(),
             mode: None,
             prompt: "Read the file /x/journal.md".into(),
         }]),

@@ -342,8 +342,15 @@ pub fn run_fork(paths: &Paths, name: Option<String>, tag: Option<String>) -> Res
     let claude_dir = std::env::var_os("AUTOFORK_CLAUDE_DIR")
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".claude")));
-    let (entries, _) =
-        autofork_core::discovery::discover_forks(&cwd, Some(&user_forks), claude_dir.as_deref());
+    let agents_dir = std::env::var_os("AUTOFORK_AGENTS_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".agents")));
+    let (entries, _) = autofork_core::discovery::discover_forks(
+        &cwd,
+        Some(&user_forks),
+        claude_dir.as_deref(),
+        agents_dir.as_deref(),
+    );
 
     let picked: Vec<_> = match (&name, &tag) {
         (Some(name), _) => match entries.into_iter().find(|e| &e.name == name) {
@@ -385,6 +392,7 @@ pub fn run_fork(paths: &Paths, name: Option<String>, tag: Option<String>) -> Res
             // The manual print targets the Claude Code subagent path, which
             // cannot apply model/mode overrides.
             model: None,
+            model_fallbacks: Vec::new(),
             mode: None,
         })
         .collect();

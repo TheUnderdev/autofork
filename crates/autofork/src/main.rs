@@ -79,6 +79,24 @@ enum Command {
         #[command(subcommand)]
         command: CodexCommand,
     },
+    /// The flush-on-close end-runner (spawned detached by SessionEnd hooks).
+    #[command(hide = true)]
+    FinalRun {
+        #[arg(long)]
+        client: String,
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        resume_target: String,
+        #[arg(long)]
+        cwd: std::path::PathBuf,
+        #[arg(long)]
+        specs: std::path::PathBuf,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        permission_mode: Option<String>,
+    },
     /// Ask the daemon to exit (it restarts on the next hook event).
     StopDaemon {
         /// Wait for in-flight fork runs to finish first.
@@ -184,6 +202,31 @@ fn main() {
                 permission_mode,
             }),
         },
+        Command::FinalRun {
+            client,
+            session,
+            resume_target,
+            cwd,
+            specs,
+            model,
+            permission_mode,
+        } => {
+            let parsed: Vec<autofork_core::protocol::WakeFork> = std::fs::read_to_string(&specs)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+            let _ = std::fs::remove_file(&specs);
+            runner::run_final(
+                &paths,
+                &client,
+                &session,
+                &resume_target,
+                &cwd,
+                model.as_deref(),
+                permission_mode.as_deref(),
+                parsed,
+            );
+        }
         Command::StopDaemon { drain } => exit_on_err(stop_daemon(&paths, drain)),
     }
 }

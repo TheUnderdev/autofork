@@ -213,6 +213,15 @@ impl Daemon {
         std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude"))
     }
 
+    /// The user-level `.agents` dir (codex's native skills location; often a
+    /// symlink twin of `.claude` — discovery dedupes by canonical path).
+    pub fn agents_dir(&self) -> Option<PathBuf> {
+        if let Some(dir) = std::env::var_os("AUTOFORK_AGENTS_DIR") {
+            return Some(PathBuf::from(dir));
+        }
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".agents"))
+    }
+
     /// Effective config for a project.
     pub fn cfg_for(&self, project_root: Option<&Path>) -> Config {
         load_config_at(project_root, &self.paths.user_config()).0
@@ -680,6 +689,7 @@ impl Daemon {
             &session.cwd,
             Some(&self.user_forks_root()),
             self.claude_dir().as_deref(),
+            self.agents_dir().as_deref(),
         );
         let deadlines = if busy {
             Vec::new()
@@ -911,6 +921,26 @@ impl Daemon {
         let store = self.store.lock().unwrap();
         let _ = store.spool_report(session_id, fork, text, now());
         ResponseBody::Ack
+    }
+
+    /// `flush_on_close`: hand the caller every idle fork not yet fired this
+    /// pause, stamped, in execution order. Must run BEFORE the session-end
+    /// event (close purges the roster).
+    pub fn handle_take_final_runs(self: &Arc<Self>, session_id: &str) -> ResponseBody {
+        self.touch_busy();
+        let session = {
+            let store = self.store.lock().unwrap();
+            if store.is_fork_run_ref(session_id).unwrap_or(false) {
+                return ResponseBody::Due { forks: Vec::new() };
+            }
+            store.get_session(session_id).ok().flatten()
+        };
+        let Some(session) = session else {
+            return ResponseBody::Due { forks: Vec::new() };
+        };
+        ResponseBody::Due {
+            forks: crate::planner::build_final_runs(self, &session),
+        }
     }
 
     /// Take (and clear) the spooled reports for a session.

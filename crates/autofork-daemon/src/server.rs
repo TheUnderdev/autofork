@@ -151,6 +151,7 @@ async fn dispatch(daemon: &Arc<Daemon>, body: RequestBody) -> ResponseBody {
                 &cwd,
                 Some(&daemon.user_forks_root()),
                 daemon.claude_dir().as_deref(),
+                daemon.agents_dir().as_deref(),
             );
             let items = entries
                 .into_iter()
@@ -206,6 +207,7 @@ async fn dispatch(daemon: &Arc<Daemon>, body: RequestBody) -> ResponseBody {
             text,
         } => daemon.handle_spool_report(&session_id, &fork, &text),
         RequestBody::TakeReports { session_id } => daemon.handle_take_reports(&session_id),
+        RequestBody::TakeFinalRuns { session_id } => daemon.handle_take_final_runs(&session_id),
         RequestBody::Shutdown { drain } => {
             tracing::info!(drain, "shutdown requested");
             let daemon = daemon.clone();

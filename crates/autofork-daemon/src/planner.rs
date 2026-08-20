@@ -89,6 +89,7 @@ pub fn refresh_roster(daemon: &Arc<Daemon>, session_id: &str, cwd: &Path) {
         cwd,
         Some(&daemon.user_forks_root()),
         daemon.claude_dir().as_deref(),
+        daemon.agents_dir().as_deref(),
     );
     let store = daemon.store.lock().unwrap();
     let t = now();
@@ -274,6 +275,135 @@ pub fn reserve_fast_path(session: &SessionRow, selected: &mut Vec<SelectedFork>)
     }
 }
 
+/// `flush_on_close`: select every idle fork not yet fired this pause, stamp
+/// it, and return the WHOLE batch — roots and dependents — in execution
+/// order (`after`/priority topological), each spec's `after` filled with its
+/// report-piping predecessors. No `pending_deps` rows: the caller (a
+/// detached end-runner) executes the batch sequentially itself and pipes
+/// reports locally, since after the session closes there is no parked poll
+/// left to deliver releases through.
+pub fn build_final_runs(daemon: &Arc<Daemon>, session: &SessionRow) -> Vec<WakeFork> {
+    let cfg = daemon.cfg_for(Some(&session.project_root));
+    let defs = collect_roster_defs(daemon, session);
+    let deadlines =
+        autofork_core::moments::idle_deadlines(defs.iter(), cfg.default_idle_deadline_secs);
+    let moments: Vec<ForkMoment> = deadlines
+        .into_iter()
+        .map(|deadline_secs| ForkMoment::Idle { deadline_secs })
+        .collect();
+    let mut selected = select_forks(daemon, session, &cfg, &moments);
+    // Idle forks only (context/every never ride an Idle moment, but keep the
+    // guard explicit), and never a gate/chain goal loop — a goal fork at
+    // close would hold nothing and chain nowhere.
+    selected.retain(|s| is_idle_trigger(&s.trigger));
+    if selected.is_empty() {
+        return Vec::new();
+    }
+    tracing::info!(
+        session = %session.session_id,
+        forks = ?selected.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+        "flush-on-close: issuing final runs"
+    );
+
+    let deps = resolve_deps(&selected);
+    let eff = effective_priorities(&selected, &deps);
+    // Topological order: repeatedly emit the lowest-priority fork whose
+    // `after` predecessors (within the batch) are all emitted.
+    let n = selected.len();
+    let mut emitted: Vec<usize> = Vec::with_capacity(n);
+    let mut done = vec![false; n];
+    while emitted.len() < n {
+        let mut pick: Option<usize> = None;
+        for i in 0..n {
+            if done[i] || deps[i].iter().any(|&j| !done[j]) {
+                continue;
+            }
+            if pick.map(|p| eff[i] < eff[p]).unwrap_or(true) {
+                pick = Some(i);
+            }
+        }
+        // A dependency cycle can't happen (resolve_deps ignores unknown
+        // names), but never loop forever if it somehow does.
+        let Some(i) = pick else { break };
+        done[i] = true;
+        emitted.push(i);
+    }
+
+    let t = now();
+    {
+        let store = daemon.store.lock().unwrap();
+        for sel in &selected {
+            let _ = store.touch_fork_ran(&session.session_id, &sel.name, t);
+            let tags_joined = (!sel.tags.is_empty()).then(|| sel.tags.join(","));
+            let _ = store.record_issued_run(
+                &session.session_id,
+                &sel.name,
+                &sel.trigger,
+                tags_joined.as_deref(),
+                t,
+            );
+            if let Some(key) = &sel.latch_key {
+                let _ = store.try_latch_fire(&session.session_id, &sel.name, key, t);
+            }
+        }
+    }
+
+    let conv = conversation_id(session);
+    let root_str = session.project_root.to_string_lossy();
+    emitted
+        .into_iter()
+        .map(|i| {
+            let sel = &selected[i];
+            let report_preds: Vec<String> =
+                deps[i].iter().map(|&j| selected[j].name.clone()).collect();
+            let (model, model_fallbacks) = split_candidates(resolve_scoped(
+                &sel.model,
+                session.client.as_deref(),
+                &cfg.fork_models,
+            ));
+            let mode = resolve_scoped(&sel.mode, session.client.as_deref(), &cfg.fork_modes)
+                .into_iter()
+                .next();
+            let due = DueFork {
+                name: sel.name.clone(),
+                path: sel.path.to_string_lossy().into_owned(),
+                trigger: format!("{} (at close)", sel.trigger),
+                overlap: sel.overlap,
+                after: report_preds,
+                skill: autofork_core::discovery::skill_sibling(&sel.path)
+                    .map(|p| p.to_string_lossy().into_owned()),
+                chain: false, // no chain loops after close
+                model,
+                model_fallbacks,
+                mode,
+            };
+            build_wake_forks(&session.session_id, &conv, &root_str, &[due]).remove(0)
+        })
+        .collect()
+}
+
+/// The parsed defs of a session's rostered forks (for deadline collection).
+fn collect_roster_defs(
+    daemon: &Arc<Daemon>,
+    session: &SessionRow,
+) -> Vec<autofork_core::frontmatter::ForkDef> {
+    refresh_roster(daemon, &session.session_id, &session.cwd);
+    let roster = {
+        let store = daemon.store.lock().unwrap();
+        store.roster(&session.session_id).unwrap_or_default()
+    };
+    roster
+        .into_iter()
+        .filter_map(|entry| {
+            let content = std::fs::read_to_string(&entry.fork_path).ok()?;
+            match parse_fork(&entry.fork_name, &content) {
+                ForkParse::Fork(p) => Some(p.def),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
 /// A trigger label produced by an idle deadline (`idle` / `idle:<secs>`) —
 /// the only trigger family a gate holds back.
 fn is_idle_trigger(label: &str) -> bool {
@@ -368,17 +498,29 @@ fn parse_fork(name: &str, content: &str) -> ForkParse {
 
 /// Resolve a client-scoped frontmatter value for a session's client, falling
 /// back to the config table for that client. Sessions with no client tag are
-/// Claude Code.
+/// Claude Code. Returns the candidate list, first choice first (empty =
+/// inherit the session's).
 fn resolve_scoped(
     scoped: &autofork_core::frontmatter::ClientScoped,
     client: Option<&str>,
-    cfg_table: &std::collections::BTreeMap<String, String>,
-) -> Option<String> {
+    cfg_table: &std::collections::BTreeMap<String, Vec<String>>,
+) -> Vec<String> {
     let client = client.unwrap_or("claude-code");
-    scoped
-        .resolve(client)
-        .map(str::to_string)
-        .or_else(|| cfg_table.get(client).cloned())
+    let own = scoped.resolve(client);
+    if !own.is_empty() {
+        return own.to_vec();
+    }
+    cfg_table.get(client).cloned().unwrap_or_default()
+}
+
+/// Split a candidate list into (first, rest) for the DueFork shape.
+fn split_candidates(mut c: Vec<String>) -> (Option<String>, Vec<String>) {
+    if c.is_empty() {
+        (None, Vec::new())
+    } else {
+        let first = c.remove(0);
+        (Some(first), c)
+    }
 }
 
 /// The conversation id survives resume: a resumed leg gets a fresh session
@@ -465,6 +607,14 @@ pub fn build_wake(
             if sel.gate {
                 let _ = store.set_active_gate(&session.session_id, &sel.name);
             }
+            let (model, fallbacks) = split_candidates(resolve_scoped(
+                &sel.model,
+                session.client.as_deref(),
+                &cfg.fork_models,
+            ));
+            let mode = resolve_scoped(&sel.mode, session.client.as_deref(), &cfg.fork_modes)
+                .into_iter()
+                .next();
             if gate.is_empty() {
                 roots.push(DueFork {
                     name: sel.name.clone(),
@@ -475,8 +625,9 @@ pub fn build_wake(
                     skill: autofork_core::discovery::skill_sibling(&sel.path)
                         .map(|p| p.to_string_lossy().into_owned()),
                     chain: sel.chain,
-                    model: resolve_scoped(&sel.model, session.client.as_deref(), &cfg.fork_models),
-                    mode: resolve_scoped(&sel.mode, session.client.as_deref(), &cfg.fork_modes),
+                    model: model.clone(),
+                    model_fallbacks: fallbacks.clone(),
+                    mode: mode.clone(),
                 });
             } else {
                 let _ = store.insert_pending_dep(
@@ -560,6 +711,17 @@ pub fn release_due(daemon: &Arc<Daemon>, session: &SessionRow) -> Option<(String
         .iter()
         .map(|dep| {
             let def = def_of(dep);
+            let (model, model_fallbacks) = split_candidates(
+                def.as_ref()
+                    .map(|d| resolve_scoped(&d.model, session.client.as_deref(), &cfg.fork_models))
+                    .unwrap_or_default(),
+            );
+            let mode = def
+                .as_ref()
+                .map(|d| resolve_scoped(&d.mode, session.client.as_deref(), &cfg.fork_modes))
+                .unwrap_or_default()
+                .into_iter()
+                .next();
             DueFork {
                 name: dep.fork_name.clone(),
                 path: dep.fork_path.to_string_lossy().into_owned(),
@@ -571,12 +733,9 @@ pub fn release_due(daemon: &Arc<Daemon>, session: &SessionRow) -> Option<(String
                 skill: autofork_core::discovery::skill_sibling(&dep.fork_path)
                     .map(|p| p.to_string_lossy().into_owned()),
                 chain: def.as_ref().map(|d| d.chain).unwrap_or(false),
-                model: def.as_ref().and_then(|d| {
-                    resolve_scoped(&d.model, session.client.as_deref(), &cfg.fork_models)
-                }),
-                mode: def.as_ref().and_then(|d| {
-                    resolve_scoped(&d.mode, session.client.as_deref(), &cfg.fork_modes)
-                }),
+                model,
+                model_fallbacks,
+                mode,
             }
         })
         .collect();

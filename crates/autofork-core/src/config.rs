@@ -46,15 +46,16 @@ pub struct Config {
     /// explicit contract). 0 disables. Tripping it is loud (a warn log), never
     /// silent.
     pub runaway_limit: u64,
-    /// Default model per client for fork runs (`[fork_models]`, keyed by
-    /// `claude-code` / `opencode` / `codex`). A fork's own `model:` wins;
-    /// unset = the run inherits the session's model. The point: forks doing
+    /// Default model candidates per client for fork runs (`[fork_models]`,
+    /// keyed by `claude-code` / `opencode` / `codex`; each value a model id
+    /// or a fallback list tried in order). A fork's own `model:` wins; unset
+    /// = the run inherits the session's model. The point: forks doing
     /// routine consolidation don't need the parent's expensive model.
-    pub fork_models: BTreeMap<String, String>,
+    pub fork_models: BTreeMap<String, Vec<String>>,
     /// Default operation mode per client for fork runs (`[fork_modes]`):
     /// permission mode (claude-code headless runner), sandbox (codex), agent
     /// (opencode). A fork's own `mode:` wins.
-    pub fork_modes: BTreeMap<String, String>,
+    pub fork_modes: BTreeMap<String, Vec<String>>,
     /// How Claude Code fork runs execute. The default, `"headless"`, is the
     /// opencode-style quiet mode: the parked Stop hook runs
     /// `claude -p --fork-session` subprocesses itself and reports arrive
@@ -66,6 +67,12 @@ pub struct Config {
     /// the inherited history cache-cold, which cheap fork models
     /// (`[fork_models]`) make irrelevant.
     pub fork_runner: ForkRunner,
+    /// `flush_on_close = true`: when a session ends, every idle fork that
+    /// hadn't yet fired this pause runs immediately — executed by a detached
+    /// end-runner, so the closed session doesn't matter. Throttles, tag
+    /// filters and the runaway breaker still apply. Off by default: closing
+    /// a session then costs a burst of fork runs, which should be a choice.
+    pub flush_on_close: bool,
 }
 
 /// The Claude Code fork execution mode (see `Config::fork_runner`).
@@ -91,6 +98,7 @@ impl Default for Config {
             fork_models: BTreeMap::new(),
             fork_modes: BTreeMap::new(),
             fork_runner: ForkRunner::Headless,
+            flush_on_close: false,
         }
     }
 }
@@ -114,6 +122,7 @@ struct RawConfig {
     #[serde(default)]
     fork_modes: BTreeMap<String, toml::Value>,
     fork_runner: Option<toml::Value>,
+    flush_on_close: Option<toml::Value>,
     // ---- deprecated since v0.5: accepted, warned, ignored ----
     concurrency: Option<toml::Value>,
     fork_timeout: Option<toml::Value>,
@@ -191,25 +200,47 @@ fn apply_layer(cfg: &mut Config, raw: RawConfig, project_level: bool, warnings: 
             cfg.tag_throttles.insert(tag, secs);
         }
     }
-    // Per-key extend, same layering as tag_throttles.
-    for (client, v) in raw.fork_models {
-        match v.as_str() {
-            Some(s) if !s.trim().is_empty() => {
-                cfg.fork_models.insert(client, s.trim().to_string());
+    // Per-key extend, same layering as tag_throttles. Values are one id or a
+    // fallback list, tried in order.
+    let candidates = |v: &toml::Value| -> Option<Vec<String>> {
+        match v {
+            toml::Value::String(s) if !s.trim().is_empty() => Some(vec![s.trim().to_string()]),
+            toml::Value::Array(a) => {
+                let out: Vec<String> = a
+                    .iter()
+                    .filter_map(|e| e.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                (!out.is_empty() && out.len() == a.len()).then_some(out)
             }
-            _ => warnings.push(format!(
-                "'fork_models.{client}' must be a model id string, ignoring"
+            _ => None,
+        }
+    };
+    for (client, v) in raw.fork_models {
+        match candidates(&v) {
+            Some(c) => {
+                cfg.fork_models.insert(client, c);
+            }
+            None => warnings.push(format!(
+                "'fork_models.{client}' must be a model id or a list of them, ignoring"
             )),
         }
     }
     for (client, v) in raw.fork_modes {
-        match v.as_str() {
-            Some(s) if !s.trim().is_empty() => {
-                cfg.fork_modes.insert(client, s.trim().to_string());
+        match candidates(&v) {
+            Some(c) => {
+                cfg.fork_modes.insert(client, c);
             }
-            _ => warnings.push(format!(
-                "'fork_modes.{client}' must be a mode string, ignoring"
+            None => warnings.push(format!(
+                "'fork_modes.{client}' must be a mode or a list of them, ignoring"
             )),
+        }
+    }
+    if let Some(v) = &raw.flush_on_close {
+        match v {
+            toml::Value::Boolean(b) => cfg.flush_on_close = *b,
+            _ => warnings.push("'flush_on_close' must be true or false, ignoring".into()),
         }
     }
     if let Some(v) = &raw.fork_runner {

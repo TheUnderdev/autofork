@@ -166,6 +166,7 @@ impl Harness {
             .env("AUTOFORK_SOCKET", &self.socket)
             // Keep the developer's real ~/.claude out of test discovery.
             .env("AUTOFORK_CLAUDE_DIR", self.home.join("claude"))
+            .env("AUTOFORK_AGENTS_DIR", self.home.join("agents"))
             .env("RUST_LOG", "debug")
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -2522,4 +2523,89 @@ fn codex_poll_reserves_idle_zero_chain_forks_for_peek_due() {
     let rx = h.park_stop_wait(oc_event(&h, EventKind::Stop, "oc-goal"));
     let forks = wake_forks(rx.recv_timeout(Duration::from_secs(10)).unwrap());
     assert_eq!(forks[0].name, "goal");
+}
+
+#[test]
+fn take_final_runs_flushes_only_unrun_idle_forks_in_order() {
+    // flush_on_close: forks that already fired this pause stay fired; the
+    // rest come back stamped, topologically ordered, with report-piping
+    // `after` preds filled in. A second take returns nothing.
+    let mut h = Harness::new("1s", "0");
+    h.write_fork("early.md", "---\nfork: true\nrun_on:\n  - idle: 1s\n---\nE");
+    h.write_fork(
+        "journal.md",
+        "---\nfork: true\nrun_on:\n  - idle: 30m\n---\nJ",
+    );
+    h.write_fork(
+        "handover.md",
+        "---\nfork: true\nrun_on:\n  - idle: 30m\nafter: [journal]\n---\nH",
+    );
+    h.start_daemon();
+    assert_ack(h.send_event(h.event(EventKind::SessionStart, "cc-flush")));
+
+    // The 1s fork fires normally and is latched for this pause.
+    let rx = h.park_stop_wait(h.event(EventKind::Stop, "cc-flush"));
+    let forks = wake_forks(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert_eq!(forks.len(), 1);
+    assert_eq!(forks[0].name, "early");
+
+    // Close-time flush: only the unrun 30m forks, journal before its
+    // dependent, the dependent carrying the report-piping pred.
+    let ResponseBody::Due { forks } = h.request(RequestBody::TakeFinalRuns {
+        session_id: "cc-flush".into(),
+    }) else {
+        panic!("expected Due");
+    };
+    assert_eq!(
+        forks.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+        vec!["journal", "handover"]
+    );
+    assert!(forks[0].after.is_empty());
+    assert_eq!(forks[1].after, vec!["journal".to_string()]);
+    assert!(
+        forks[0].trigger.contains("at close"),
+        "{}",
+        forks[0].trigger
+    );
+
+    // Everything is stamped now: a second take is empty.
+    let ResponseBody::Due { forks } = h.request(RequestBody::TakeFinalRuns {
+        session_id: "cc-flush".into(),
+    }) else {
+        panic!("expected Due");
+    };
+    assert!(forks.is_empty(), "final runs must stamp what they hand out");
+}
+
+#[test]
+fn wake_forks_carry_model_fallback_lists() {
+    let mut h = Harness::new("1s", "0");
+    h.append_config("[fork_models]");
+    h.append_config("codex = [\"gpt-5.6-luna\", \"gpt-5.5\"]");
+    h.write_fork(
+        "journal.md",
+        "---\nfork: true\nrun_on: [idle]\nmodel:\n  opencode: [github-copilot/gemini-3.7-flash, anthropic/claude-haiku-4-5]\n---\nJ",
+    );
+    h.start_daemon();
+
+    // Frontmatter list on opencode.
+    assert_ack(h.send_event(oc_event(&h, EventKind::SessionStart, "oc-fb")));
+    let rx = h.park_stop_wait(oc_event(&h, EventKind::Stop, "oc-fb"));
+    let forks = wake_forks(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert_eq!(
+        forks[0].model.as_deref(),
+        Some("github-copilot/gemini-3.7-flash")
+    );
+    assert_eq!(
+        forks[0].model_fallbacks,
+        vec!["anthropic/claude-haiku-4-5".to_string()]
+    );
+
+    // Config array on codex.
+    let sid = "01a01f24-abcd-76c3-a00a-74ac3948e630";
+    assert_ack(h.send_event(cx_event(&h, EventKind::SessionStart, sid)));
+    let rx = h.park_stop_wait(cx_event(&h, EventKind::Stop, sid));
+    let forks = wake_forks(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert_eq!(forks[0].model.as_deref(), Some("gpt-5.6-luna"));
+    assert_eq!(forks[0].model_fallbacks, vec!["gpt-5.5".to_string()]);
 }

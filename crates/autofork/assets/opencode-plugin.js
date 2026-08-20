@@ -314,23 +314,36 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
         // them. Default is the parent's own (prompt-cache reuse needs an
         // identical request prefix); a fork's `model:`/`mode:` overrides win
         // — the daemon resolves them into the spec (model as
-        // "provider/model", mode as the agent name).
-        let runModel = parent.model;
-        if (spec.model) {
-          const i = spec.model.indexOf("/");
-          if (i > 0) {
-            runModel = { providerID: spec.model.slice(0, i), modelID: spec.model.slice(i + 1) };
+        // "provider/model" with optional fallbacks, mode as the agent name).
+        // A prompt that fails on one model candidate retries on the next.
+        const parseModel = (id) => {
+          const i = id.indexOf("/");
+          return i > 0 ? { providerID: id.slice(0, i), modelID: id.slice(i + 1) } : null;
+        };
+        const modelCandidates = spec.model
+          ? [spec.model, ...(spec.model_fallbacks ?? [])].map(parseModel).filter(Boolean)
+          : [parent.model];
+        if (modelCandidates.length === 0) modelCandidates.push(parent.model);
+        const runAgent = spec.mode ?? parent.agent;
+        let prompted = false;
+        let lastErr = null;
+        for (const runModel of modelCandidates) {
+          try {
+            await client.session.promptAsync({
+              path: { id: forked.id },
+              body: {
+                ...(runModel ? { model: runModel } : {}),
+                ...(runAgent ? { agent: runAgent } : {}),
+                parts: [{ type: "text", text: prompt }],
+              },
+            });
+            prompted = true;
+            break;
+          } catch (e) {
+            lastErr = e;
           }
         }
-        const runAgent = spec.mode ?? parent.agent;
-        await client.session.promptAsync({
-          path: { id: forked.id },
-          body: {
-            ...(runModel ? { model: runModel } : {}),
-            ...(runAgent ? { agent: runAgent } : {}),
-            parts: [{ type: "text", text: prompt }],
-          },
-        });
+        if (!prompted) throw lastErr ?? new Error("promptAsync failed on every model candidate");
       } catch {
         // A failed spawn is dropped; the daemon's throttles already stamped,
         // matching the Claude Code behavior for a wake the model fumbled. A
@@ -478,6 +491,33 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
           }
         }
         if (deleted === 0) break;
+      }
+      // Second pass: flush-on-close runs (`opencode run --fork` spawned by
+      // the end-runner after an instance died) carry opencode's own "Fork
+      // of …" auto-title, not ours — find them by the spawn-prompt
+      // fingerprint in their last user message, aged like the rest.
+      const page =
+        (await client.session.list({ query: { search: "Fork of", limit: 200 } }))?.data ?? [];
+      for (const info of page) {
+        if (info?.parentID) continue;
+        if ((info.time?.updated ?? Infinity) > cutoff) continue;
+        if (forkRuns.has(info.id)) continue;
+        try {
+          const msgs = (await client.session.messages({ path: { id: info.id } }))?.data ?? [];
+          let isOurs = false;
+          for (let i = msgs.length - 1; i >= 0; i--) {
+            if (msgs[i]?.info?.role !== "user") continue;
+            const text = (msgs[i].parts ?? [])
+              .filter((p) => p.type === "text")
+              .map((p) => p.text)
+              .join("\n");
+            isOurs = text.includes(SPAWN_CTX);
+            break;
+          }
+          if (isOurs) await client.session.delete({ path: { id: info.id } });
+        } catch {
+          // best-effort per session
+        }
       }
     })().catch(() => {});
   }

@@ -91,6 +91,7 @@ pub fn execute_wake(
             run_one(&paths, &session_id, &resume_target, &cwd, spec, &carried)
         });
         handles.push((name, h));
+        // (reports spool under the conversation id inside run_one)
     }
     for (name, h) in handles {
         if let Ok(Some(report)) = h.join() {
@@ -117,8 +118,57 @@ fn run_one(
             run_ref: run_ref.clone(),
         },
     );
+    let spool_key = resume_target.to_string();
 
     let prompt = format!("{}{}", spec.prompt, carried);
+    // Model candidates, tried in order: a failed run retries on the next one
+    // ("if the first option is not available, the next one is used"). No
+    // model at all = one inherit-the-default attempt.
+    let mut candidates: Vec<Option<String>> = Vec::new();
+    match &spec.model {
+        Some(m) => {
+            candidates.push(Some(m.clone()));
+            candidates.extend(spec.model_fallbacks.iter().cloned().map(Some));
+        }
+        None => candidates.push(None),
+    }
+    let mut status = "failed";
+    let mut report = String::new();
+    for (i, model) in candidates.iter().enumerate() {
+        let (st, rep) = run_attempt(
+            session_id,
+            resume_target,
+            cwd,
+            &spec,
+            &prompt,
+            model.as_deref(),
+        );
+        status = st;
+        report = rep;
+        if status == "completed" {
+            break;
+        }
+        if i + 1 < candidates.len() {
+            eprintln!(
+                "[headless] fork '{}' failed on model {:?}; retrying on {:?}",
+                spec.name,
+                model,
+                candidates[i + 1]
+            );
+        }
+    }
+    finish_run(paths, session_id, &spool_key, spec, run_ref, status, report)
+}
+
+/// One `claude -p` attempt on one model candidate.
+fn run_attempt(
+    session_id: &str,
+    resume_target: &str,
+    cwd: &std::path::Path,
+    spec: &WakeFork,
+    prompt: &str,
+    model: Option<&str>,
+) -> (&'static str, String) {
     let mut cmd = Command::new(claude_bin());
     cmd.arg("-p")
         .arg("--resume")
@@ -126,7 +176,7 @@ fn run_one(
         .arg("--fork-session")
         .arg("--output-format")
         .arg("json");
-    if let Some(m) = &spec.model {
+    if let Some(m) = model {
         cmd.arg("--model").arg(m);
     }
     // Headless runs cannot answer permission prompts; without a mode a write
@@ -134,7 +184,7 @@ fn run_one(
     // mode that lets typical consolidation forks do their file work.
     cmd.arg("--permission-mode")
         .arg(spec.mode.as_deref().unwrap_or("acceptEdits"));
-    cmd.arg(&prompt)
+    cmd.arg(prompt)
         .current_dir(cwd)
         .env("AUTOFORK_FORK", "1")
         .env("AUTOFORK_SESSION_ID", session_id)
@@ -144,7 +194,7 @@ fn run_one(
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
 
-    let (status, mut report) = match cmd.spawn() {
+    match cmd.spawn() {
         Ok(mut child) => {
             let mut out = String::new();
             let deadline = std::time::Instant::now() + fork_timeout();
@@ -185,8 +235,19 @@ fn run_one(
             eprintln!("[headless] fork '{}' spawn failed: {e}", spec.name);
             ("failed", String::new())
         }
-    };
+    }
+}
 
+/// Sentinel handling, spooling and the completion frame for a finished run.
+fn finish_run(
+    paths: &Paths,
+    session_id: &str,
+    spool_key: &str,
+    spec: WakeFork,
+    run_ref: String,
+    status: &'static str,
+    mut report: String,
+) -> Option<String> {
     report = report.trim().to_string();
     let chain_next =
         status == "completed" && spec.chain && autofork_core::wake::wants_continue(&report);
@@ -210,10 +271,13 @@ fn run_one(
             }
         )
     };
+    // Spool under the CONVERSATION id: it survives session resume (a resumed
+    // leg gets a fresh session id), so a report finished after you left still
+    // reaches you when you pick the conversation back up.
     send(
         paths,
         RequestBody::SpoolReport {
-            session_id: session_id.to_string(),
+            session_id: spool_key.to_string(),
             fork: spec.name.clone(),
             text: report_block(&spec.name, &spec.trigger, status, &body),
         },
@@ -235,4 +299,194 @@ fn send(paths: &Paths, body: RequestBody) {
     if let Ok(mut client) = Client::connect_or_spawn(paths, Duration::from_secs(5)) {
         let _ = client.request(body);
     }
+}
+
+/// Serialize the final-run specs and spawn the detached end-runner process.
+/// Called from SessionEnd hooks BEFORE the session-end event (which purges
+/// the roster). Fire-and-forget: the runner outlives both the hook and the
+/// closing session.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_final_runner(
+    paths: &Paths,
+    client: &str,
+    session_id: &str,
+    resume_target: &str,
+    cwd: &std::path::Path,
+    parent_model: Option<&str>,
+    parent_permission_mode: Option<&str>,
+    specs: &[WakeFork],
+) {
+    if specs.is_empty() {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let tmp = paths.base.join("tmp");
+    let _ = std::fs::create_dir_all(&tmp);
+    let specs_path = tmp.join(format!("final-{}.json", crate::codex::uuid_v4()));
+    let Ok(json) = serde_json::to_string(specs) else {
+        return;
+    };
+    if std::fs::write(&specs_path, json).is_err() {
+        return;
+    }
+    let log_path = paths.base.join("logs/final-run.log");
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Ok(log) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    else {
+        return;
+    };
+    let Ok(log2) = log.try_clone() else { return };
+    let mut cmd = Command::new(exe);
+    cmd.arg("final-run")
+        .arg("--client")
+        .arg(client)
+        .arg("--session")
+        .arg(session_id)
+        .arg("--resume-target")
+        .arg(resume_target)
+        .arg("--cwd")
+        .arg(cwd)
+        .arg("--specs")
+        .arg(&specs_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log2));
+    if let Some(m) = parent_model {
+        cmd.arg("--model").arg(m);
+    }
+    if let Some(m) = parent_permission_mode {
+        cmd.arg("--permission-mode").arg(m);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+    let _ = cmd.spawn();
+}
+
+/// `autofork final-run`: execute a flush-on-close batch after the parent
+/// session died. Specs arrive topologically ordered from the daemon; runs are
+/// sequential so `after` reports pipe locally.
+#[allow(clippy::too_many_arguments)]
+pub fn run_final(
+    paths: &Paths,
+    client: &str,
+    session_id: &str,
+    resume_target: &str,
+    cwd: &std::path::Path,
+    parent_model: Option<&str>,
+    parent_permission_mode: Option<&str>,
+    specs: Vec<WakeFork>,
+) {
+    let mut reports: HashMap<String, String> = HashMap::new();
+    for spec in specs {
+        let mut carried = String::new();
+        for pred in &spec.after {
+            if let Some(r) = reports.get(pred) {
+                carried.push_str(&format!(
+                    "\n\nThis fork runs after '{pred}'; its report follows so you can build on it:\n{r}"
+                ));
+            }
+        }
+        let name = spec.name.clone();
+        let report = match client {
+            "codex" => crate::codex::run_final_codex(
+                paths,
+                session_id,
+                cwd,
+                parent_model,
+                parent_permission_mode,
+                spec,
+                &carried,
+            ),
+            "opencode" => run_final_opencode(paths, session_id, cwd, spec, &carried),
+            _ => run_one(paths, session_id, resume_target, cwd, spec, &carried),
+        };
+        if let Some(r) = report {
+            reports.insert(name, r);
+        }
+    }
+}
+
+/// One flush-on-close opencode run: `opencode run -s <id> --fork` continues a
+/// fork of the closed session headlessly (verified byte-identical request
+/// prefixes). The report has nowhere to go (no live instance, no queue), so
+/// only the run's WORK matters; leftover fork sessions are cleaned by the
+/// plugin's startup sweep, which also matches the spawn-prompt fingerprint.
+fn run_final_opencode(
+    paths: &Paths,
+    session_id: &str,
+    cwd: &std::path::Path,
+    spec: WakeFork,
+    carried: &str,
+) -> Option<String> {
+    let run_ref = format!("fr:{}", crate::codex::uuid_v4());
+    send(
+        paths,
+        RequestBody::ForkSpawned {
+            session_id: session_id.to_string(),
+            fork: spec.name.clone(),
+            run_ref: run_ref.clone(),
+        },
+    );
+    let prompt = format!("{}{}", spec.prompt, carried);
+    let mut candidates: Vec<Option<String>> = Vec::new();
+    match &spec.model {
+        Some(m) => {
+            candidates.push(Some(m.clone()));
+            candidates.extend(spec.model_fallbacks.iter().cloned().map(Some));
+        }
+        None => candidates.push(None),
+    }
+    let opencode_bin =
+        std::env::var("AUTOFORK_OPENCODE_BIN").unwrap_or_else(|_| "opencode".to_string());
+    let mut status = "failed";
+    let mut report = String::new();
+    for model in &candidates {
+        let mut cmd = Command::new(&opencode_bin);
+        cmd.arg("run").arg("-s").arg(session_id).arg("--fork");
+        if let Some(m) = model {
+            cmd.arg("-m").arg(m);
+        }
+        cmd.arg(&prompt)
+            .current_dir(cwd)
+            .env("AUTOFORK_FORK", "1")
+            .env("AUTOFORK_SESSION_ID", session_id)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let out = cmd.output();
+        match out {
+            Ok(o) if o.status.success() => {
+                status = "completed";
+                report = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                break;
+            }
+            _ => status = "failed",
+        }
+    }
+    send(
+        paths,
+        RequestBody::ForkCompleted {
+            session_id: session_id.to_string(),
+            fork: spec.name.clone(),
+            run_ref,
+            status: status.to_string(),
+            cont: None,
+        },
+    );
+    (status == "completed" && !report.is_empty()).then_some(report)
 }

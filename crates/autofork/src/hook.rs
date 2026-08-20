@@ -111,9 +111,17 @@ fn run_hook_inner(kind: HookKind) -> Option<()> {
             };
             // Headless-runner reports spooled since the last prompt are
             // delivered here, silently, as additionalContext (invisible in
-            // the transcript). Old daemons answer Error — treated as none.
+            // the transcript). Spooled under the CONVERSATION id (transcript
+            // stem) so a report finished after a session closed still reaches
+            // its resumed leg. Old daemons answer Error — treated as none.
+            let spool_key = input
+                .transcript_path
+                .as_deref()
+                .and_then(|p| p.file_stem())
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| input.session_id.clone());
             if let Ok(ResponseBody::Reports { blocks }) = client.request(RequestBody::TakeReports {
-                session_id: input.session_id.clone(),
+                session_id: spool_key,
             }) {
                 if !blocks.is_empty() {
                     print_additional_context(&blocks);
@@ -198,6 +206,38 @@ fn run_hook_inner(kind: HookKind) -> Option<()> {
         }
         HookKind::SessionEnd => {
             let mut client = Client::connect_or_spawn(&paths, Duration::from_secs(5)).ok()?;
+            // `flush_on_close`: hand every idle fork that hadn't yet fired
+            // this pause to a detached end-runner BEFORE the close purges the
+            // roster.
+            let flush = {
+                let (cfg, _w) =
+                    autofork_core::config::load_config_at(Some(&root), &paths.user_config());
+                cfg.flush_on_close
+            };
+            if flush {
+                if let Ok(ResponseBody::Due { forks }) =
+                    client.request(RequestBody::TakeFinalRuns {
+                        session_id: input.session_id.clone(),
+                    })
+                {
+                    let resume_target = input
+                        .transcript_path
+                        .as_deref()
+                        .and_then(|p| p.file_stem())
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| input.session_id.clone());
+                    crate::runner::spawn_final_runner(
+                        &paths,
+                        "claude-code",
+                        &input.session_id,
+                        &resume_target,
+                        &cwd,
+                        None,
+                        None,
+                        &forks,
+                    );
+                }
+            }
             let _ = client.request(RequestBody::Event(event(EventKind::SessionEnd)));
         }
     }
