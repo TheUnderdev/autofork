@@ -441,7 +441,7 @@ disable_tags = ["noisy"]       # default tag blocklist (see below)
 ci = "1h"
 
 fork_runner = "headless"       # Claude Code execution mode; "subagent" opts into cache-preserving visible forks
-flush_on_close = false         # run the pause's unrun idle forks when a session ends (see below)
+flush_on_close = true          # run the pause's unrun idle forks when a session ends (see below)
 
 [fork_models]                  # default fork model per client; a fork's own `model:` wins
 "claude-code" = ["sonnet", "haiku"]   # one id, or a fallback list tried in order
@@ -482,15 +482,15 @@ than a quiet conversation.
 
 ### Flush on close
 
-`flush_on_close = true` closes the classic gap "I quit before the idle deadline, so the
-consolidation forks never ran": when a session ends, every idle fork that hadn't yet fired this
-pause runs **immediately**, executed by a detached end-runner that outlives the session — a
+`flush_on_close` — ON by default since v0.21 — closes the classic gap "I quit before the idle
+deadline, so the consolidation forks never ran": when a session ends, every idle fork that hadn't
+yet fired this pause runs **immediately**, executed by a detached end-runner that outlives the session — a
 `claude -p --fork-session`, `codex exec fork`, or `opencode run --fork` of the on-disk
 conversation, in `after`/priority order with report piping. Throttles, tag filters and the
 runaway breaker still apply, so a fork that already ran recently stays quiet. Reports go where
 they can: Claude Code spools them under the conversation (delivered if you resume it), codex
-queues them into the thread (same), opencode runs are work-only. Off by default — with it on,
-closing a session costs a burst of fork runs, which should be a choice you made.
+spools them the same way, opencode runs are work-only. `flush_on_close = false` opts out if
+close-time runs aren't wanted.
 
 ### Tag filtering
 

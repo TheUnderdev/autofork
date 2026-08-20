@@ -339,6 +339,33 @@ fn waiter_tombstone(paths: &Paths, session_id: &str) -> PathBuf {
 /// duplicate spawns exit immediately, so this is safe to call from every hook.
 fn spawn_waiter(paths: &Paths, input: &CxInput, cwd: &Path) {
     let Some(rollout) = input.transcript_path.as_ref() else {
+        // Without the rollout path there is nothing to tail — and without a
+        // waiter, NO timed idle fork ever fires for this session (only the
+        // Stop hook's idle:0 fast path works). Leave a trace where the
+        // missing waiter would have logged, so the failure is diagnosable.
+        let log_path = paths.base.join("logs/codex-waiter.log");
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            use std::io::Write as _;
+            let _ = writeln!(
+                f,
+                "[codex-waiter] NOT spawned for session {}: the {} hook payload carried no \
+                 transcript_path (codex version too old, or hooks misconfigured) — timed idle \
+                 forks will not fire for this session",
+                input.session_id,
+                if input.prompt.is_some() {
+                    "prompt"
+                } else {
+                    "session-start"
+                },
+            );
+        }
         return;
     };
     let Ok(exe) = std::env::current_exe() else {

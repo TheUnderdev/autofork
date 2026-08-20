@@ -74,11 +74,12 @@ pub struct Config {
     /// the inherited history cache-cold, which cheap fork models
     /// (`[fork_models]`) make irrelevant.
     pub fork_runner: ForkRunner,
-    /// `flush_on_close = true`: when a session ends, every idle fork that
-    /// hadn't yet fired this pause runs immediately — executed by a detached
-    /// end-runner, so the closed session doesn't matter. Throttles, tag
-    /// filters and the runaway breaker still apply. Off by default: closing
-    /// a session then costs a burst of fork runs, which should be a choice.
+    /// When a session ends, every idle fork that hadn't yet fired this pause
+    /// runs immediately — executed by a detached end-runner, so the closed
+    /// session doesn't matter. Throttles, tag filters and the runaway
+    /// breaker still apply. ON by default since v0.21 (closing a session
+    /// finishes its pause's work instead of losing it); set
+    /// `flush_on_close = false` to opt out.
     pub flush_on_close: bool,
 }
 
@@ -131,7 +132,7 @@ impl Default for Config {
             fork_models: BTreeMap::new(),
             fork_modes: BTreeMap::new(),
             fork_runner: ForkRunner::Headless,
-            flush_on_close: false,
+            flush_on_close: true,
         }
     }
 }
