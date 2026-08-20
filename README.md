@@ -262,8 +262,12 @@ report carries, on a line of its own, the marker
 <<autofork:continue>>
 ```
 
-autofork runs the fork again once the parent session has digested the report. The decision is made
-**per run, by the fork itself** — a run that omits the line ends the chain. That turns a fork into
+autofork runs the fork again once the parent session has digested the report. Detection is
+maximally liberal (since v0.19.1): the marker counts **anywhere in the report** — its own line,
+mid-sentence, decorated, wherever — because models routinely ignore "a line of its own" and a
+missed sentinel silently ends a goal loop. The decision is made **per run, by the fork itself** —
+a run whose report contains no occurrence of the marker ends the chain, so a settling fork must
+omit it entirely. That turns a fork into
 an evaluator loop: check the state of some goal against the parent's current conversation, report
 what's missing, and come back after the parent has seen the report; each iteration forks the
 parent's *current* context, prior reports included.

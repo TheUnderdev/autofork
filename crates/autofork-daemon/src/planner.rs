@@ -359,11 +359,17 @@ pub fn build_final_runs(daemon: &Arc<Daemon>, session: &SessionRow) -> Vec<WakeF
             let (model, model_fallbacks) = split_candidates(resolve_scoped(
                 &sel.model,
                 session.client.as_deref(),
+                session.model.as_deref(),
                 &cfg.fork_models,
             ));
-            let mode = resolve_scoped(&sel.mode, session.client.as_deref(), &cfg.fork_modes)
-                .into_iter()
-                .next();
+            let mode = resolve_scoped(
+                &sel.mode,
+                session.client.as_deref(),
+                session.model.as_deref(),
+                &cfg.fork_modes,
+            )
+            .into_iter()
+            .next();
             let due = DueFork {
                 name: sel.name.clone(),
                 path: sel.path.to_string_lossy().into_owned(),
@@ -497,20 +503,25 @@ fn parse_fork(name: &str, content: &str) -> ForkParse {
 }
 
 /// Resolve a client-scoped frontmatter value for a session's client, falling
-/// back to the config table for that client. Sessions with no client tag are
-/// Claude Code. Returns the candidate list, first choice first (empty =
-/// inherit the session's).
+/// back to the config table for that client — itself resolved against the
+/// session's own (parent) model when the client's policy is keyed by parent
+/// model. Sessions with no client tag are Claude Code. Returns the candidate
+/// list, first choice first (empty = inherit the session's).
 fn resolve_scoped(
     scoped: &autofork_core::frontmatter::ClientScoped,
     client: Option<&str>,
-    cfg_table: &std::collections::BTreeMap<String, Vec<String>>,
+    parent_model: Option<&str>,
+    cfg_table: &std::collections::BTreeMap<String, autofork_core::config::ModelPolicy>,
 ) -> Vec<String> {
     let client = client.unwrap_or("claude-code");
     let own = scoped.resolve(client);
     if !own.is_empty() {
         return own.to_vec();
     }
-    cfg_table.get(client).cloned().unwrap_or_default()
+    cfg_table
+        .get(client)
+        .map(|policy| policy.resolve(parent_model).to_vec())
+        .unwrap_or_default()
 }
 
 /// Split a candidate list into (first, rest) for the DueFork shape.
@@ -610,11 +621,17 @@ pub fn build_wake(
             let (model, fallbacks) = split_candidates(resolve_scoped(
                 &sel.model,
                 session.client.as_deref(),
+                session.model.as_deref(),
                 &cfg.fork_models,
             ));
-            let mode = resolve_scoped(&sel.mode, session.client.as_deref(), &cfg.fork_modes)
-                .into_iter()
-                .next();
+            let mode = resolve_scoped(
+                &sel.mode,
+                session.client.as_deref(),
+                session.model.as_deref(),
+                &cfg.fork_modes,
+            )
+            .into_iter()
+            .next();
             if gate.is_empty() {
                 roots.push(DueFork {
                     name: sel.name.clone(),
@@ -713,12 +730,26 @@ pub fn release_due(daemon: &Arc<Daemon>, session: &SessionRow) -> Option<(String
             let def = def_of(dep);
             let (model, model_fallbacks) = split_candidates(
                 def.as_ref()
-                    .map(|d| resolve_scoped(&d.model, session.client.as_deref(), &cfg.fork_models))
+                    .map(|d| {
+                        resolve_scoped(
+                            &d.model,
+                            session.client.as_deref(),
+                            session.model.as_deref(),
+                            &cfg.fork_models,
+                        )
+                    })
                     .unwrap_or_default(),
             );
             let mode = def
                 .as_ref()
-                .map(|d| resolve_scoped(&d.mode, session.client.as_deref(), &cfg.fork_modes))
+                .map(|d| {
+                    resolve_scoped(
+                        &d.mode,
+                        session.client.as_deref(),
+                        session.model.as_deref(),
+                        &cfg.fork_modes,
+                    )
+                })
                 .unwrap_or_default()
                 .into_iter()
                 .next();

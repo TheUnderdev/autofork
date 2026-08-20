@@ -149,7 +149,9 @@ mod tests {
         .unwrap();
         assert!(n.continue_requested);
 
-        // Sentinel quoted mid-report (with a quoted closer, even): not a request.
+        // Since v0.19.1 the sentinel matches anywhere — a mid-report mention
+        // (even with a quoted closer) requests a run: chain forks are told
+        // any occurrence counts, so their reports omit it entirely to settle.
         let n = parse_task_notification(
             "<task-notification>\n<tool-use-id>toolu_1</tool-use-id>\n\
              <status>completed</status>\n\
@@ -157,7 +159,7 @@ mod tests {
              </task-notification>",
         )
         .unwrap();
-        assert!(!n.continue_requested);
+        assert!(n.continue_requested);
 
         // No result tag at all.
         let n = parse_task_notification(

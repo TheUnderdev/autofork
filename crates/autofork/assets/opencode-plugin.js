@@ -69,16 +69,24 @@ function isSentinelLine(line) {
   return DECORATION.test(t.slice(0, i)) && DECORATION.test(t.slice(i + CONTINUE.length));
 }
 
-// Whether some line of the report is the sentinel alone (decoration
-// tolerated, any position — a missed sentinel silently ends a goal loop).
+// Whether the sentinel appears ANYWHERE in the report (invisible chars
+// deleted first). Maximally liberal since v0.19.1 — models append the
+// sentinel to prose lines despite being taught "a line of its own", and a
+// missed sentinel silently ends a goal loop (keep in sync with
+// wants_continue in wake.rs).
 function wantsContinue(text) {
-  return text.split("\n").some(isSentinelLine);
+  return text.replace(INVISIBLE, "").includes(CONTINUE);
 }
 
 function stripContinue(text) {
+  if (!wantsContinue(text)) return text;
   return text
     .split("\n")
     .filter((l) => !isSentinelLine(l))
+    .map((l) => {
+      const cleaned = l.replace(INVISIBLE, "");
+      return cleaned.includes(CONTINUE) ? cleaned.split(CONTINUE).join("").trimEnd() : l;
+    })
     .join("\n")
     .trimEnd();
 }

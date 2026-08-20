@@ -224,22 +224,36 @@ fn run_hook_inner(kind: CxHookKind) -> Option<()> {
                 } else {
                     format!("(the fork run {})", outcome.status)
                 };
-                blocks.push(report_block(
-                    &spec.name,
-                    &spec.trigger,
-                    outcome.status,
-                    &body,
-                ));
+                let block = report_block(&spec.name, &spec.trigger, outcome.status, &body);
+                if outcome.cont {
+                    // The chain continues: block the stop and inject the
+                    // report — the parent reacts in the same turn and the
+                    // loop advances.
+                    blocks.push(block);
+                } else {
+                    // Settled (goal met) or failed: the loop is over, so
+                    // hold NOTHING — no blocking, no injected continuation
+                    // the parent would have to acknowledge. The report goes
+                    // through the normal queue like any other fork's.
+                    if let Err(e) = queue_message(&input.session_id, &block) {
+                        eprintln!(
+                            "[codex-stop] fork '{}' settle report queue failed: {e}",
+                            spec.name
+                        );
+                    }
+                }
                 cleanup_run(&outcome);
             }
-            // Block the stop and inject the report(s): codex records the
-            // reason as a continuation prompt and the model reacts in the
-            // same turn. This is the entire delivery — no queue involved.
-            let out = serde_json::json!({
-                "decision": "block",
-                "reason": blocks.join("\n\n"),
-            });
-            println!("{out}");
+            if !blocks.is_empty() {
+                // Codex records the reason as a continuation prompt and the
+                // model reacts in the same turn. This is the entire delivery
+                // for a continuing chain — no queue involved.
+                let out = serde_json::json!({
+                    "decision": "block",
+                    "reason": blocks.join("\n\n"),
+                });
+                println!("{out}");
+            }
         }
         CxHookKind::SessionEnd => {
             // `flush_on_close`: take the unrun idle forks before the close
@@ -768,6 +782,8 @@ fn run_fork_inner(
 pub(crate) struct RunOutcome {
     pub status: &'static str,
     pub report: String,
+    /// The run asked for another (chain sentinel found and honored).
+    pub cont: bool,
     /// The fork thread id of a native run — the session to delete on cleanup.
     fork_thread: Option<String>,
     /// The throwaway `CODEX_HOME` of a cache-copy run, removed on cleanup.
@@ -961,6 +977,7 @@ fn attempt_run(
             return RunOutcome {
                 status: "failed",
                 report: String::new(),
+                cont: false,
                 fork_thread: None,
                 copy_home,
             };
@@ -1037,6 +1054,7 @@ fn attempt_run(
     RunOutcome {
         status,
         report,
+        cont: chain_next,
         fork_thread,
         copy_home,
     }
@@ -1336,16 +1354,22 @@ pub(crate) fn uuid_v4() -> String {
 /// Queue a message into a codex thread — codex's own durable queue, drained
 /// by the owning process when the thread next goes idle.
 fn queue_message(thread_id: &str, text: &str) -> Result<(), String> {
-    let mut srv = AppServer::start()?;
-    srv.request(
+    let mut srv = AppServer::start().inspect_err(|e| {
+        debug_log(&format!("queue_message app-server start failed: {e}"));
+    })?;
+    let res = srv.request(
         "thread/queue/add",
         serde_json::json!({
             "threadId": thread_id,
             "clientUserMessageId": uuid_v4(),
             "input": [{"type": "text", "text": text, "textElements": []}],
         }),
-    )?;
-    Ok(())
+    );
+    match &res {
+        Ok(_) => debug_log(&format!("queue_message ok thread={thread_id}")),
+        Err(e) => debug_log(&format!("queue_message failed thread={thread_id}: {e}")),
+    }
+    res.map(|_| ())
 }
 
 // ---------------------------------------------------------------------------

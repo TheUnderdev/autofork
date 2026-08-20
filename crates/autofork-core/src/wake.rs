@@ -80,19 +80,25 @@ fn is_sentinel_line(line: &str) -> bool {
     deco(&t[..start]) && deco(&t[start + CONTINUE_SENTINEL.len()..])
 }
 
-/// Whether a fork report requests another run: some line of the report is the
-/// [`CONTINUE_SENTINEL`] alone (markdown decoration around it tolerated).
-/// Deliberately liberal — the spawn prompt teaches the strict form (a final
-/// line that is exactly the sentinel), but models decorate it, and a missed
-/// sentinel silently ends a goal loop. A line with any other word on it does
-/// not chain, so prose quoting the sentinel mid-sentence stays inert.
+/// Whether a fork report requests another run: the [`CONTINUE_SENTINEL`]
+/// appears ANYWHERE in the report (after deleting the invisible format
+/// characters models sprinkle into output). Maximally liberal since v0.19.1:
+/// the spawn prompt teaches "a line of its own", but models regularly append
+/// the sentinel to a prose line instead, and the line-scoped matcher then
+/// read a continuing report as a settle — silently ending the goal loop
+/// (field incident: a count-to-10 goal died at 2). The lost property —
+/// prose *quoting* the sentinel stays inert — is deliberately traded away;
+/// only chain forks' own reports are ever scanned, and their prompt now
+/// warns that any occurrence counts.
 pub fn wants_continue(report: &str) -> bool {
-    report.lines().any(is_sentinel_line)
+    let cleaned: String = report.chars().filter(|c| !is_invisible(*c)).collect();
+    cleaned.contains(CONTINUE_SENTINEL)
 }
 
-/// `report` with its sentinel line(s) removed (for clients that inject the
-/// report themselves and can hand the parent a clean text). Returns the
-/// report unchanged when it carries no sentinel line.
+/// `report` with the sentinel removed (for clients that inject the report
+/// themselves and can hand the parent a clean text): sentinel-only lines are
+/// dropped whole (decoration and all), in-prose occurrences are excised in
+/// place. Returns the report unchanged when it carries no sentinel.
 pub fn strip_continue(report: &str) -> String {
     if !wants_continue(report) {
         return report.to_string();
@@ -100,6 +106,17 @@ pub fn strip_continue(report: &str) -> String {
     report
         .lines()
         .filter(|l| !is_sentinel_line(l))
+        .map(|l| {
+            let cleaned: String = l.chars().filter(|c| !is_invisible(*c)).collect();
+            if cleaned.contains(CONTINUE_SENTINEL) {
+                cleaned
+                    .replace(CONTINUE_SENTINEL, "")
+                    .trim_end()
+                    .to_string()
+            } else {
+                l.to_string()
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n")
         .trim_end()
@@ -188,7 +205,9 @@ fn spawn_prompt(
             " This fork may chain: if its goal needs another run after this one, end your \
              report with a final line that is exactly {CONTINUE_SENTINEL} — autofork will \
              run this fork again once the parent session has seen your report. When the \
-             goal is met (or nothing needs doing), do not emit that line; the chain ends."
+             goal is met (or nothing needs doing), your report must not contain that \
+             marker AT ALL — any occurrence anywhere in the report (even mid-sentence) \
+             counts as a request to run again; the chain ends only when the report omits it."
         )
     } else {
         String::new()
@@ -432,13 +451,16 @@ mod tests {
         assert!(wants_continue(
             "progress\n<<autofork:continue>>\nwill resume next run"
         ));
-        // Mid-sentence mention (quoting the docs) does not chain: other
-        // words share the line.
-        assert!(!wants_continue(
-            "the sentinel is <<autofork:continue>>, which I did not emit\ndone"
+        // Since v0.19.1 the sentinel matches ANYWHERE — even mid-sentence
+        // (field incident: a model appended it to a prose line, the
+        // line-scoped matcher read the report as a settle, and the goal
+        // loop died). Prose quoting the sentinel now chains too — the
+        // documented trade; chain forks are told any occurrence counts.
+        assert!(wants_continue(
+            "Resume by sending `2` only, then stop again as requested. <<autofork:continue>>"
         ));
-        assert!(!wants_continue(
-            "end with <<autofork:continue>> to chain\ndone"
+        assert!(wants_continue(
+            "the sentinel is <<autofork:continue>>, which I did not emit\ndone"
         ));
         assert!(!wants_continue("plain report"));
         assert!(!wants_continue(""));
@@ -462,8 +484,11 @@ mod tests {
             strip_continue("progress\n<<autofork:continue>>\nresuming"),
             "progress\nresuming"
         );
-        let quoted = "the sentinel is <<autofork:continue>>, not emitted\ndone";
-        assert_eq!(strip_continue(quoted), quoted);
+        // An in-prose sentinel is excised in place, the rest of the line kept.
+        assert_eq!(
+            strip_continue("Resume by sending `2` only. <<autofork:continue>>\ndone"),
+            "Resume by sending `2` only.\ndone"
+        );
         assert_eq!(strip_continue(CONTINUE_SENTINEL), "");
     }
 

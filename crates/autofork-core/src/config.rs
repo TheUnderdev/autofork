@@ -47,15 +47,22 @@ pub struct Config {
     /// silent.
     pub runaway_limit: u64,
     /// Default model candidates per client for fork runs (`[fork_models]`,
-    /// keyed by `claude-code` / `opencode` / `codex`; each value a model id
-    /// or a fallback list tried in order). A fork's own `model:` wins; unset
-    /// = the run inherits the session's model. The point: forks doing
-    /// routine consolidation don't need the parent's expensive model.
-    pub fork_models: BTreeMap<String, Vec<String>>,
+    /// keyed by `claude-code` / `opencode` / `codex`). Each client's value is
+    /// either a flat model id / fallback list (used regardless of the
+    /// session's own model) or a table keyed by the session's PARENT model
+    /// id, with `default` as the catch-all for a parent model with no
+    /// explicit entry — mirrors a fork's own client-scoped `model:`
+    /// frontmatter one level deeper. A fork's own `model:` wins over both
+    /// forms; unset = the run inherits the session's model. The point:
+    /// forks doing routine consolidation don't need the parent's expensive
+    /// model, and a big/expensive parent can point at a different (cheaper)
+    /// fork model than a small/cheap parent does.
+    pub fork_models: BTreeMap<String, ModelPolicy>,
     /// Default operation mode per client for fork runs (`[fork_modes]`):
     /// permission mode (claude-code headless runner), sandbox (codex), agent
-    /// (opencode). A fork's own `mode:` wins.
-    pub fork_modes: BTreeMap<String, Vec<String>>,
+    /// (opencode). A fork's own `mode:` wins. Same flat-or-by-parent-model
+    /// shape as `fork_models`.
+    pub fork_modes: BTreeMap<String, ModelPolicy>,
     /// How Claude Code fork runs execute. The default, `"headless"`, is the
     /// opencode-style quiet mode: the parked Stop hook runs
     /// `claude -p --fork-session` subprocesses itself and reports arrive
@@ -81,6 +88,32 @@ pub enum ForkRunner {
     #[default]
     Headless,
     Subagent,
+}
+
+/// One client's `[fork_models]` / `[fork_modes]` entry: either a flat
+/// candidate list (applies whatever the session's own model is) or a table
+/// keyed by the session's parent model id, with `default` as the catch-all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelPolicy {
+    Flat(Vec<String>),
+    ByParentModel {
+        by_model: BTreeMap<String, Vec<String>>,
+        default: Vec<String>,
+    },
+}
+
+impl ModelPolicy {
+    /// The candidate list for a session whose own model is `parent_model`
+    /// (`None` when the client never reported one).
+    pub fn resolve(&self, parent_model: Option<&str>) -> &[String] {
+        match self {
+            ModelPolicy::Flat(v) => v,
+            ModelPolicy::ByParentModel { by_model, default } => parent_model
+                .and_then(|m| by_model.get(m))
+                .map(Vec::as_slice)
+                .unwrap_or(default),
+        }
+    }
 }
 
 impl Default for Config {
@@ -139,6 +172,50 @@ struct RawConfig {
 
 /// Keys ignored at project level (global-only concerns).
 const GLOBAL_ONLY: &[&str] = &["quiet_period"];
+
+/// A model id or a fallback list tried in order.
+fn parse_candidates(v: &toml::Value) -> Option<Vec<String>> {
+    match v {
+        toml::Value::String(s) if !s.trim().is_empty() => Some(vec![s.trim().to_string()]),
+        toml::Value::Array(a) => {
+            let out: Vec<String> = a
+                .iter()
+                .filter_map(|e| e.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            (!out.is_empty() && out.len() == a.len()).then_some(out)
+        }
+        _ => None,
+    }
+}
+
+/// A `[fork_models.<client>]` / `[fork_modes.<client>]` entry: a flat
+/// scalar/list, or a table keyed by parent model id (`default` = the
+/// catch-all). A table with no valid entries at all is rejected; individual
+/// bad entries within an otherwise-valid table are skipped (best effort,
+/// since one typo shouldn't drop the whole client's policy).
+fn parse_model_policy(v: &toml::Value) -> Option<ModelPolicy> {
+    match v {
+        toml::Value::Table(t) => {
+            let mut by_model = BTreeMap::new();
+            let mut default = Vec::new();
+            for (key, val) in t {
+                let Some(c) = parse_candidates(val) else {
+                    continue;
+                };
+                if key == "default" {
+                    default = c;
+                } else {
+                    by_model.insert(key.clone(), c);
+                }
+            }
+            (!by_model.is_empty() || !default.is_empty())
+                .then_some(ModelPolicy::ByParentModel { by_model, default })
+        }
+        other => parse_candidates(other).map(ModelPolicy::Flat),
+    }
+}
 
 fn parse_toml_duration(v: &toml::Value, key: &str, warnings: &mut Vec<String>) -> Option<u64> {
     let parsed = match v {
@@ -200,40 +277,28 @@ fn apply_layer(cfg: &mut Config, raw: RawConfig, project_level: bool, warnings: 
             cfg.tag_throttles.insert(tag, secs);
         }
     }
-    // Per-key extend, same layering as tag_throttles. Values are one id or a
-    // fallback list, tried in order.
-    let candidates = |v: &toml::Value| -> Option<Vec<String>> {
-        match v {
-            toml::Value::String(s) if !s.trim().is_empty() => Some(vec![s.trim().to_string()]),
-            toml::Value::Array(a) => {
-                let out: Vec<String> = a
-                    .iter()
-                    .filter_map(|e| e.as_str())
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                (!out.is_empty() && out.len() == a.len()).then_some(out)
-            }
-            _ => None,
-        }
-    };
+    // Per-key extend, same layering as tag_throttles. Each client's value is
+    // one id, a fallback list, or a table keyed by parent model id (with
+    // `default` as the catch-all) — see `ModelPolicy`.
     for (client, v) in raw.fork_models {
-        match candidates(&v) {
-            Some(c) => {
-                cfg.fork_models.insert(client, c);
+        match parse_model_policy(&v) {
+            Some(p) => {
+                cfg.fork_models.insert(client, p);
             }
             None => warnings.push(format!(
-                "'fork_models.{client}' must be a model id or a list of them, ignoring"
+                "'fork_models.{client}' must be a model id, a list of them, or a table keyed \
+                 by parent model id, ignoring"
             )),
         }
     }
     for (client, v) in raw.fork_modes {
-        match candidates(&v) {
-            Some(c) => {
-                cfg.fork_modes.insert(client, c);
+        match parse_model_policy(&v) {
+            Some(p) => {
+                cfg.fork_modes.insert(client, p);
             }
             None => warnings.push(format!(
-                "'fork_modes.{client}' must be a mode or a list of them, ignoring"
+                "'fork_modes.{client}' must be a mode, a list of them, or a table keyed by \
+                 parent model id, ignoring"
             )),
         }
     }
