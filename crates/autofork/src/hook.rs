@@ -3,8 +3,10 @@
 //!
 //! The Stop hook (`stop-wait`) is an asyncRewake command: it long-polls the
 //! daemon and, when forks come due, prints the wake payload to stderr and
-//! exits 2 so Claude Code wakes the idle session. Every other path — and every
-//! failure — exits 0 so a hook never breaks or wedges the session.
+//! exits 2 so Claude Code wakes the idle session. In headless mode the same
+//! exit-2 wake carries a continuing chain fork's report (the goal fast path —
+//! see `runner`). Every other path — and every failure — exits 0 so a hook
+//! never breaks or wedges the session.
 
 use crate::client::{spawn_daemon_detached, Client};
 use autofork_core::config::Paths;
@@ -162,10 +164,13 @@ fn run_hook_inner(kind: HookKind) -> Option<()> {
             };
             if headless {
                 // The quiet mode: this parked hook process consumes wakes
-                // itself — no exit 2, no wake turn, no visible spawns. It
-                // runs each fork as a `claude -p --fork-session` subprocess,
-                // spools the report for silent delivery at the next prompt,
-                // and re-parks until the wait is cancelled by activity.
+                // itself — no wake turn, no visible spawns. It runs each fork
+                // as a `claude -p --fork-session` subprocess, spools the
+                // report for silent delivery at the next prompt, and re-parks
+                // until the wait is cancelled by activity. The one exception
+                // is a chain run that asks to continue: that report IS the
+                // parent's next instruction, so it wakes the session (exit 2)
+                // like subagent mode does.
                 // Fork children run the PARENT Claude Code process's exact
                 // binary (captured now — the poll outlives reparenting).
                 crate::runner::set_harness_bin(crate::client::parent_exe());
@@ -179,7 +184,7 @@ fn run_hook_inner(kind: HookKind) -> Option<()> {
                 while let Ok(ResponseBody::Wake { forks, .. }) =
                     client.stop_wait(event(EventKind::Stop))
                 {
-                    crate::runner::execute_wake(
+                    let wake_blocks = crate::runner::execute_wake(
                         &paths,
                         &input.session_id,
                         &resume_target,
@@ -187,6 +192,20 @@ fn run_hook_inner(kind: HookKind) -> Option<()> {
                         forks.unwrap_or_default(),
                         &mut reports,
                     );
+                    if !wake_blocks.is_empty() {
+                        // The goal fast path: a chain run asked to continue,
+                        // so its report is work for the parent — deliver it by
+                        // waking the session (stderr + exit 2) instead of
+                        // re-parking and letting it rot in the spool until the
+                        // user's next prompt. The daemon has already re-armed
+                        // the fork; it fires again at the Stop that ends the
+                        // turn this wake starts, which is the loop.
+                        eprintln!(
+                            "{}",
+                            autofork_core::wake::build_chain_wake_payload(&wake_blocks)
+                        );
+                        std::process::exit(2);
+                    }
                     // Re-park on a fresh connection (the wake resolved this
                     // one's poll); a brief pause guards against a misbehaving
                     // daemon spinning us.

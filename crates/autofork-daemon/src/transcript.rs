@@ -4,7 +4,9 @@
 //! - the context gauge (input + cache tokens of the last assistant message);
 //! - fork spawns — Agent `tool_use` blocks with `subagent_type: "fork"`, with
 //!   the fork's name read from the spawn-prompt fingerprint when present;
-//! - the `agentId` a spawn's `tool_result` reports (the background task id);
+//! - background-task launches — the id a `tool_result` reports for an async
+//!   Agent (`agentId`) or a `run_in_background` Bash command, which is what
+//!   tells the daemon the session stopped *waiting* rather than idle;
 //! - task-notification entries (background-task completions).
 //!
 //! Parsing is deliberately defensive — the transcript format is internal to
@@ -25,7 +27,10 @@ pub struct Delta {
     pub model: Option<String>,
     /// Fork spawns: (tool_use_id, fork name when the fingerprint parsed).
     pub spawns: Vec<(String, Option<String>)>,
-    /// Background task ids reported by tool results: (tool_use_id, task_id).
+    /// Background task launches reported by tool results: (tool_use_id,
+    /// task_id). Covers async Agent spawns (fork subagents included) and
+    /// `run_in_background` Bash commands — every tool use whose work outlives
+    /// the turn that started it.
     pub task_ids: Vec<(String, String)>,
     /// Task-notification envelopes seen in user entries.
     pub notifications: Vec<TaskNotification>,
@@ -133,7 +138,7 @@ fn scan_user(value: &serde_json::Value, delta: &mut Delta) {
                             continue;
                         };
                         for text in result_texts(block) {
-                            if let Some(task_id) = agent_id_from_result(text) {
+                            if let Some(task_id) = background_task_id(text) {
                                 delta
                                     .task_ids
                                     .push((tool_use_id.to_string(), task_id.to_string()));
@@ -181,9 +186,17 @@ fn fork_name_from_prompt(prompt: &str) -> Option<String> {
     }
 }
 
-/// The `agentId: <id>` a background Agent launch reports in its tool result.
-fn agent_id_from_result(text: &str) -> Option<&str> {
-    let start = text.find("agentId: ")? + "agentId: ".len();
+/// The background task id a tool result announces, if any: `agentId: <id>`
+/// for an async Agent launch, `…running in background with ID: <id>` for a
+/// `run_in_background` Bash command. A synchronous tool use announces
+/// neither — which is exactly the discriminator: a result with an id here
+/// means work that outlives the turn.
+fn background_task_id(text: &str) -> Option<&str> {
+    const PREFIXES: [&str; 2] = ["agentId: ", "running in background with ID: "];
+    let (start, _) = PREFIXES
+        .iter()
+        .filter_map(|p| text.find(p).map(|i| (i + p.len(), i)))
+        .min_by_key(|(_, i)| *i)?;
     let rest = &text[start..];
     let end = rest
         .find(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
@@ -292,5 +305,28 @@ mod tests {
         assert_eq!(n.tool_use_id.as_deref(), Some("toolu_fork"));
         assert_eq!(n.task_id.as_deref(), Some("a1b2c3"));
         assert_eq!(n.status.as_deref(), Some("completed"));
+    }
+    #[test]
+    fn background_bash_launch_is_a_tracked_task() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut f = tmp.reopen().unwrap();
+        // A `run_in_background` Bash result announces a shell id...
+        writeln!(
+            f,
+            r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"toolu_bash","content":"Command running in background with ID: b42911nqs. Output is being written to: /tmp/b42911nqs.output."}}]}}}}"#
+        )
+        .unwrap();
+        // ...a synchronous one announces nothing, and must not be tracked.
+        writeln!(
+            f,
+            r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"toolu_sync","content":"total 4\ndrwxr-xr-x"}}]}}}}"#
+        )
+        .unwrap();
+
+        let d = read_delta(tmp.path(), 0).unwrap();
+        assert_eq!(
+            d.task_ids,
+            vec![("toolu_bash".to_string(), "b42911nqs".to_string())]
+        );
     }
 }

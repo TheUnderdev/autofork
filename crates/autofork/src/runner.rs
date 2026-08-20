@@ -11,6 +11,12 @@
 //! `additionalContext` on the next prompt. Nothing surfaces in the
 //! conversation itself.
 //!
+//! One report cannot wait for your next prompt: a `chain: true` run that asks
+//! to continue. There the parent is the worker and the loop only advances once
+//! it has seen the report, so that block is handed back to the parked hook,
+//! which wakes the session with it (exit 2) instead of re-parking — the goal
+//! fast path, the async twin of codex's synchronous block-and-inject.
+//!
 //! Trade-off, stated where it matters: a `-p` fork of an *interactive*
 //! session cannot reuse its prompt cache (mode-stamped request prefixes), so
 //! each run pays a cold read of the inherited history. That is the price of
@@ -62,13 +68,23 @@ fn fork_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
-/// The report block spooled for silent delivery. Carries the wake marker so
-/// nothing downstream mistakes it for user text.
-fn report_block(fork: &str, trigger: &str, status: &str, body: &str) -> String {
-    format!("---\nsource: autofork\nfork: {fork} (trigger: {trigger}) — {status}\n---\n{body}")
+/// What one finished fork run leaves behind for its caller.
+#[derive(Default)]
+pub struct RunResult {
+    /// The (sentinel-stripped) report, when the run completed with one —
+    /// carried to `after` dependents and to the next chain iteration.
+    pub report: Option<String>,
+    /// The report block to wake the parent session with: set when a chain run
+    /// asked to continue and the caller can deliver it (the parked Stop hook,
+    /// which exits 2 with it). `None` means the report was spooled for silent
+    /// delivery instead.
+    pub wake_block: Option<String>,
 }
 
-/// Consume one wake's forks headlessly, then return so the caller re-parks.
+/// Consume one wake's forks headlessly. Returns the report blocks of any
+/// chain runs that asked to continue: the caller (the parked Stop hook) wakes
+/// the parent session with them instead of re-parking, so a goal loop
+/// advances on its own. Empty = nothing to wake for, re-park.
 /// `resume_target` is the conversation id (transcript stem — the identity
 /// that survives session resume; a resumed leg's own id is not resumable).
 /// `reports` accumulates the last report per fork across the runner process's
@@ -80,7 +96,7 @@ pub fn execute_wake(
     cwd: &std::path::Path,
     forks: Vec<WakeFork>,
     reports: &mut HashMap<String, String>,
-) {
+) -> Vec<String> {
     // Batch-parallel like the opencode plugin: each fork run is independent
     // (the daemon holds `after` dependents until predecessors complete).
     let mut handles = Vec::new();
@@ -89,9 +105,9 @@ pub fn execute_wake(
         let session_id = session_id.to_string();
         let resume_target = resume_target.to_string();
         let cwd = cwd.to_path_buf();
-        // `after` predecessors' reports — and, for a chain re-run, the fork's
-        // own previous report (the parent never saw it mid-chain, so the next
-        // iteration must carry it itself).
+        // `after` predecessors' reports — and, as a belt for a chain re-run
+        // whose report never reached the parent (a wake that couldn't be
+        // delivered), the fork's own previous report.
         let mut carried = String::new();
         for pred in &spec.after {
             if let Some(r) = reports.get(pred) {
@@ -109,19 +125,35 @@ pub fn execute_wake(
         }
         let name = spec.name.clone();
         let h = std::thread::spawn(move || {
-            run_one(&paths, &session_id, &resume_target, &cwd, spec, &carried)
+            run_one(
+                &paths,
+                &session_id,
+                &resume_target,
+                &cwd,
+                spec,
+                &carried,
+                true,
+            )
         });
         handles.push((name, h));
         // (reports spool under the conversation id inside run_one)
     }
+    let mut wake_blocks = Vec::new();
     for (name, h) in handles {
-        if let Ok(Some(report)) = h.join() {
+        let Ok(result) = h.join() else { continue };
+        if let Some(report) = result.report {
             reports.insert(name, report);
         }
+        if let Some(block) = result.wake_block {
+            wake_blocks.push(block);
+        }
     }
+    wake_blocks
 }
 
-/// Run one fork; returns the (sentinel-stripped) report on completion.
+/// Run one fork. `can_wake` says whether the caller can deliver a continuing
+/// chain report by waking the parent (true for the parked Stop hook; false
+/// for the end-runner, whose session is already gone).
 fn run_one(
     paths: &Paths,
     session_id: &str,
@@ -129,7 +161,8 @@ fn run_one(
     cwd: &std::path::Path,
     spec: WakeFork,
     carried: &str,
-) -> Option<String> {
+    can_wake: bool,
+) -> RunResult {
     let run_ref = format!("hl:{}", crate::codex::uuid_v4());
     send(
         paths,
@@ -178,7 +211,9 @@ fn run_one(
             );
         }
     }
-    finish_run(paths, session_id, &spool_key, spec, run_ref, status, report)
+    finish_run(
+        paths, session_id, &spool_key, spec, run_ref, status, report, can_wake,
+    )
 }
 
 /// One `claude -p` attempt on one model candidate.
@@ -272,7 +307,8 @@ fn run_attempt(
     }
 }
 
-/// Sentinel handling, spooling and the completion frame for a finished run.
+/// Sentinel handling, delivery and the completion frame for a finished run.
+#[allow(clippy::too_many_arguments)]
 fn finish_run(
     paths: &Paths,
     session_id: &str,
@@ -281,7 +317,8 @@ fn finish_run(
     run_ref: String,
     status: &'static str,
     mut report: String,
-) -> Option<String> {
+    can_wake: bool,
+) -> RunResult {
     report = report.trim().to_string();
     let chain_next =
         status == "completed" && spec.chain && autofork_core::wake::wants_continue(&report);
@@ -305,17 +342,26 @@ fn finish_run(
             }
         )
     };
-    // Spool under the CONVERSATION id: it survives session resume (a resumed
-    // leg gets a fresh session id), so a report finished after you left still
-    // reaches you when you pick the conversation back up.
-    send(
-        paths,
-        RequestBody::SpoolReport {
-            session_id: spool_key.to_string(),
-            fork: spec.name.clone(),
-            text: report_block(&spec.name, &spec.trigger, status, &body),
-        },
-    );
+    let block = autofork_core::wake::report_block(&spec.name, &spec.trigger, status, &body);
+    // A continuing chain report is the goal loop's handoff: the parent is the
+    // worker, and the loop only advances once it has SEEN the report. So it
+    // goes back to the caller, which wakes the session with it, instead of
+    // waiting silently in the spool for the user's next prompt. Everything
+    // else — settled chains included — spools under the CONVERSATION id,
+    // which survives session resume (a resumed leg gets a fresh session id),
+    // so a report finished after you left still reaches you when you pick the
+    // conversation back up.
+    let wake_block = (chain_next && can_wake).then(|| block.clone());
+    if wake_block.is_none() {
+        send(
+            paths,
+            RequestBody::SpoolReport {
+                session_id: spool_key.to_string(),
+                fork: spec.name.clone(),
+                text: block,
+            },
+        );
+    }
     send(
         paths,
         RequestBody::ForkCompleted {
@@ -326,7 +372,10 @@ fn finish_run(
             cont: chain_next.then_some(true),
         },
     );
-    (status == "completed" && !report.is_empty()).then_some(report)
+    RunResult {
+        report: (status == "completed" && !report.is_empty()).then_some(report),
+        wake_block,
+    }
 }
 
 fn send(paths: &Paths, body: RequestBody) {
@@ -451,7 +500,9 @@ pub fn run_final(
                 &carried,
             ),
             "opencode" => run_final_opencode(paths, session_id, cwd, spec, &carried),
-            _ => run_one(paths, session_id, resume_target, cwd, spec, &carried),
+            // No parent left to wake: a continuing chain report spools for
+            // the conversation's next leg like any other.
+            _ => run_one(paths, session_id, resume_target, cwd, spec, &carried, false).report,
         };
         if let Some(r) = report {
             reports.insert(name, r);

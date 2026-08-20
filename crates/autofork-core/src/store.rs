@@ -20,7 +20,7 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
-const SCHEMA_VERSION: i32 = 10;
+const SCHEMA_VERSION: i32 = 11;
 
 /// Split a comma-joined tag column back into a list (trimmed, empties
 /// dropped). `NULL` (unset) stays `None`.
@@ -324,6 +324,26 @@ impl Store {
                  COMMIT;",
             )?;
         }
+        if version < 11 {
+            // Background work the session started and is waiting on — a
+            // `run_in_background` Bash command, a background subagent — keyed
+            // by the launching tool use. autofork's OWN fork spawns are
+            // deliberately not recorded here (they live in `fork_spawns` and
+            // have their own overlap/after/gate machinery): a session is not
+            // "busy" because autofork is forking it.
+            conn.execute_batch(
+                "BEGIN;
+                 CREATE TABLE IF NOT EXISTS bg_tasks (
+                   session_id  TEXT NOT NULL,
+                   tool_use_id TEXT NOT NULL,
+                   task_id     TEXT,
+                   started_at  INTEGER NOT NULL,
+                   terminal_at INTEGER,
+                   PRIMARY KEY (session_id, tool_use_id)
+                 );
+                 COMMIT;",
+            )?;
+        }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(Self { conn })
     }
@@ -599,7 +619,13 @@ impl Store {
              WHERE session_id = ?1 AND status = 'open'",
             params![session_id],
         )?;
-        for table in ["fork_roster", "fork_fires", "fork_spawns", "pending_deps"] {
+        for table in [
+            "fork_roster",
+            "fork_fires",
+            "fork_spawns",
+            "pending_deps",
+            "bg_tasks",
+        ] {
             tx.execute(
                 &format!("DELETE FROM {table} WHERE session_id = ?1"),
                 params![session_id],
@@ -870,6 +896,65 @@ impl Store {
             )
             .optional()
             .map(|v| v.flatten())
+    }
+
+    // ---- background tasks the session is waiting on ----
+
+    /// Record background work the session launched (a `run_in_background`
+    /// Bash command, a background subagent), keyed by the launching tool use.
+    /// Idempotent, and a no-op for one of autofork's own fork spawns — those
+    /// must never make the session look busy to its own scheduler.
+    pub fn record_bg_task(
+        &self,
+        session_id: &str,
+        tool_use_id: &str,
+        task_id: &str,
+        now: i64,
+    ) -> rusqlite::Result<()> {
+        if self.is_fork_spawn(session_id, Some(tool_use_id), None)? {
+            return Ok(());
+        }
+        self.conn.execute(
+            "INSERT INTO bg_tasks (session_id, tool_use_id, task_id, started_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(session_id, tool_use_id)
+               DO UPDATE SET task_id = COALESCE(bg_tasks.task_id, ?3)",
+            params![session_id, tool_use_id, task_id, now],
+        )?;
+        Ok(())
+    }
+
+    /// Mark background work finished, matching by tool-use id or task id (a
+    /// completion notification carries both). Returns whether a pending row
+    /// was flipped.
+    pub fn mark_bg_task_terminal(
+        &self,
+        session_id: &str,
+        tool_use_id: Option<&str>,
+        task_id: Option<&str>,
+        now: i64,
+    ) -> rusqlite::Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE bg_tasks SET terminal_at = ?4
+             WHERE session_id = ?1 AND terminal_at IS NULL
+               AND ((?2 IS NOT NULL AND tool_use_id = ?2)
+                 OR (?3 IS NOT NULL AND task_id = ?3))",
+            params![session_id, tool_use_id, task_id, now],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// How many background tasks the session is still waiting on. Tasks
+    /// started before `not_before` are ignored — the timeout that keeps work
+    /// the daemon never sees finish (a server left running, a notification
+    /// lost to a resume) from silencing the session's idle forks forever.
+    pub fn pending_bg_tasks(&self, session_id: &str, not_before: i64) -> rusqlite::Result<i64> {
+        self.conn.query_row(
+            "SELECT COUNT(*) FROM bg_tasks
+             WHERE session_id = ?1 AND terminal_at IS NULL AND started_at >= ?2",
+            params![session_id, not_before],
+            |r| r.get(0),
+        )
     }
 
     /// Release a chaining fork's once-per-pause idle latch so it can fire
@@ -1537,5 +1622,53 @@ mod tests {
         let row = s.get_session("a").unwrap().unwrap();
         assert_eq!(row.cwd, PathBuf::from("/home/proj"));
         assert_eq!(row.last_activity, 200);
+    }
+    #[test]
+    fn background_tasks_hold_until_terminal_or_stale() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_session(
+            "a",
+            Path::new("/p"),
+            Path::new("/p"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        assert_eq!(s.pending_bg_tasks("a", 0).unwrap(), 0);
+
+        s.record_bg_task("a", "toolu_bash", "bg1", 100).unwrap();
+        assert_eq!(s.pending_bg_tasks("a", 0).unwrap(), 1);
+        // Idempotent; a second sighting doesn't double-count.
+        s.record_bg_task("a", "toolu_bash", "bg1", 105).unwrap();
+        assert_eq!(s.pending_bg_tasks("a", 0).unwrap(), 1);
+
+        // autofork's own fork spawn is background work to the client, but
+        // never to autofork's own scheduler.
+        s.record_spawn("a", "toolu_fork", Some("journal"), 100)
+            .unwrap();
+        s.record_bg_task("a", "toolu_fork", "a1", 100).unwrap();
+        assert_eq!(s.pending_bg_tasks("a", 0).unwrap(), 1);
+
+        // A task older than the window stops holding.
+        assert_eq!(s.pending_bg_tasks("a", 101).unwrap(), 0);
+
+        // Matching by task id alone works (notifications carry both).
+        assert!(s
+            .mark_bg_task_terminal("a", None, Some("bg1"), 200)
+            .unwrap());
+        assert_eq!(s.pending_bg_tasks("a", 0).unwrap(), 0);
+        // Already terminal: no second transition.
+        assert!(!s
+            .mark_bg_task_terminal("a", Some("toolu_bash"), None, 201)
+            .unwrap());
+
+        // Closing the session purges them.
+        s.record_bg_task("a", "toolu_two", "bg2", 300).unwrap();
+        s.close_session("a").unwrap();
+        assert_eq!(s.pending_bg_tasks("a", 0).unwrap(), 0);
     }
 }

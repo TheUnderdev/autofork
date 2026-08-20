@@ -64,13 +64,6 @@ const TAIL_INTERVAL: Duration = Duration::from_millis(500);
 /// `AUTOFORK_CODEX_FORK_TIMEOUT_SECS`.
 const FORK_TIMEOUT_SECS: u64 = 1800;
 
-/// Report block header injected into the parent (keep the marker in sync with
-/// `WAKE_MARKER` in wake.rs — the prompt-submit sniff keys on it, so the
-/// queue-drained report turn is classified non-waking).
-fn report_block(fork: &str, trigger: &str, status: &str, body: &str) -> String {
-    format!("---\nsource: autofork\nfork: {fork} (trigger: {trigger}) — {status}\n---\n{body}")
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum CxHookKind {
     /// Codex `SessionStart` hook: register the session, spawn the waiter.
@@ -246,7 +239,12 @@ fn run_hook_inner(kind: CxHookKind) -> Option<()> {
                 } else {
                     format!("(the fork run {})", outcome.status)
                 };
-                let block = report_block(&spec.name, &spec.trigger, outcome.status, &body);
+                let block = autofork_core::wake::report_block(
+                    &spec.name,
+                    &spec.trigger,
+                    outcome.status,
+                    &body,
+                );
                 if outcome.cont {
                     // The chain continues: block the stop and inject the
                     // report — the parent reacts in the same turn and the
@@ -839,7 +837,7 @@ fn run_fork_inner(
             }
         )
     };
-    let block = report_block(&spec.name, &spec.trigger, outcome.status, &body);
+    let block = autofork_core::wake::report_block(&spec.name, &spec.trigger, outcome.status, &body);
     spool_report(paths, session, &spec.name, &block);
     cleanup_run(&outcome);
 }
@@ -1284,7 +1282,8 @@ pub(crate) fn run_final_codex(
         } else {
             outcome.report.clone()
         };
-        let block = report_block(&spec.name, &spec.trigger, outcome.status, &body);
+        let block =
+            autofork_core::wake::report_block(&spec.name, &spec.trigger, outcome.status, &body);
         // Codex session ids survive resume, so the spool reaches the session
         // if it is ever picked back up.
         spool_report(paths, session, &spec.name, &block);
@@ -1921,7 +1920,7 @@ mod tests {
 
     #[test]
     fn report_block_carries_the_wake_marker() {
-        let b = report_block("journal", "idle:600", "completed", "did things");
+        let b = autofork_core::wake::report_block("journal", "idle:600", "completed", "did things");
         assert!(b.contains(autofork_core::wake::WAKE_MARKER));
         assert!(b.contains("journal"));
     }

@@ -589,10 +589,6 @@ impl Daemon {
         // A new poll parking proves the session is alive.
         self.clear_pending_close(&ev.session_id);
         let t = now();
-        // A busy poll (opencode parks one mid-run so `every:`/context
-        // triggers can fire without a pause) must not start a pause or arm
-        // idle deadlines — the session is still working.
-        let busy = ev.busy.unwrap_or(false);
         let enable_tags = ev.enable_tags.as_ref().map(|v| v.join(","));
         let disable_tags = ev.disable_tags.as_ref().map(|v| v.join(","));
         let newly_opened = {
@@ -613,11 +609,6 @@ impl Daemon {
             let _ = store.set_last_activity(&ev.session_id, t);
             if let Some(w) = ev.context_window {
                 let _ = store.set_context_window(&ev.session_id, w);
-            }
-            // The first Stop of a pause sets the baseline; a wake-turn's own
-            // Stop keeps the existing one, so idle deadlines don't reset.
-            if !busy {
-                let _ = store.set_pause_started_at_if_unset(&ev.session_id, t);
             }
             newly
         };
@@ -640,6 +631,29 @@ impl Daemon {
             self.ingest_transcript(&ev)
         };
         let cfg = self.cfg_for(Some(&ev.project_root));
+
+        // A busy poll must not start a pause or arm idle deadlines — the
+        // session isn't pausing, it's working. Two ways to be busy: the
+        // client says so (opencode parks a poll mid-run so `every:`/context
+        // triggers can still fire), or the session stopped while waiting on
+        // background work it started — a `run_in_background` command, a
+        // background subagent. The second case is a *stop*, so Claude Code
+        // would otherwise call it idle; the idle clock instead starts when
+        // the last of that work clears (`background_hold`).
+        let busy = ev.busy.unwrap_or_else(|| {
+            let waiting = self.waiting_on_background(&ev.session_id, &cfg, t);
+            if waiting {
+                tracing::info!(session = %ev.session_id,
+                    "stop with background work still running: not idle yet");
+            }
+            waiting
+        });
+        // The first Stop of a pause sets the baseline; a wake-turn's own Stop
+        // keeps the existing one, so idle deadlines don't reset.
+        if !busy {
+            let store = self.store.lock().unwrap();
+            let _ = store.set_pause_started_at_if_unset(&ev.session_id, t);
+        }
 
         // Register this wait so PromptSubmit / SessionEnd can cancel it. A
         // stale wait for the same session (if any) is cancelled by the insert.
@@ -1086,6 +1100,25 @@ impl Daemon {
         }
     }
 
+    /// Whether the session is waiting on background work it started rather
+    /// than being genuinely idle: a `run_in_background` Bash command or a
+    /// background subagent that hasn't reported completion yet. autofork's
+    /// own fork spawns never count (a session isn't busy because autofork is
+    /// forking it), and a task older than `background_hold_timeout` stops
+    /// counting so work whose completion the daemon never sees can't silence
+    /// the session's idle forks for good.
+    fn waiting_on_background(&self, session_id: &str, cfg: &Config, t: i64) -> bool {
+        if !cfg.background_hold {
+            return false;
+        }
+        let not_before = match cfg.background_hold_timeout_secs {
+            0 => 0,
+            secs => t - secs as i64,
+        };
+        let store = self.store.lock().unwrap();
+        store.pending_bg_tasks(session_id, not_before).unwrap_or(0) > 0
+    }
+
     /// Read the transcript delta (updating the stored offset): refresh the
     /// context gauge, record fork spawns and their task ids, and mark spawns
     /// terminal on completion notifications. Returns the session's best-known
@@ -1117,6 +1150,11 @@ impl Daemon {
                     }
                     for (tool_use_id, task_id) in &delta.task_ids {
                         let _ = store.set_spawn_task_id(&ev.session_id, tool_use_id, task_id);
+                        // Background work the session itself started (a
+                        // `run_in_background` command, a background subagent):
+                        // it keeps the session out of the idle state until it
+                        // finishes. Own fork spawns are filtered inside.
+                        let _ = store.record_bg_task(&ev.session_id, tool_use_id, task_id, t);
                     }
                     for n in &delta.notifications {
                         let Some(status) = n
@@ -1126,6 +1164,16 @@ impl Daemon {
                         else {
                             continue;
                         };
+                        if let Ok(true) = store.mark_bg_task_terminal(
+                            &ev.session_id,
+                            n.tool_use_id.as_deref(),
+                            n.task_id.as_deref(),
+                            t,
+                        ) {
+                            tracing::debug!(session = %ev.session_id, status,
+                                tool_use_id = ?n.tool_use_id,
+                                "background task finished; idle clock can start");
+                        }
                         if let Ok((true, transitioned)) = store.mark_spawn_terminal(
                             &ev.session_id,
                             n.tool_use_id.as_deref(),

@@ -81,6 +81,19 @@ pub struct Config {
     /// finishes its pause's work instead of losing it); set
     /// `flush_on_close = false` to opt out.
     pub flush_on_close: bool,
+    /// Whether unfinished background work keeps a session out of the idle
+    /// state. A Claude Code turn can end while a `run_in_background` Bash
+    /// command or a background subagent is still running — the model stopped,
+    /// but the session is waiting, not idle. With this on (the default) the
+    /// idle clock starts when the last such task clears, so idle forks (a
+    /// goal fork included) measure their deadline from the moment the session
+    /// really has nothing in flight. autofork's own fork spawns never count.
+    pub background_hold: bool,
+    /// How long one background task may hold the idle clock. A task the
+    /// daemon never sees finish — a server left running, a notification lost
+    /// to a resume — would otherwise silence the session's idle forks for
+    /// good. `0` disables the timeout (hold forever).
+    pub background_hold_timeout_secs: u64,
 }
 
 /// The Claude Code fork execution mode (see `Config::fork_runner`).
@@ -133,6 +146,8 @@ impl Default for Config {
             fork_modes: BTreeMap::new(),
             fork_runner: ForkRunner::Headless,
             flush_on_close: true,
+            background_hold: true,
+            background_hold_timeout_secs: 30 * 60,
         }
     }
 }
@@ -157,6 +172,8 @@ struct RawConfig {
     fork_modes: BTreeMap<String, toml::Value>,
     fork_runner: Option<toml::Value>,
     flush_on_close: Option<toml::Value>,
+    background_hold: Option<toml::Value>,
+    background_hold_timeout: Option<toml::Value>,
     // ---- deprecated since v0.5: accepted, warned, ignored ----
     concurrency: Option<toml::Value>,
     fork_timeout: Option<toml::Value>,
@@ -307,6 +324,19 @@ fn apply_layer(cfg: &mut Config, raw: RawConfig, project_level: bool, warnings: 
         match v {
             toml::Value::Boolean(b) => cfg.flush_on_close = *b,
             _ => warnings.push("'flush_on_close' must be true or false, ignoring".into()),
+        }
+    }
+    if let Some(v) = &raw.background_hold {
+        match v {
+            toml::Value::Boolean(b) => cfg.background_hold = *b,
+            _ => warnings.push("'background_hold' must be true or false, ignoring".into()),
+        }
+    }
+    if let Some(v) = &raw.background_hold_timeout {
+        // Not via `dur`: that closure holds a mutable borrow of `warnings`,
+        // and the sections above push to it directly.
+        if let Some(s) = parse_toml_duration(v, "background_hold_timeout", warnings) {
+            cfg.background_hold_timeout_secs = s;
         }
     }
     if let Some(v) = &raw.fork_runner {
@@ -706,5 +736,32 @@ mod tests {
         assert!(!cfg.fork_models.contains_key("codex"));
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("fork_models.codex"), "{warnings:?}");
+    }
+    #[test]
+    fn background_hold_keys_parse_and_default() {
+        let d = Config::default();
+        assert!(d.background_hold);
+        assert_eq!(d.background_hold_timeout_secs, 1800);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        fs::create_dir_all(home.join(".autofork")).unwrap();
+        let write = |body: &str| {
+            fs::write(home.join(".autofork/config.toml"), body).unwrap();
+            load_config(None, Some(home))
+        };
+
+        let (cfg, warnings) = write("background_hold = false\nbackground_hold_timeout = \"90s\"\n");
+        assert!(!cfg.background_hold);
+        assert_eq!(cfg.background_hold_timeout_secs, 90);
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        // 0 is legal: hold for as long as the work runs.
+        let (cfg, _) = write("background_hold_timeout = 0\n");
+        assert_eq!(cfg.background_hold_timeout_secs, 0);
+
+        let (cfg, warnings) = write("background_hold = \"yes\"\n");
+        assert!(cfg.background_hold, "a bad value keeps the default");
+        assert!(warnings.iter().any(|w| w.contains("background_hold")));
     }
 }

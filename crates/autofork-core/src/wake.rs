@@ -123,6 +123,56 @@ pub fn strip_continue(report: &str) -> String {
         .to_string()
 }
 
+/// The block a fork run's report is wrapped in when it is handed to the
+/// parent session — spooled for silent delivery on every client, and used
+/// verbatim as the Stop-hook wake payload for a continuing chain (see
+/// [`build_chain_wake_payload`]). The header carries [`WAKE_MARKER`], which is
+/// what makes the turn that delivers it classify as a continuation of the
+/// current pause rather than as user activity.
+pub fn report_block(fork: &str, trigger: &str, status: &str, body: &str) -> String {
+    format!("---\nsource: autofork\nfork: {fork} (trigger: {trigger}) — {status}\n---\n{body}")
+}
+
+/// Cap on a chain wake payload: Claude Code shows the Stop hook's stderr to
+/// the model, and an unbounded report would crowd the turn it is meant to
+/// drive.
+const CHAIN_WAKE_CAP: usize = 9_800;
+
+/// Build the wake payload that carries a continuing chain fork's report into
+/// the parent session: the goal fast path for Claude Code's headless runner.
+///
+/// A headless run normally spools its report for silent delivery at the
+/// parent's *next prompt* — fine for a consolidation fork, fatal for a goal
+/// loop, where the parent is the worker and the loop only advances when it
+/// sees the report. So a run that asks to continue is delivered instead by
+/// the parked asyncRewake Stop hook: it prints this payload to stderr and
+/// exits 2, waking the session with the report in hand. Same effect as
+/// codex's synchronous block-and-inject, without holding the session while
+/// the fork evaluates.
+pub fn build_chain_wake_payload(blocks: &[String]) -> String {
+    let mut text = blocks.join("\n\n");
+    if text.len() > CHAIN_WAKE_CAP {
+        let mut cut = CHAIN_WAKE_CAP;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
+        text.push_str("\n[…report truncated to fit the wake payload]");
+    }
+    format!("{text}\n\n{CHAIN_CLOSER}")
+}
+
+/// Closing instruction of a chain wake: tells the woken parent that the
+/// report is work for *it*, not a spawn instruction (every other wake payload
+/// this file builds asks the model to spawn a fork subagent — without this,
+/// a woken model reaches for the Agent tool out of habit).
+const CHAIN_CLOSER: &str = "The fork above is not done: its report asks for another run, so the \
+    goal it tracks is not met yet. Act on that report now, in this turn — do the work it \
+    describes (or answer what it asks) and then stop. autofork runs the fork again once you \
+    stop, so it re-evaluates against what you just did; the loop ends when the fork's report \
+    stops asking for another run, or when the user sends a message of their own. Do not spawn \
+    a subagent for this and do not read the fork's own file — this report is the whole handoff.";
+
 /// Whether a submitted "prompt" is actually a non-waking continuation — an
 /// asyncRewake wake reminder (carries [`WAKE_MARKER`]) or a background-task
 /// completion notification — rather than genuine user input. This is the
@@ -506,6 +556,30 @@ mod tests {
         // A non-chain fork's prompt never mentions the sentinel.
         let p = build_wake_payload("s", "conv-s", "/p", &[due("j", &[], false)], &[]);
         assert!(!p.contains(CONTINUE_SENTINEL));
+    }
+
+    #[test]
+    fn chain_wake_payload_carries_the_report_and_drives_the_parent() {
+        let block = report_block("goal", "idle:0", "completed", "next: run the migration");
+        let p = build_chain_wake_payload(&[block]);
+        assert!(p.contains("next: run the migration"));
+        assert!(p.contains("fork: goal (trigger: idle:0) — completed"));
+        // Must sniff as a continuation, or the turn it starts would read as
+        // user activity and reset the pause (killing the chain counter).
+        assert!(p.contains(WAKE_MARKER));
+        assert!(looks_like_continuation(&p));
+        // The parent is the worker here: no spawn instruction, no fork file.
+        assert!(!p.contains("subagent_type"));
+        assert!(p.contains("Act on that report now"));
+    }
+
+    #[test]
+    fn chain_wake_payload_truncates_a_huge_report() {
+        let block = report_block("goal", "idle:0", "completed", &"x".repeat(40_000));
+        let p = build_chain_wake_payload(&[block]);
+        assert!(p.len() < 11_000, "payload not truncated: {}", p.len());
+        assert!(p.contains("report truncated"));
+        assert!(p.contains("Act on that report now"));
     }
 
     #[test]

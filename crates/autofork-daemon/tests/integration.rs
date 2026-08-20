@@ -294,6 +294,23 @@ impl Harness {
         self.append_transcript_line(&line.to_string());
     }
 
+    /// Append the tool_result of a `run_in_background` Bash launch: the turn
+    /// ended, but the session is waiting on work that is still running.
+    fn append_background_launch(&self, tool_use_id: &str, task_id: &str) {
+        let line = serde_json::json!({
+            "type": "user",
+            "message": { "content": [
+                { "type": "tool_result", "tool_use_id": tool_use_id, "content": [
+                    { "type": "text", "text": format!(
+                        "Command running in background with ID: {task_id}. Output is being \
+                         written to: /tmp/{task_id}.output. You will be notified when it \
+                         completes.") },
+                ] },
+            ] }
+        });
+        self.append_transcript_line(&line.to_string());
+    }
+
     /// Append a background-task completion notification to the transcript, as
     /// the relay turn's user entry would contain.
     fn append_completion_notification(&self, tool_use_id: &str, status: &str) {
@@ -2656,4 +2673,110 @@ fn fork_models_resolve_by_parent_model_with_default_catchall() {
     let rx = h.park_stop_wait(stop);
     let forks = wake_forks(rx.recv_timeout(Duration::from_secs(10)).unwrap());
     assert_eq!(forks[0].model.as_deref(), Some("haiku"));
+}
+
+// ---- background work holds the idle clock ----
+
+#[test]
+fn background_work_holds_the_idle_clock_until_it_finishes() {
+    let mut h = Harness::new("1s", "0").wake_grace_secs(0);
+    h.write_fork(
+        "goal.md",
+        "---\nfork: true\nrun_on:\n  - idle: 0s\n---\nGOAL",
+    );
+    h.start_daemon();
+    h.write_transcript(100);
+    assert_ack(h.send_event(h.event_t(EventKind::SessionStart, "s1")));
+
+    // The turn ended with a `run_in_background` command still running: Claude
+    // Code calls that a Stop, but the session is waiting, not idle.
+    h.append_background_launch("toolu_bg", "bg1");
+    let rx = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
+    assert!(
+        rx.recv_timeout(Duration::from_millis(2500)).is_err(),
+        "an idle:0s fork fired while background work was still running"
+    );
+
+    // The command finishes and its notification lands; the next Stop is the
+    // first genuinely idle one, and the fork fires there.
+    h.append_completion_notification("toolu_bg", "completed");
+    assert_ack(h.send_event(h.prompt_submit("s1", false)));
+    let rx = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
+    let payload = wake_payload(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert!(payload.contains("due: goal"), "{payload}");
+}
+
+#[test]
+fn background_hold_expires_so_unfinished_work_cannot_silence_forks() {
+    let mut h = Harness::new("1s", "0").wake_grace_secs(0);
+    h.append_config("background_hold_timeout = \"1s\"");
+    h.write_fork(
+        "journal.md",
+        "---\nfork: true\nrun_on:\n  - idle: 0s\n---\nJOURNAL",
+    );
+    h.start_daemon();
+    h.write_transcript(100);
+    assert_ack(h.send_event(h.event_t(EventKind::SessionStart, "s1")));
+
+    // A server left running: its completion notification never comes.
+    h.append_background_launch("toolu_server", "srv1");
+    let rx = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
+    assert!(rx.recv_timeout(Duration::from_millis(1200)).is_err());
+
+    // Past the hold timeout the task stops counting and idle forks resume.
+    std::thread::sleep(Duration::from_millis(1200));
+    assert_ack(h.send_event(h.prompt_submit("s1", false)));
+    let rx = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
+    let payload = wake_payload(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert!(payload.contains("due: journal"), "{payload}");
+}
+
+#[test]
+fn background_hold_can_be_switched_off() {
+    let mut h = Harness::new("1s", "0").wake_grace_secs(0);
+    h.append_config("background_hold = false");
+    h.write_fork(
+        "journal.md",
+        "---\nfork: true\nrun_on:\n  - idle: 0s\n---\nJOURNAL",
+    );
+    h.start_daemon();
+    h.write_transcript(100);
+    assert_ack(h.send_event(h.event_t(EventKind::SessionStart, "s1")));
+
+    h.append_background_launch("toolu_bg", "bg1");
+    let rx = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
+    let payload = wake_payload(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert!(payload.contains("due: journal"), "{payload}");
+}
+
+#[test]
+fn own_fork_spawns_never_count_as_background_work() {
+    // autofork's own fork subagent is background work in Claude Code's eyes,
+    // but it must not make the session look busy to autofork's own scheduler
+    // (the gate/after/overlap machinery is what orders fork runs).
+    let mut h = Harness::new("1s", "0").wake_grace_secs(0);
+    h.write_fork(
+        "second.md",
+        "---\nfork: true\nrun_on:\n  - idle: 0s\n---\nSECOND",
+    );
+    h.start_daemon();
+    h.write_transcript(100);
+    assert_ack(h.send_event(h.event_t(EventKind::SessionStart, "s1")));
+
+    // A fork spawn, still running (no completion notification).
+    h.append_fork_spawn("toolu_f1", "first");
+    h.append_transcript_line(
+        &serde_json::json!({
+            "type": "user",
+            "message": { "content": [
+                { "type": "tool_result", "tool_use_id": "toolu_f1", "content": [
+                    { "type": "text", "text": "Async agent launched successfully.\nagentId: a1" },
+                ] },
+            ] }
+        })
+        .to_string(),
+    );
+    let rx = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
+    let payload = wake_payload(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert!(payload.contains("due: second"), "{payload}");
 }

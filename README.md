@@ -19,7 +19,10 @@ background, with the report slipped into your agent's context on your next excha
 ## How a fork fires
 
 1. When a turn ends, an **asyncRewake `Stop` hook** long-polls the autofork daemon in the
-   background without blocking your session.
+   background without blocking your session. A turn that ends while background work is still
+   running (a `run_in_background` command, a background subagent) is a stop but not an idle
+   moment: the clock starts when that work clears — see
+   [What counts as idle](#what-counts-as-idle).
 2. When forks come due (an idle deadline elapses, or a context threshold was crossed), the daemon
    answers the poll with the due forks.
 3. **By default (v0.18, `fork_runner = "headless"`)** the hook consumes the wake itself: each fork
@@ -27,7 +30,8 @@ background, with the report slipped into your agent's context on your next excha
    conversation, executed outside your session, on whatever model the fork (or `[fork_models]`)
    names. Its report is spooled and delivered **silently** as `additionalContext` on your next
    prompt. Nothing about forks ever appears in your conversation — the same quiet semantics as
-   opencode.
+   opencode. (The one exception is a `chain: true` report that asks to continue: that one wakes
+   the session, because a goal loop only advances when the parent sees it.)
 4. **Opt-in (`fork_runner = "subagent"`)**: the cache-preserving alternative. The hook exits 2,
    which wakes the idle session with a spawn payload; the session's own model calls the **Agent
    tool with `subagent_type: "fork"`** per due fork — background subagents that inherit the whole
@@ -274,10 +278,12 @@ parent's *current* context, prior reports included.
 
 Mechanics per client:
 
-- **Claude Code** — the fork's completion notification already wakes the parent natively; the
-  sentinel additionally re-arms the fork's once-per-pause latch, so it fires again right after the
-  relay turn settles. Nothing else changes: no epoch bump, so every *other* idle fork stays exactly
-  as it was.
+- **Claude Code** — a continuing report is delivered by **waking the session with it**: the parked
+  Stop hook exits 2 carrying the report, so the parent reacts to it in the turn that wake starts
+  (in subagent mode the fork's own completion notification does the same natively). The sentinel
+  additionally re-arms the fork's once-per-pause latch, so it fires again at the Stop that ends
+  that turn — which is the loop. Nothing else changes: no epoch bump, so every *other* idle fork
+  stays exactly as it was.
 - **opencode** — a sentinel-carrying report is injected as a **real turn** (instead of the usual
   zero-turn no-reply message), so the parent model reacts to it; the completion frame carries
   `continue: true` and the daemon re-arms the fork the same way.
@@ -330,6 +336,13 @@ next concrete chunk of work (or tell the parent exactly what to do next in
 your report) and end your report with the continue line. If the goal is met,
 or there is no active goal, report one line and stop — no continue line.
 ```
+
+It loops autonomously on every client: the fork's continuing report is delivered as a turn the
+parent reacts to right away (Claude Code wakes the session with it from the Stop hook, codex
+blocks-and-injects, opencode injects a real turn), the parent does the work, and the fork
+re-evaluates at the stop that follows. It starts counting only when the session is genuinely idle,
+so a goal fork never evaluates while a background command it asked for is still running (see
+[What counts as idle](#what-counts-as-idle)).
 
 `gate: true` holds **every other idle-triggered fork** while this fork's run/chain is unsettled —
 they are dropped at selection without consuming their once-per-pause latches, and `after`-held
@@ -442,6 +455,8 @@ ci = "1h"
 
 fork_runner = "headless"       # Claude Code execution mode; "subagent" opts into cache-preserving visible forks
 flush_on_close = true          # run the pause's unrun idle forks when a session ends (see below)
+background_hold = true         # a session waiting on background work isn't idle yet (see below)
+background_hold_timeout = "30m" # after this, one unfinished task stops holding; 0 = hold forever
 
 [fork_models]                  # default fork model per client; a fork's own `model:` wins
 "claude-code" = ["sonnet", "haiku"]   # one id, or a fallback list tried in order
@@ -471,14 +486,40 @@ request prefixes per mode), so each run reads the inherited history cold — whi
 pairs naturally with cheap fork models (`[fork_models]`, above): pay small-model input prices for
 the copy instead of burning your session's model on a journal update. Runs default to
 `--permission-mode acceptEdits` (headless runs can't answer permission prompts); set a fork's
-`mode:` or `[fork_modes]` for more or less. Chain forks work, with one semantic shift: the parent
-only sees reports at your next prompt, so a goal loop advances between your messages rather than
-autonomously.
+`mode:` or `[fork_modes]` for more or less.
+
+One report never waits for your next prompt: a `chain: true` run that asks to continue. There the
+parent is the worker and the loop only advances once it has seen the report, so the parked hook
+delivers that block by **waking the session with it** (stderr + exit 2) instead of re-parking —
+the goal fast path, the async twin of codex's synchronous block-and-inject. A goal loop therefore
+runs autonomously under the headless runner too: fork evaluates → parent wakes and works → parent
+stops → fork evaluates again, until a report omits the sentinel. Settled and failed runs still
+spool silently. (Before v0.22 a continuing report only surfaced at your next manual prompt, so the
+loop advanced *between* your messages rather than on its own.)
 
 `fork_runner = "subagent"` opts back into the pre-v0.18 behavior: the session's own model spawns
 fork subagents (near-total prompt-cache reuse, forks on the session's model) at the price of
 visible wake/spawn/relay turns. Pick it when cache reuse on the big model matters more to you
 than a quiet conversation.
+
+### What counts as idle
+
+A turn can end while the session is still *waiting*: a `run_in_background` Bash command polling a
+deploy, a background subagent researching something. The harness calls that a stop, but nothing
+about it is idle — and firing a goal fork there evaluates a goal against work that hasn't landed.
+
+So `background_hold` (on by default) holds the idle clock while the session has unfinished
+background work: those stops arm no idle deadlines and start no pause, and the clock starts at the
+first stop after the last such task reports completion. An `idle: 4m` handover then measures its
+4 minutes from *that* moment, and an `idle: 0s` goal fork fires exactly then. `every:` and
+`context_*` triggers are not held (a periodic backstop and a filling context window still matter
+while you wait).
+
+autofork's own fork spawns never count — a session isn't busy because autofork is forking it; fork
+ordering is what `after`, `overlap` and `gate` are for. And because a completion can go unseen (a
+server left running, a notification lost to a resume), one task stops holding after
+`background_hold_timeout` (default 30m; `0` holds for as long as the work runs). Set
+`background_hold = false` for the pre-v0.22 behavior, where every stop is idle.
 
 ### Flush on close
 
