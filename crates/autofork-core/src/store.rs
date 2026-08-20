@@ -923,6 +923,21 @@ impl Store {
         Ok(blocks)
     }
 
+    /// Fork runs with a recorded spawn and no terminal status yet, oldest
+    /// first: the in-flight set (`autofork status` shows it so a user can
+    /// tell whether closing the session would interrupt anything).
+    pub fn list_live_spawns(&self) -> rusqlite::Result<Vec<(String, String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_id, COALESCE(fork_name, tool_use_id), spawned_at
+             FROM fork_spawns WHERE terminal_at IS NULL
+             ORDER BY spawned_at ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     pub fn count_runs_since(
         &self,
         session_id: &str,

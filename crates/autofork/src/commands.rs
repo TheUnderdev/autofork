@@ -160,6 +160,17 @@ fn print_sessions_header(info: &StatusInfo) {
             fmt_ago(t, s.last_activity),
         );
     }
+    if !info.running.is_empty() {
+        println!("running fork runs (closing their session now would interrupt them):");
+        for r in &info.running {
+            println!(
+                "  {} — session {} — started {}",
+                r.fork,
+                display_session_id(&r.session_id),
+                fmt_ago(t, r.started_at),
+            );
+        }
+    }
     if !info.recent_runs.is_empty() {
         println!("recent wakes:");
         for r in &info.recent_runs {

@@ -259,12 +259,25 @@ fn status(daemon: &Arc<Daemon>) -> ResponseBody {
             started_at: r.started_at,
         })
         .collect();
+    let running = store
+        .list_live_spawns()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(session_id, fork, spawned_at)| RunInfo {
+            fork,
+            trigger: String::new(),
+            session_id,
+            state: "running".into(),
+            started_at: spawned_at,
+        })
+        .collect();
     ResponseBody::StatusInfo(StatusInfo {
         version: Daemon::version().to_string(),
         daemon_proto: PROTO_VERSION,
         pid: std::process::id(),
         sessions,
         recent_runs,
+        running,
     })
 }
 

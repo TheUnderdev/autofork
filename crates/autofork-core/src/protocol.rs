@@ -237,6 +237,10 @@ pub struct StatusInfo {
     pub sessions: Vec<SessionInfo>,
     /// Recent wakes issued (forks handed to sessions to spawn).
     pub recent_runs: Vec<RunInfo>,
+    /// Fork runs currently in flight: spawn observed, completion not yet.
+    /// The "is it safe to close this session?" answer. Additive field.
+    #[serde(default)]
+    pub running: Vec<RunInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
