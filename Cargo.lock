@@ -75,7 +75,7 @@ dependencies = [
 
 [[package]]
 name = "autofork"
-version = "0.20.1"
+version = "0.20.2"
 dependencies = [
  "autofork-core",
  "clap",
@@ -88,7 +88,7 @@ dependencies = [
 
 [[package]]
 name = "autofork-core"
-version = "0.20.1"
+version = "0.20.2"
 dependencies = [
  "rusqlite",
  "serde",
@@ -101,7 +101,7 @@ dependencies = [
 
 [[package]]
 name = "autofork-daemon"
-version = "0.20.1"
+version = "0.20.2"
 dependencies = [
  "autofork-core",
  "libc",
