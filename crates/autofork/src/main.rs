@@ -1,4 +1,5 @@
 mod client;
+mod codex;
 mod commands;
 mod hook;
 mod opencode;
@@ -72,6 +73,11 @@ enum Command {
         #[command(subcommand)]
         command: OpencodeCommand,
     },
+    /// OpenAI Codex CLI integration: install the hooks, or serve as one.
+    Codex {
+        #[command(subcommand)]
+        command: CodexCommand,
+    },
     /// Ask the daemon to exit (it restarts on the next hook event).
     StopDaemon {
         /// Wait for in-flight fork runs to finish first.
@@ -99,6 +105,43 @@ enum OpencodeCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum CodexCommand {
+    /// Merge the autofork hooks into `$CODEX_HOME/hooks.json` and trust them
+    /// with codex (codex silently skips untrusted hooks). Restart codex
+    /// sessions afterwards.
+    Install {
+        /// Print the merged hooks.json to stdout instead of installing it.
+        #[arg(long)]
+        print: bool,
+    },
+    /// Remove the autofork hooks from `$CODEX_HOME/hooks.json`.
+    Uninstall,
+    /// The codex hooks' entrypoint (reads the hook JSON on stdin).
+    #[command(hide = true)]
+    Hook {
+        #[arg(value_enum)]
+        event: codex::CxHookKind,
+    },
+    /// The per-session waiter: parks the idle long-poll, executes due forks
+    /// via `codex exec fork`, and queues their reports into the parent.
+    #[command(hide = true)]
+    Waiter {
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        rollout: std::path::PathBuf,
+        #[arg(long)]
+        codex_pid: u32,
+        #[arg(long)]
+        cwd: std::path::PathBuf,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        permission_mode: Option<String>,
+    },
+}
+
 fn main() {
     let cli = Cli::parse();
     let Some(paths) = Paths::from_env() else {
@@ -119,6 +162,26 @@ fn main() {
             OpencodeCommand::Install { print } => exit_on_err(opencode::install(print)),
             OpencodeCommand::Uninstall => exit_on_err(opencode::uninstall()),
             OpencodeCommand::Hook { event } => opencode::run_hook(event),
+        },
+        Command::Codex { command } => match command {
+            CodexCommand::Install { print } => exit_on_err(codex::install(print)),
+            CodexCommand::Uninstall => exit_on_err(codex::uninstall()),
+            CodexCommand::Hook { event } => codex::run_hook(event),
+            CodexCommand::Waiter {
+                session,
+                rollout,
+                codex_pid,
+                cwd,
+                model,
+                permission_mode,
+            } => codex::run_waiter(codex::WaiterArgs {
+                session,
+                rollout,
+                codex_pid,
+                cwd,
+                model,
+                permission_mode,
+            }),
         },
         Command::StopDaemon { drain } => exit_on_err(stop_daemon(&paths, drain)),
     }

@@ -1,6 +1,6 @@
 # autofork
 
-**Forks for Claude Code and opencode.** When your session goes idle — or its context crosses a
+**Forks for Claude Code, opencode and Codex CLI.** When your session goes idle — or its context crosses a
 threshold —
 autofork has the session's own model spawn *forks*: background **fork subagents** that inherit the
 full conversation, do work with tools, and report back, all without interrupting you.
@@ -382,6 +382,9 @@ autofork stop-daemon     # retire the daemon (it restarts on the next event)
 
 autofork opencode install    # install the opencode bridge plugin (see "opencode support")
 autofork opencode uninstall  # remove it
+
+autofork codex install       # install + trust the Codex CLI hooks (see "Codex CLI support")
+autofork codex uninstall     # remove them
 ```
 
 `autofork run` can no longer spawn a fork itself (forks are subagents of an interactive session); it
@@ -545,10 +548,63 @@ idle deadlines short (the default fits) or budget a cold prefix write for late f
 
 Requires opencode >= 1.18 (the plugin uses the v1 plugin API and the session fork route).
 
+## Codex CLI support (v0.16)
+
+autofork also runs forks in [OpenAI Codex CLI](https://github.com/openai/codex) sessions — same
+fork files, same daemon, same schedule semantics. Install once:
+
+```
+autofork codex install     # merges hooks into ~/.codex/hooks.json and trusts them
+```
+
+then start a new codex session. `autofork codex uninstall` removes the hooks; `autofork doctor`
+reports whether they are installed, current, and trusted.
+
+**Trust matters:** codex silently skips hooks it doesn't trust. `autofork codex install` writes
+the hooks *and* records their trust hashes (through the same RPCs the codex TUI's `/hooks`
+command uses), so a plain hooks.json edit is never enough — always go through the installer.
+If your codex binary or the autofork binary moves, re-run it; `autofork doctor` flags both
+conditions. Managed environments that set `allow_managed_hooks_only` disable user hooks
+entirely — autofork cannot run there.
+
+### How codex forks run
+
+Codex has lifecycle hooks shaped like Claude Code's, but they run synchronously — a slow Stop
+hook blocks the session — so autofork parks nothing in them. Instead the SessionStart hook spawns
+a small per-session **waiter** process that tails the session's rollout file (codex records turn
+boundaries, token usage and the model's real context window there) and talks to the autofork
+daemon. When a fork comes due it:
+
+1. forks your conversation with codex's native **thread fork** (`codex exec fork`) — a new
+   thread that inherits the full history without touching your session,
+2. runs the fork instruction as that thread's first turn, headless, with your session's model
+   and a sandbox matching your session's permission mode,
+3. delivers the report into your session through codex's **durable message queue**
+   (`thread/queue/add`) — your own codex process picks it up within seconds of the session being
+   idle, and the report block (`source: autofork`) arrives as a message your model reads,
+4. reports the completion to the daemon, which releases any `after` dependents; the fork's
+   thread is then **deleted** (failed runs are kept for inspection —
+   `AUTOFORK_KEEP_FORK_SESSIONS=1` keeps everything).
+
+Because the queued report arrives as a real turn, your model reacts to every fork report (on
+Claude Code the completion notification behaves the same way). Chain forks work unchanged: a
+report carrying the continue sentinel re-arms the fork after your session digests the report.
+
+### Cache economics on codex
+
+A codex thread fork gets a fresh thread id, and codex keys the OpenAI prompt cache on it — so
+**every fork run pays a cold prompt-cache write** for the inherited history (measured:
+`cached_input_tokens: 0` on the fork's first request). OpenAI charges no premium for cache
+writes, so a fork costs plain input-token pricing for the parent context once, per run. Keep
+heavyweight forks on sensible throttles for very large sessions.
+
+Requires codex >= 0.148 (lifecycle hooks, `codex exec fork`, and the queue RPC — all verified
+against that release).
+
 ## Other tools
 
 The fork file format is deliberately tool-agnostic; autofork is the reference implementation for
-Claude Code and opencode. Other agent harnesses are welcome to read the same fork definitions
+Claude Code, opencode and Codex CLI. Other agent harnesses are welcome to read the same fork definitions
 natively — the format spec above is the whole contract. A harness with its own lifecycle may
 honor extra keys or moments as extensions (autofork warns about and ignores keys like `delivery`
 that only make sense elsewhere), and the reverse holds here: a definition written for such a

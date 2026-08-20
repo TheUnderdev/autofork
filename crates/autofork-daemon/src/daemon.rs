@@ -110,6 +110,14 @@ fn wake_grace_secs() -> i64 {
 /// dedupe). Kept short: a genuine user prompt landing inside it merely skips
 /// one pause-epoch bump, which the next genuine prompt supplies. Overridable
 /// via `AUTOFORK_CHAIN_GRACE_SECS` (tests shorten or zero it).
+/// Clients whose plugin/waiter executes forks natively and delivers reports
+/// as turns of the parent session (as opposed to Claude Code, where the
+/// session's own model spawns fork subagents and completions arrive as task
+/// notifications).
+fn is_native_exec_client(client: Option<&str>) -> bool {
+    matches!(client, Some("opencode") | Some("codex"))
+}
+
 fn chain_grace_secs() -> i64 {
     std::env::var("AUTOFORK_CHAIN_GRACE_SECS")
         .ok()
@@ -475,10 +483,12 @@ impl Daemon {
                 // activity — bumping the pause epoch, which re-arms every
                 // idle fork and resets the per-pause chain limit, turning a
                 // goal fork into a self-sustaining pump. Any waking
-                // PromptSubmit for an opencode session inside the chain
-                // grace window is downgraded to non-waking.
+                // PromptSubmit for a native-execution client's session
+                // (opencode, codex — never Claude Code, whose completions
+                // are task notifications) inside the chain grace window is
+                // downgraded to non-waking.
                 let waking = if waking
-                    && ev.client.as_deref() == Some("opencode")
+                    && is_native_exec_client(ev.client.as_deref())
                     && self.recently_chain_continued(&ev.session_id, t)
                 {
                     tracing::info!(session = %ev.session_id,
@@ -932,11 +942,12 @@ impl Daemon {
 
         let mut rearmed = false;
         if cont && status == "completed" {
-            // The plugin injects a continuing chain's report as a real turn
-            // before it reports the completion; open the dedupe window so
-            // duplicated observers of that turn don't classify it as user
-            // activity (see the PromptSubmit downgrade).
-            if session.client.as_deref() == Some("opencode") {
+            // The client delivers a continuing chain's report as a real turn
+            // around the completion frame (opencode injects it, codex queues
+            // it); open the dedupe window so duplicated observers of that
+            // turn don't classify it as user activity (see the PromptSubmit
+            // downgrade).
+            if is_native_exec_client(session.client.as_deref()) {
                 self.note_chain_continued(session_id);
             }
             match &def {

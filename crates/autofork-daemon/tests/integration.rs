@@ -2209,3 +2209,134 @@ fn resume_hook_fires_only_for_the_resume_source() {
         1
     );
 }
+
+// ---- codex client flow (same wire shape as opencode: no transcript,
+// explicit gauge, fork frames; the waiter consumes wakes structured) ----
+
+/// An event as the codex waiter/hooks send it: client tag "codex", UUIDv7
+/// session ids, gauge and window riding on the event.
+fn cx_event(h: &Harness, kind: EventKind, session: &str) -> Event {
+    let mut ev = h.event(kind, session);
+    ev.client = Some("codex".to_string());
+    ev
+}
+
+#[test]
+fn codex_wake_carries_structured_forks_and_gauge() {
+    let mut h = Harness::new("1s", "0");
+    h.write_fork(
+        "journal.md",
+        "---\nfork: true\nrun_on: [idle]\n---\nwrite the journal now",
+    );
+    h.write_fork(
+        "distill.md",
+        "---\nfork: true\nrun_on:\n  - context_used: 50%\n---\nDISTILL",
+    );
+    h.start_daemon();
+
+    let sid = "01a01f24-3113-76c3-a00a-74ac3948e630";
+    assert_ack(h.send_event(cx_event(&h, EventKind::SessionStart, sid)));
+    // The waiter's idle poll carries the rollout-derived gauge and codex's
+    // own model_context_window; both trigger kinds resolve off it.
+    let mut ev = cx_event(&h, EventKind::Stop, sid);
+    ev.context_tokens = Some(160_000);
+    ev.context_window = Some(258_400);
+    // 160k of a 258.4k reported window is past 50%: the context fork fires
+    // on the very poll that reported the gauge, ahead of the idle deadline.
+    let rx = h.park_stop_wait(ev.clone());
+    let forks = wake_forks(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert_eq!(forks.len(), 1);
+    assert_eq!(forks[0].name, "distill");
+    assert_eq!(forks[0].trigger, "context_used:50%");
+    // The waiter re-parks; the idle fork fires at its deadline.
+    let rx = h.park_stop_wait(ev);
+    let forks = wake_forks(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert_eq!(forks.len(), 1);
+    assert_eq!(forks[0].name, "journal");
+    assert!(forks[0].prompt.contains(&format!("parent session {sid}")));
+    assert_eq!(h.status_recent_runs(), 2);
+}
+
+#[test]
+fn codex_chain_grace_downgrades_duplicate_activity() {
+    // The chain-grace downgrade is keyed on native-execution clients, not on
+    // opencode alone: a codex queue-drained report turn that fires a waking
+    // UserPromptSubmit (sniff missed, duplicated observer) inside the grace
+    // window must not reset the pause, or chain_limit never binds.
+    let mut h = Harness::new("1s", "0").wake_grace_secs(0);
+    h.write_fork(
+        "goal.md",
+        "---\nfork: true\nrun_on: [idle]\nchain: true\nchain_limit: 2\n---\nGOAL",
+    );
+    h.start_daemon();
+    let sid = "01a01f24-aaaa-76c3-a00a-74ac3948e630";
+    assert_ack(h.send_event(cx_event(&h, EventKind::SessionStart, sid)));
+
+    let duplicate_report = |h: &Harness| {
+        let mut ev = cx_event(h, EventKind::PromptSubmit, sid);
+        ev.waking = Some(true);
+        assert_ack(h.send_event(ev));
+    };
+
+    for run in [
+        "01a01f30-0001-7000-8000-000000000001",
+        "01a01f30-0002-7000-8000-000000000002",
+    ] {
+        let rx = h.park_stop_wait(cx_event(&h, EventKind::Stop, sid));
+        let forks = wake_forks(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+        assert_eq!(forks[0].name, "goal");
+        assert_ack(h.request(RequestBody::ForkSpawned {
+            session_id: sid.into(),
+            fork: "goal".into(),
+            run_ref: run.into(),
+        }));
+        assert_ack(h.request(RequestBody::ForkCompleted {
+            session_id: sid.into(),
+            fork: "goal".into(),
+            run_ref: run.into(),
+            status: "completed".into(),
+            cont: Some(true),
+        }));
+        duplicate_report(&h);
+    }
+
+    // chain_limit (2 per pause) binds because the duplicates were downgraded.
+    let rx = h.park_stop_wait(cx_event(&h, EventKind::Stop, sid));
+    assert!(
+        rx.recv_timeout(Duration::from_millis(2500)).is_err(),
+        "duplicate activity report reset the pause and defeated chain_limit"
+    );
+}
+
+#[test]
+fn codex_fork_run_sessions_are_never_scheduled() {
+    // The recursion env guard on the `codex exec fork` child is the primary
+    // defense; the daemon's spawn registry is the backstop that survives a
+    // waiter restart or a hook environment that lost the guard vars.
+    let mut h = Harness::new("1s", "0");
+    h.write_fork("journal.md", "---\nfork: true\nrun_on: [idle]\n---\nJ");
+    h.start_daemon();
+
+    let sid = "01a01f24-bbbb-76c3-a00a-74ac3948e630";
+    let run = "01a01f30-cccc-7000-8000-000000000001";
+    assert_ack(h.send_event(cx_event(&h, EventKind::SessionStart, sid)));
+    let rx = h.park_stop_wait(cx_event(&h, EventKind::Stop, sid));
+    let forks = wake_forks(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert_eq!(forks[0].name, "journal");
+    assert_ack(h.request(RequestBody::ForkSpawned {
+        session_id: sid.into(),
+        fork: "journal".into(),
+        run_ref: run.into(),
+    }));
+
+    // The fork child's own SessionStart hook fires (env guard lost): the
+    // daemon must drop it and answer its polls Waited immediately.
+    assert_ack(h.send_event(cx_event(&h, EventKind::SessionStart, run)));
+    assert!(!h.has_open_session(run), "fork run was registered");
+    let rx = h.park_stop_wait(cx_event(&h, EventKind::Stop, run));
+    assert!(matches!(
+        rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        ResponseBody::Waited
+    ));
+    assert_eq!(h.status_recent_runs(), 1);
+}

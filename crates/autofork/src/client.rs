@@ -149,7 +149,7 @@ fn semver_lt(a: &str, b: &str) -> bool {
 
 /// Acquire (and immediately hold) a non-blocking exclusive flock; None when
 /// another process holds it. Dropping the file releases it.
-fn try_flock(path: &Path) -> Option<std::fs::File> {
+pub(crate) fn try_flock(path: &Path) -> Option<std::fs::File> {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }

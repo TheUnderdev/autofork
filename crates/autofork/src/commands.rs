@@ -122,8 +122,12 @@ pub fn status(paths: &Paths) -> Result<(), String> {
 /// opencode ids (`ses_<time-ordered>`) share their leading characters across
 /// sessions created near in time — truncating them made every session of a
 /// stretch display identically ("the same session twice"). Show those whole.
+/// Codex ids are UUIDv7 — time-ordered too (the leading 48 bits are a
+/// timestamp), so they get the same treatment; the version nibble tells the
+/// two UUID kinds apart.
 fn display_session_id(id: &str) -> &str {
-    if id.contains('-') {
+    let uuid_v7 = id.len() >= 15 && id.as_bytes().get(14) == Some(&b'7');
+    if id.contains('-') && !uuid_v7 {
         &id[..id.len().min(8)]
     } else {
         id
@@ -504,6 +508,15 @@ pub fn doctor(paths: &Paths) -> Result<(), String> {
     // present — a Claude-Code-only install stays quiet).
     for line in crate::opencode::doctor_lines() {
         if line.contains("plugin installed") {
+            ok(&line);
+        } else {
+            println!("  WARN: {line}");
+        }
+    }
+
+    // Codex CLI integration (likewise quiet unless codex or our hooks exist).
+    for line in crate::codex::doctor_lines() {
+        if line.contains("hooks installed (") {
             ok(&line);
         } else {
             println!("  WARN: {line}");
