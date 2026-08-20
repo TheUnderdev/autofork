@@ -43,6 +43,10 @@ pub struct SelectedFork {
     pub chain: bool,
     /// `gate: true`: holds the session's other idle forks while unsettled.
     pub gate: bool,
+    /// Raw `model:` frontmatter (client-scoped); resolved at wake build.
+    pub model: autofork_core::frontmatter::ClientScoped,
+    /// Raw `mode:` frontmatter (client-scoped); resolved at wake build.
+    pub mode: autofork_core::frontmatter::ClientScoped,
     /// The latch this fork consumes at wake-issuance, if any: `context_*`
     /// triggers latch once per session (key = the trigger label); `idle`
     /// triggers latch once per pause (key = `idle-pause:<epoch>`). `None` means
@@ -247,11 +251,27 @@ pub fn select_forks(
             tags: parsed.def.tags.clone(),
             chain: parsed.def.chain,
             gate: parsed.def.gate,
+            model: parsed.def.model.clone(),
+            mode: parsed.def.mode.clone(),
             latch_key,
         });
     }
     apply_gate_filter(daemon, session, &mut selected);
     selected
+}
+
+/// On codex sessions, `idle: 0s` chain forks belong to the Stop hook's
+/// `PeekDue` (the goal fast path — synchronous block-and-inject at the
+/// pause's first Stop). The waiter's parked poll fires at the same instant
+/// and must not race it for them: whichever selects first consumes the
+/// once-per-pause latch, and a poll win would strand the goal loop on the
+/// slow queue path. `autofork doctor` flags installs whose hooks predate the
+/// Stop hook (3 of 4), where this reservation would otherwise silence such
+/// forks.
+pub fn reserve_fast_path(session: &SessionRow, selected: &mut Vec<SelectedFork>) {
+    if session.client.as_deref() == Some("codex") {
+        selected.retain(|s| !(s.chain && s.trigger == "idle:0"));
+    }
 }
 
 /// A trigger label produced by an idle deadline (`idle` / `idle:<secs>`) —
@@ -346,6 +366,21 @@ fn parse_fork(name: &str, content: &str) -> ForkParse {
     autofork_core::frontmatter::parse_fork_file(name, content)
 }
 
+/// Resolve a client-scoped frontmatter value for a session's client, falling
+/// back to the config table for that client. Sessions with no client tag are
+/// Claude Code.
+fn resolve_scoped(
+    scoped: &autofork_core::frontmatter::ClientScoped,
+    client: Option<&str>,
+    cfg_table: &std::collections::BTreeMap<String, String>,
+) -> Option<String> {
+    let client = client.unwrap_or("claude-code");
+    scoped
+        .resolve(client)
+        .map(str::to_string)
+        .or_else(|| cfg_table.get(client).cloned())
+}
+
 /// The conversation id survives resume: a resumed leg gets a fresh session
 /// id but appends to the original leg's transcript, so the transcript stem
 /// is the stable identity. No transcript known → the session id.
@@ -377,6 +412,9 @@ pub fn build_wake(
         forks = ?selected.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
         "issuing wake"
     );
+
+    // For resolving client-scoped model/mode into the structured specs.
+    let cfg = daemon.cfg_for(Some(&session.project_root));
 
     // Resolve `after` dependencies within the selected set, then layer the
     // priority waves on top: each fork's effective priority is its declared
@@ -437,6 +475,8 @@ pub fn build_wake(
                     skill: autofork_core::discovery::skill_sibling(&sel.path)
                         .map(|p| p.to_string_lossy().into_owned()),
                     chain: sel.chain,
+                    model: resolve_scoped(&sel.model, session.client.as_deref(), &cfg.fork_models),
+                    mode: resolve_scoped(&sel.mode, session.client.as_deref(), &cfg.fork_modes),
                 });
             } else {
                 let _ = store.insert_pending_dep(
@@ -503,38 +543,48 @@ pub fn release_due(daemon: &Arc<Daemon>, session: &SessionRow) -> Option<(String
         forks = ?released.iter().map(|d| d.fork_name.as_str()).collect::<Vec<_>>(),
         "releasing held dependents"
     );
-    // Pending rows carry no chain/gate info; re-read each definition so a
-    // released chain fork still learns the sentinel and a released gate fork
-    // still claims the gate.
-    let flags = |dep: &autofork_core::store::PendingDep| -> (bool, bool) {
-        std::fs::read_to_string(&dep.fork_path)
-            .ok()
-            .and_then(|c| match parse_fork(&dep.fork_name, &c) {
-                ForkParse::Fork(p) => Some((p.def.chain, p.def.gate)),
-                _ => None,
+    // Pending rows carry no chain/gate/model info; re-read each definition so
+    // a released chain fork still learns the sentinel, a released gate fork
+    // still claims the gate, and model/mode overrides still resolve.
+    let def_of =
+        |dep: &autofork_core::store::PendingDep| -> Option<autofork_core::frontmatter::ForkDef> {
+            std::fs::read_to_string(&dep.fork_path).ok().and_then(|c| {
+                match parse_fork(&dep.fork_name, &c) {
+                    ForkParse::Fork(p) => Some(p.def),
+                    _ => None,
+                }
             })
-            .unwrap_or((false, false))
-    };
+        };
+    let cfg = daemon.cfg_for(Some(&session.project_root));
     let due: Vec<DueFork> = released
         .iter()
-        .map(|dep| DueFork {
-            name: dep.fork_name.clone(),
-            path: dep.fork_path.to_string_lossy().into_owned(),
-            trigger: dep.trigger_label.clone(),
-            overlap: dep.overlap,
-            // Only the true `after` deps are quoted/report-piped; priority
-            // gates were order-only.
-            after: dep.report_preds.clone(),
-            skill: autofork_core::discovery::skill_sibling(&dep.fork_path)
-                .map(|p| p.to_string_lossy().into_owned()),
-            chain: flags(dep).0,
+        .map(|dep| {
+            let def = def_of(dep);
+            DueFork {
+                name: dep.fork_name.clone(),
+                path: dep.fork_path.to_string_lossy().into_owned(),
+                trigger: dep.trigger_label.clone(),
+                overlap: dep.overlap,
+                // Only the true `after` deps are quoted/report-piped; priority
+                // gates were order-only.
+                after: dep.report_preds.clone(),
+                skill: autofork_core::discovery::skill_sibling(&dep.fork_path)
+                    .map(|p| p.to_string_lossy().into_owned()),
+                chain: def.as_ref().map(|d| d.chain).unwrap_or(false),
+                model: def.as_ref().and_then(|d| {
+                    resolve_scoped(&d.model, session.client.as_deref(), &cfg.fork_models)
+                }),
+                mode: def.as_ref().and_then(|d| {
+                    resolve_scoped(&d.mode, session.client.as_deref(), &cfg.fork_modes)
+                }),
+            }
         })
         .collect();
     {
         let store = daemon.store.lock().unwrap();
         for dep in &released {
             let _ = store.delete_pending_dep(&session.session_id, &dep.fork_name);
-            if flags(dep).1 {
+            if def_of(dep).map(|d| d.gate).unwrap_or(false) {
                 let _ = store.set_active_gate(&session.session_id, &dep.fork_name);
             }
         }

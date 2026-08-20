@@ -105,11 +105,6 @@ fn wake_grace_secs() -> i64 {
         .unwrap_or(20)
 }
 
-/// How long after a chain continue a `waking: true` PromptSubmit on an
-/// opencode session is downgraded to non-waking (the duplicated-event-stream
-/// dedupe). Kept short: a genuine user prompt landing inside it merely skips
-/// one pause-epoch bump, which the next genuine prompt supplies. Overridable
-/// via `AUTOFORK_CHAIN_GRACE_SECS` (tests shorten or zero it).
 /// Clients whose plugin/waiter executes forks natively and delivers reports
 /// as turns of the parent session (as opposed to Claude Code, where the
 /// session's own model spawns fork subagents and completions arrive as task
@@ -118,6 +113,12 @@ fn is_native_exec_client(client: Option<&str>) -> bool {
     matches!(client, Some("opencode") | Some("codex"))
 }
 
+/// How long after a chain continue a `waking: true` PromptSubmit on a
+/// native-execution client's session is downgraded to non-waking (the
+/// duplicated-event-stream dedupe). Kept short: a genuine user prompt landing
+/// inside it merely skips one pause-epoch bump, which the next genuine prompt
+/// supplies. Overridable via `AUTOFORK_CHAIN_GRACE_SECS` (tests shorten or
+/// zero it).
 fn chain_grace_secs() -> i64 {
     std::env::var("AUTOFORK_CHAIN_GRACE_SECS")
         .ok()
@@ -763,7 +764,9 @@ impl Daemon {
                 now(),
                 pause_gate,
             );
-            !crate::planner::select_forks(slf, &session, &cfg, &moments).is_empty()
+            let mut sel = crate::planner::select_forks(slf, &session, &cfg, &moments);
+            crate::planner::reserve_fast_path(&session, &mut sel);
+            !sel.is_empty()
         };
 
         let fire_instants: Vec<i64> = {
@@ -836,7 +839,8 @@ impl Daemon {
             now(),
             pause_gate,
         );
-        let selected = crate::planner::select_forks(self, &session, &cfg, &moments);
+        let mut selected = crate::planner::select_forks(self, &session, &cfg, &moments);
+        crate::planner::reserve_fast_path(&session, &mut selected);
         if let Some((payload, forks)) = crate::planner::build_wake(self, &session, selected) {
             return ResponseBody::Wake {
                 payload,
@@ -865,6 +869,57 @@ impl Daemon {
         let store = self.store.lock().unwrap();
         let _ = store.record_spawn(session_id, run_ref, Some(fork), now());
         ResponseBody::Ack
+    }
+
+    /// The codex Stop hook's goal fast path: select-and-stamp exactly the
+    /// `chain: true` forks due at this pause's first Stop (`idle: 0s`
+    /// triggers only) and hand them back for synchronous execution. Non-chain
+    /// forks are deliberately not evaluated here — nothing is stamped for
+    /// them, so the session's regular parked poll picks them up unchanged.
+    /// No debounce: the goal loop wants immediacy.
+    pub fn handle_peek_due(self: &Arc<Self>, session_id: &str) -> ResponseBody {
+        self.touch_busy();
+        let session = {
+            let store = self.store.lock().unwrap();
+            if store.is_fork_run_ref(session_id).unwrap_or(false) {
+                return ResponseBody::Due { forks: Vec::new() };
+            }
+            store.get_session(session_id).ok().flatten()
+        };
+        let Some(session) = session else {
+            return ResponseBody::Due { forks: Vec::new() };
+        };
+        let cfg = self.cfg_for(Some(&session.project_root));
+        let moments = [autofork_core::moments::ForkMoment::Idle { deadline_secs: 0 }];
+        let mut selected = crate::planner::select_forks(self, &session, &cfg, &moments);
+        selected.retain(|s| s.chain);
+        match crate::planner::build_wake(self, &session, selected) {
+            Some((_payload, forks)) => ResponseBody::Due { forks },
+            None => ResponseBody::Due { forks: Vec::new() },
+        }
+    }
+
+    /// Spool a headless fork run's report for silent delivery on the
+    /// session's next prompt.
+    pub fn handle_spool_report(
+        self: &Arc<Self>,
+        session_id: &str,
+        fork: &str,
+        text: &str,
+    ) -> ResponseBody {
+        self.touch_busy();
+        let store = self.store.lock().unwrap();
+        let _ = store.spool_report(session_id, fork, text, now());
+        ResponseBody::Ack
+    }
+
+    /// Take (and clear) the spooled reports for a session.
+    pub fn handle_take_reports(self: &Arc<Self>, session_id: &str) -> ResponseBody {
+        self.touch_busy();
+        let store = self.store.lock().unwrap();
+        ResponseBody::Reports {
+            blocks: store.take_reports(session_id).unwrap_or_default(),
+        }
     }
 
     /// An opencode fork run finished. Mark it terminal, then nudge the

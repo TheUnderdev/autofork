@@ -22,6 +22,21 @@
 //! - exits when the codex process dies (pid watch) or the SessionEnd hook
 //!   leaves a tombstone.
 //!
+//! Two v0.17 additions ride on top:
+//!
+//! - **The goal fast path**: a synchronous `Stop` hook that, when a
+//!   `chain: true` fork is due at the pause's first Stop (`idle: 0s`), runs
+//!   it inline and answers `{"decision": "block", "reason": <report>}` —
+//!   codex injects the report as a continuation prompt and the parent reacts
+//!   in the same turn. The daemon reserves such forks for this path on codex
+//!   sessions so the waiter's poll can't race it.
+//! - **Cache-copy runs**: codex keys the OpenAI prompt cache on the thread
+//!   id, so a native `exec fork` reads the inherited history cold. When a
+//!   run uses the parent's model and the parent rollout is self-contained,
+//!   the run resumes a copy of the rollout (original id kept) inside a
+//!   throwaway `CODEX_HOME` instead — same cache key, warm prefix, parent
+//!   untouched. Preflight failures fall back to the native fork.
+//!
 //! Codex hooks are trust-gated (untrusted hooks are silently skipped), so
 //! `autofork codex install` both merges our hooks into `$CODEX_HOME/hooks.json`
 //! and trusts them through the same `hooks/list` + `config/batchWrite` RPCs
@@ -62,6 +77,13 @@ pub enum CxHookKind {
     /// Codex `UserPromptSubmit` hook: cancels any parked stop-wait, bumps the
     /// pause epoch (unless the prompt is one of our own report injections).
     PromptSubmit,
+    /// Codex `Stop` hook: the goal-loop fast path. Codex Stop hooks run
+    /// synchronously and may block-and-inject; when a `chain: true` fork is
+    /// due at this pause's first Stop (`idle: 0s` — the goal recipe), run it
+    /// right here and return its report as a continuation prompt — the model
+    /// reacts in the same turn, with none of the queue's latency. Anything
+    /// else exits instantly and leaves the waiter path untouched.
+    Stop,
     /// Codex `SessionEnd` hook: close the session, tombstone the waiter.
     SessionEnd,
 }
@@ -161,6 +183,62 @@ fn run_hook_inner(kind: CxHookKind) -> Option<()> {
             // Belt: a waiter that died mid-session comes back on the next
             // genuine prompt (the flock makes this a no-op when one lives).
             spawn_waiter(&paths, &input, &cwd);
+        }
+        CxHookKind::Stop => {
+            // Goal fast path. Ask the daemon — with a short budget, since a
+            // codex Stop hook holds the whole session — whether any chain
+            // fork is due at this very Stop. `PeekDue` stamps only what it
+            // returns; everything else stays for the waiter's parked poll.
+            let Ok(mut client) = Client::connect(&paths, Duration::from_millis(2000)) else {
+                spawn_daemon_detached(&paths);
+                return Some(());
+            };
+            let due = match client.request(RequestBody::PeekDue {
+                session_id: input.session_id.clone(),
+            }) {
+                Ok(ResponseBody::Due { forks }) if !forks.is_empty() => forks,
+                _ => return Some(()), // nothing due / old daemon: stay silent
+            };
+            set_stop_rollout(input.transcript_path.clone());
+            let mut blocks = Vec::new();
+            for spec in due {
+                // Sequential and synchronous: this IS the goal loop's
+                // iteration, and the session is deliberately held while the
+                // fork evaluates. Prior reports need no carrying — each block
+                // we returned earlier was injected into the parent, so the
+                // next fork copy inherits them with the history.
+                let outcome = execute_run(
+                    &paths,
+                    &input.session_id,
+                    &cwd,
+                    input.model.as_deref(),
+                    input.permission_mode.as_deref(),
+                    &spec,
+                    &spec.prompt,
+                );
+                let body = if outcome.status == "completed" && !outcome.report.is_empty() {
+                    outcome.report.clone()
+                } else if outcome.status == "completed" {
+                    "(the fork finished without a report)".to_string()
+                } else {
+                    format!("(the fork run {})", outcome.status)
+                };
+                blocks.push(report_block(
+                    &spec.name,
+                    &spec.trigger,
+                    outcome.status,
+                    &body,
+                ));
+                cleanup_run(&outcome);
+            }
+            // Block the stop and inject the report(s): codex records the
+            // reason as a continuation prompt and the model reacts in the
+            // same turn. This is the entire delivery — no queue involved.
+            let out = serde_json::json!({
+                "decision": "block",
+                "reason": blocks.join("\n\n"),
+            });
+            println!("{out}");
         }
         CxHookKind::SessionEnd => {
             // Tombstone first: the waiter must not re-park for a dead session.
@@ -569,6 +647,7 @@ fn run_fork(
     }
     let paths = Paths::new(paths.base.clone());
     let session = args.session.clone();
+    let rollout = args.rollout.clone();
     let cwd = args.cwd.clone();
     let model = state.model.clone().or_else(|| args.model.clone());
     let permission_mode = args.permission_mode.clone();
@@ -577,6 +656,7 @@ fn run_fork(
         run_fork_inner(
             &paths,
             &session,
+            &rollout,
             &cwd,
             model.as_deref(),
             permission_mode.as_deref(),
@@ -590,9 +670,11 @@ fn run_fork(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_fork_inner(
     paths: &Paths,
     session: &str,
+    rollout: &Path,
     cwd: &Path,
     model: Option<&str>,
     permission_mode: Option<&str>,
@@ -609,19 +691,169 @@ fn run_fork_inner(
         }
     }
 
+    let outcome = execute_run_with_rollout(
+        paths,
+        session,
+        Some(rollout),
+        cwd,
+        model,
+        permission_mode,
+        &spec,
+        &prompt,
+    );
+    if outcome.status == "completed" && !outcome.report.is_empty() {
+        shared
+            .lock()
+            .unwrap()
+            .reports
+            .insert(spec.name.clone(), outcome.report.clone());
+    }
+
+    // Deliver the report into the parent session via codex's durable queue:
+    // the parent's own process drains it when the session next goes idle.
+    let body = if outcome.status == "completed" {
+        if outcome.report.is_empty() {
+            "(the fork finished without a report)".to_string()
+        } else {
+            outcome.report.clone()
+        }
+    } else {
+        format!(
+            "(the fork run failed{})",
+            if outcome.report.is_empty() {
+                String::new()
+            } else {
+                format!("; its last message:\n{}", outcome.report)
+            }
+        )
+    };
+    let block = report_block(&spec.name, &spec.trigger, outcome.status, &body);
+    if let Err(e) = queue_message(session, &block) {
+        eprintln!(
+            "[codex-waiter] fork '{}' report delivery failed: {e}",
+            spec.name
+        );
+    }
+    cleanup_run(&outcome);
+}
+
+/// The result of one fork run's execution (daemon frames already sent).
+pub(crate) struct RunOutcome {
+    pub status: &'static str,
+    pub report: String,
+    /// The fork thread id of a native run — the session to delete on cleanup.
+    fork_thread: Option<String>,
+    /// The throwaway `CODEX_HOME` of a cache-copy run, removed on cleanup.
+    copy_home: Option<PathBuf>,
+}
+
+/// Stop-hook entry: no rollout path in hand beyond the hook input (which has
+/// it — the waiter path passes it explicitly).
+pub(crate) fn execute_run(
+    paths: &Paths,
+    session: &str,
+    cwd: &Path,
+    parent_model: Option<&str>,
+    parent_permission_mode: Option<&str>,
+    spec: &WakeFork,
+    prompt: &str,
+) -> RunOutcome {
+    execute_run_with_rollout(
+        paths,
+        session,
+        stop_hook_rollout().as_deref(),
+        cwd,
+        parent_model,
+        parent_permission_mode,
+        spec,
+        prompt,
+    )
+}
+
+/// The Stop hook stashes its transcript_path here for the cache-copy
+/// preflight (set in run_hook_inner before execute_run).
+static STOP_ROLLOUT: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+pub(crate) fn set_stop_rollout(p: Option<PathBuf>) {
+    *STOP_ROLLOUT.lock().unwrap() = p;
+}
+
+fn stop_hook_rollout() -> Option<PathBuf> {
+    STOP_ROLLOUT.lock().unwrap().clone()
+}
+
+/// Run one fork against the parent conversation and send the spawn/completion
+/// frames. Two execution shapes:
+///
+/// - **Native thread fork** (`codex exec fork`): always correct, but a fresh
+///   thread id means a fresh OpenAI prompt-cache key — the inherited history
+///   is read cold every run.
+/// - **Cache copy** (when the run uses the parent's model and the parent's
+///   rollout is self-contained): copy the rollout into a throwaway
+///   `CODEX_HOME` keeping the original session id and `codex exec resume` it
+///   there. Same id → same cache key → the parent's warm prefix is reused
+///   (~93% measured); the parent's real home is untouched. Falls back to the
+///   native fork whenever the preflight fails, and can be disabled outright
+///   with `AUTOFORK_CODEX_NO_CACHE_COPY=1`.
+#[allow(clippy::too_many_arguments)]
+fn execute_run_with_rollout(
+    paths: &Paths,
+    session: &str,
+    rollout: Option<&Path>,
+    cwd: &Path,
+    parent_model: Option<&str>,
+    parent_permission_mode: Option<&str>,
+    spec: &WakeFork,
+    prompt: &str,
+) -> RunOutcome {
+    let model = spec.model.as_deref().or(parent_model);
+    let same_model = match spec.model.as_deref() {
+        None => true,
+        Some(m) => Some(m) == parent_model,
+    };
+    let sandbox = resolve_sandbox(spec.mode.as_deref(), parent_permission_mode);
+
+    let copy_home = if same_model && std::env::var_os("AUTOFORK_CODEX_NO_CACHE_COPY").is_none() {
+        rollout.and_then(|r| prepare_cache_copy(paths, session, r))
+    } else {
+        None
+    };
+    debug_log(&format!(
+        "execute_run fork={} session={session} rollout={rollout:?} copy={}",
+        spec.name,
+        copy_home.is_some()
+    ));
+
+    // Register the run ref BEFORE anything executes: the daemon refuses to
+    // schedule fork-run sessions from here on (defense in depth next to the
+    // recursion env guard). Native runs learn their real thread id from the
+    // stream and register it then instead; copy runs reuse the parent id on
+    // purpose, so their ref is synthetic.
+    let copy_ref = copy_home.is_some().then(|| format!("copy:{}", uuid_v4()));
+    if let Some(r) = &copy_ref {
+        send_fork_frame(paths, session, &spec.name, Some(r), None);
+    }
+
     let mut cmd = Command::new(codex_bin());
     cmd.arg("exec")
         .arg("--skip-git-repo-check")
         .arg("--json")
         .arg("-C")
         .arg(cwd);
-    for a in sandbox_args(permission_mode) {
+    for a in &sandbox {
         cmd.arg(a);
     }
     if let Some(m) = model {
         cmd.arg("-m").arg(m);
     }
-    cmd.arg("fork").arg(session).arg(&prompt);
+    if copy_home.is_some() {
+        cmd.arg("resume").arg(session).arg(prompt);
+    } else {
+        cmd.arg("fork").arg(session).arg(prompt);
+    }
+    if let Some(home) = &copy_home {
+        cmd.env("CODEX_HOME", home);
+    }
     cmd.env("AUTOFORK_FORK", "1")
         .env("AUTOFORK_SESSION_ID", session)
         .env("AUTOFORK_FORK_NAME", &spec.name)
@@ -633,16 +865,27 @@ fn run_fork_inner(
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[codex-waiter] fork '{}' spawn failed: {e}", spec.name);
+            eprintln!("[codex-fork] '{}' spawn failed: {e}", spec.name);
             // Nothing ran; report a failed run so `after` dependents release.
-            send_fork_frame(paths, session, &spec.name, None, Some(("failed", None)));
-            return;
+            send_fork_frame(
+                paths,
+                session,
+                &spec.name,
+                copy_ref.as_deref(),
+                Some(("failed", None)),
+            );
+            return RunOutcome {
+                status: "failed",
+                report: String::new(),
+                fork_thread: None,
+                copy_home,
+            };
         }
     };
 
     let stdout = child.stdout.take();
     let deadline = Instant::now() + fork_timeout();
-    let mut run_ref: Option<String> = None;
+    let mut fork_thread: Option<String> = None;
     let mut last_message: Option<String> = None;
     let mut failed = false;
     let mut completed = false;
@@ -662,11 +905,12 @@ fn run_fork_inner(
             match v["type"].as_str() {
                 Some("thread.started") => {
                     if let Some(id) = v["thread_id"].as_str() {
-                        run_ref = Some(id.to_string());
-                        // Register the run ref BEFORE the run proceeds: the
-                        // daemon refuses to schedule fork-run sessions from
-                        // here on (defense in depth next to the env guard).
-                        send_fork_frame(paths, session, &spec.name, Some(id), None);
+                        // A copy run's stream reports the parent's own id —
+                        // never register that as a fork run.
+                        if copy_ref.is_none() && id != session {
+                            fork_thread = Some(id.to_string());
+                            send_fork_frame(paths, session, &spec.name, Some(id), None);
+                        }
                     }
                 }
                 Some("item.completed") => {
@@ -695,63 +939,136 @@ fn run_fork_inner(
     if chain_next {
         report = autofork_core::wake::strip_continue(&report);
     }
-    if status == "completed" && !report.is_empty() {
-        shared
-            .lock()
-            .unwrap()
-            .reports
-            .insert(spec.name.clone(), report.clone());
-    }
 
-    // Deliver the report into the parent session via codex's durable queue:
-    // the parent's own process drains it when the session next goes idle.
-    let body = if status == "completed" {
-        if report.is_empty() {
-            "(the fork finished without a report)".to_string()
-        } else {
-            report.clone()
-        }
-    } else {
-        format!(
-            "(the fork run failed{})",
-            if report.is_empty() {
-                String::new()
-            } else {
-                format!("; its last message:\n{report}")
-            }
-        )
-    };
-    let block = report_block(&spec.name, &spec.trigger, status, &body);
-    if let Err(e) = queue_message(session, &block) {
-        eprintln!(
-            "[codex-waiter] fork '{}' report delivery failed: {e}",
-            spec.name
-        );
-    }
-
-    // The completion frame rides even if delivery failed: the daemon settles
-    // the run and (for chains) re-arms the fork.
+    // The completion frame rides even when delivery later fails: the daemon
+    // settles the run and (for chains) re-arms the fork.
     send_fork_frame(
         paths,
         session,
         &spec.name,
-        run_ref.as_deref(),
+        copy_ref.as_deref().or(fork_thread.as_deref()),
         Some((status, chain_next.then_some(true))),
     );
 
-    // A completed run's thread has served its purpose; delete it so fork runs
-    // never accumulate in codex's session store. Failed runs stay readable.
-    if status == "completed" && std::env::var_os("AUTOFORK_KEEP_FORK_SESSIONS").is_none() {
-        if let Some(id) = run_ref.as_deref() {
-            // `--force`: without a terminal, delete refuses to confirm.
-            let _ = Command::new(codex_bin())
-                .arg("delete")
-                .arg("--force")
-                .arg(id)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+    RunOutcome {
+        status,
+        report,
+        fork_thread,
+        copy_home,
+    }
+}
+
+/// Resolve the sandbox flags: a fork's `mode:` names a codex sandbox
+/// directly; without one, derive it from the parent's permission mode.
+fn resolve_sandbox(mode: Option<&str>, parent_permission_mode: Option<&str>) -> Vec<String> {
+    match mode {
+        Some("danger-full-access") => {
+            vec!["--dangerously-bypass-approvals-and-sandbox".to_string()]
+        }
+        Some(m @ ("read-only" | "workspace-write")) => {
+            vec!["--sandbox".to_string(), m.to_string()]
+        }
+        Some(other) => {
+            eprintln!(
+                "[codex-fork] unknown mode '{other}' (expected read-only / workspace-write / \
+                 danger-full-access); using the session's"
+            );
+            sandbox_args(parent_permission_mode)
+                .into_iter()
+                .map(String::from)
+                .collect()
+        }
+        None => sandbox_args(parent_permission_mode)
+            .into_iter()
+            .map(String::from)
+            .collect(),
+    }
+}
+
+/// Preflight + build the throwaway `CODEX_HOME` for a cache-copy run. `None`
+/// means "use the native fork instead" — never an error.
+fn prepare_cache_copy(paths: &Paths, session: &str, rollout: &Path) -> Option<PathBuf> {
+    // Self-contained plain-JSONL rollouts only: compressed files, paginated
+    // history and reference-backed forks (`history_base`) all break a byte
+    // copy, and codex is free to move to them — fail closed to native.
+    if rollout.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+        return None;
+    }
+    let mut first = String::new();
+    {
+        let f = std::fs::File::open(rollout).ok()?;
+        let mut reader = BufReader::new(f);
+        reader.read_line(&mut first).ok()?;
+    }
+    let meta: serde_json::Value = serde_json::from_str(first.trim()).ok()?;
+    if meta["type"].as_str() != Some("session_meta") {
+        return None;
+    }
+    let payload = &meta["payload"];
+    if payload["id"].as_str() != Some(session) {
+        return None;
+    }
+    if payload
+        .get("history_base")
+        .map(|v| !v.is_null())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+
+    let real_home = codex_home()?;
+    let home = paths
+        .base
+        .join("tmp")
+        .join(format!("cx-{}", &uuid_v4()[..13]));
+    // Mirror the source's date path under sessions/ so resume's scan finds it.
+    let rel: PathBuf = {
+        let comps: Vec<_> = rollout.components().collect();
+        let pos = comps.iter().position(|c| c.as_os_str() == "sessions")?;
+        comps[pos..].iter().collect()
+    };
+    let dst = home.join(&rel);
+    std::fs::create_dir_all(dst.parent()?).ok()?;
+    std::fs::copy(rollout, &dst).ok()?;
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(real_home.join("auth.json"), home.join("auth.json")).ok()?;
+    let _ = std::fs::copy(real_home.join("config.toml"), home.join("config.toml"));
+    Some(home)
+}
+
+/// Post-delivery cleanup: delete a native run's fork thread (codex would
+/// otherwise accumulate one stored session per fork per pause) and a copy
+/// run's throwaway home. Failed runs keep both, for inspection.
+pub(crate) fn cleanup_run(outcome: &RunOutcome) {
+    if outcome.status != "completed" || std::env::var_os("AUTOFORK_KEEP_FORK_SESSIONS").is_some() {
+        return;
+    }
+    if let Some(id) = outcome.fork_thread.as_deref() {
+        // `--force`: without a terminal, delete refuses to confirm.
+        let _ = Command::new(codex_bin())
+            .arg("delete")
+            .arg("--force")
+            .arg(id)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    if let Some(home) = &outcome.copy_home {
+        let _ = std::fs::remove_dir_all(home);
+    }
+}
+
+/// Append a debug line when `AUTOFORK_CODEX_DEBUG` names a file (test aid).
+fn debug_log(msg: &str) {
+    if let Ok(path) = std::env::var("AUTOFORK_CODEX_DEBUG") {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            use std::io::Write as _;
+            let _ = writeln!(f, "[{}] {msg}", std::process::id());
         }
     }
 }
@@ -765,6 +1082,9 @@ fn send_fork_frame(
     completion: Option<(&str, Option<bool>)>,
 ) {
     let Ok(mut client) = Client::connect_or_spawn(paths, Duration::from_secs(5)) else {
+        debug_log(&format!(
+            "frame connect failed fork={fork} run_ref={run_ref:?} completion={completion:?}"
+        ));
         return;
     };
     let run_ref = run_ref.unwrap_or("unknown").to_string();
@@ -772,17 +1092,20 @@ fn send_fork_frame(
         None => RequestBody::ForkSpawned {
             session_id: session.to_string(),
             fork: fork.to_string(),
-            run_ref,
+            run_ref: run_ref.clone(),
         },
         Some((status, cont)) => RequestBody::ForkCompleted {
             session_id: session.to_string(),
             fork: fork.to_string(),
-            run_ref,
+            run_ref: run_ref.clone(),
             status: status.to_string(),
             cont,
         },
     };
-    let _ = client.request(body);
+    let res = client.request(body);
+    debug_log(&format!(
+        "frame sent fork={fork} run_ref={run_ref} completion={completion:?} -> {res:?}"
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -876,7 +1199,7 @@ impl Drop for AppServer {
 }
 
 /// A v4 UUID from the OS RNG (no extra dependency).
-fn uuid_v4() -> String {
+pub(crate) fn uuid_v4() -> String {
     let mut b = [0u8; 16];
     let mut f = std::fs::File::open("/dev/urandom").expect("urandom");
     f.read_exact(&mut b).expect("urandom read");
@@ -920,9 +1243,10 @@ fn hooks_json_path() -> Option<PathBuf> {
 }
 
 /// The (codex event name, autofork hook kind) pairs we install.
-const HOOK_EVENTS: [(&str, &str); 3] = [
+const HOOK_EVENTS: [(&str, &str); 4] = [
     ("SessionStart", "session-start"),
     ("UserPromptSubmit", "prompt-submit"),
+    ("Stop", "stop"),
     ("SessionEnd", "session-end"),
 ];
 
@@ -1317,6 +1641,27 @@ mod tests {
             vec!["--sandbox", "workspace-write"]
         );
         assert_eq!(sandbox_args(None), vec!["--sandbox", "workspace-write"]);
+    }
+
+    #[test]
+    fn resolve_sandbox_prefers_the_fork_mode() {
+        assert_eq!(
+            resolve_sandbox(Some("read-only"), Some("bypassPermissions")),
+            vec!["--sandbox".to_string(), "read-only".to_string()]
+        );
+        assert_eq!(
+            resolve_sandbox(Some("danger-full-access"), None),
+            vec!["--dangerously-bypass-approvals-and-sandbox".to_string()]
+        );
+        // Unknown mode falls back to the session's permission mode.
+        assert_eq!(
+            resolve_sandbox(Some("nonsense"), Some("plan")),
+            vec!["--sandbox".to_string(), "read-only".to_string()]
+        );
+        assert_eq!(
+            resolve_sandbox(None, None),
+            vec!["--sandbox".to_string(), "workspace-write".to_string()]
+        );
     }
 
     #[test]

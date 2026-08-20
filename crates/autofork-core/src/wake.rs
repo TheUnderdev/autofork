@@ -143,6 +143,11 @@ pub struct DueFork {
     /// `chain: true` frontmatter: the spawn prompt tells the fork it may end
     /// its report with the [`CONTINUE_SENTINEL`] to request another run.
     pub chain: bool,
+    /// Model for the run, already resolved for the session's client (fork
+    /// `model:` over config `[fork_models]`). `None` = inherit the session's.
+    pub model: Option<String>,
+    /// Operation mode for the run, resolved like `model`.
+    pub mode: Option<String>,
 }
 
 /// A fork the daemon is holding back until its predecessors finish, named in
@@ -353,6 +358,8 @@ pub fn build_wake_forks(
             overlap: f.overlap,
             after: f.after.clone(),
             chain: f.chain,
+            model: f.model.clone(),
+            mode: f.mode.clone(),
             prompt: spawn_prompt(f, session_id, conversation_id, project_root),
         })
         .collect()
@@ -390,6 +397,8 @@ mod tests {
             after: after.iter().map(|s| s.to_string()).collect(),
             skill: None,
             chain: false,
+            model: None,
+            mode: None,
         }
     }
 

@@ -167,6 +167,8 @@ async fn dispatch(daemon: &Arc<Daemon>, body: RequestBody) -> ResponseBody {
                     tags: e.parsed.def.tags.clone(),
                     chain: e.parsed.def.chain,
                     gate: e.parsed.def.gate,
+                    model: e.parsed.def.model.display(),
+                    mode: e.parsed.def.mode.display(),
                     warnings: e
                         .parsed
                         .warnings
@@ -197,6 +199,13 @@ async fn dispatch(daemon: &Arc<Daemon>, body: RequestBody) -> ResponseBody {
             &status,
             cont.unwrap_or(false),
         ),
+        RequestBody::PeekDue { session_id } => daemon.handle_peek_due(&session_id),
+        RequestBody::SpoolReport {
+            session_id,
+            fork,
+            text,
+        } => daemon.handle_spool_report(&session_id, &fork, &text),
+        RequestBody::TakeReports { session_id } => daemon.handle_take_reports(&session_id),
         RequestBody::Shutdown { drain } => {
             tracing::info!(drain, "shutdown requested");
             let daemon = daemon.clone();

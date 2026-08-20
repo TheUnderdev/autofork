@@ -109,6 +109,16 @@ fn run_hook_inner(kind: HookKind) -> Option<()> {
                 spawn_daemon_detached(&paths);
                 return Some(());
             };
+            // Headless-runner reports spooled since the last prompt are
+            // delivered here, silently, as additionalContext (invisible in
+            // the transcript). Old daemons answer Error — treated as none.
+            if let Ok(ResponseBody::Reports { blocks }) = client.request(RequestBody::TakeReports {
+                session_id: input.session_id.clone(),
+            }) {
+                if !blocks.is_empty() {
+                    print_additional_context(&blocks);
+                }
+            }
             // Sniff the prompt. An asyncRewake wake reminder (our marker) is
             // always a non-waking continuation. A task notification gets its
             // envelope ids forwarded so the daemon can decide whether it is
@@ -137,13 +147,53 @@ fn run_hook_inner(kind: HookKind) -> Option<()> {
             // Runs async (Claude Code doesn't block): fine to spawn + retire.
             let client = Client::connect_or_spawn(&paths, Duration::from_secs(10)).ok()?;
             let mut client = client.ensure_current_version(&paths).ok()?;
-            // Long-poll until forks are due or the wait is cancelled/retired.
-            // Waited / error / closed socket / proto skew: exit 0 silently.
-            if let Ok(ResponseBody::Wake { payload, .. }) = client.stop_wait(event(EventKind::Stop))
-            {
-                // Wake the idle session: stderr shown as a system reminder.
-                eprintln!("{payload}");
-                std::process::exit(2);
+            let headless = {
+                let (cfg, _warnings) =
+                    autofork_core::config::load_config_at(Some(&root), &paths.user_config());
+                cfg.fork_runner == autofork_core::config::ForkRunner::Headless
+            };
+            if headless {
+                // The quiet mode: this parked hook process consumes wakes
+                // itself — no exit 2, no wake turn, no visible spawns. It
+                // runs each fork as a `claude -p --fork-session` subprocess,
+                // spools the report for silent delivery at the next prompt,
+                // and re-parks until the wait is cancelled by activity.
+                let resume_target = input
+                    .transcript_path
+                    .as_deref()
+                    .and_then(|p| p.file_stem())
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| input.session_id.clone());
+                let mut reports = std::collections::HashMap::new();
+                while let Ok(ResponseBody::Wake { forks, .. }) =
+                    client.stop_wait(event(EventKind::Stop))
+                {
+                    crate::runner::execute_wake(
+                        &paths,
+                        &input.session_id,
+                        &resume_target,
+                        &cwd,
+                        forks.unwrap_or_default(),
+                        &mut reports,
+                    );
+                    // Re-park on a fresh connection (the wake resolved this
+                    // one's poll); a brief pause guards against a misbehaving
+                    // daemon spinning us.
+                    std::thread::sleep(Duration::from_secs(1));
+                    let c = Client::connect_or_spawn(&paths, Duration::from_secs(10)).ok()?;
+                    client = c.ensure_current_version(&paths).ok()?;
+                }
+            } else {
+                // Long-poll until forks are due or the wait is cancelled/
+                // retired. Waited / error / closed socket / proto skew: exit
+                // 0 silently.
+                if let Ok(ResponseBody::Wake { payload, .. }) =
+                    client.stop_wait(event(EventKind::Stop))
+                {
+                    // Wake the idle session: stderr shown as a system reminder.
+                    eprintln!("{payload}");
+                    std::process::exit(2);
+                }
             }
         }
         HookKind::SessionEnd => {
@@ -152,6 +202,29 @@ fn run_hook_inner(kind: HookKind) -> Option<()> {
         }
     }
     Some(())
+}
+
+/// Print spooled fork reports as UserPromptSubmit additionalContext (exit-0
+/// JSON on stdout). Claude Code caps additionalContext at 10k characters;
+/// truncate to fit rather than lose the delivery entirely.
+fn print_additional_context(blocks: &[String]) {
+    const CAP: usize = 9_800;
+    let mut text = blocks.join("\n\n");
+    if text.len() > CAP {
+        let mut cut = CAP;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
+        text.push_str("\n[…report truncated to fit the context budget]");
+    }
+    let out = serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": text,
+        }
+    });
+    println!("{out}");
 }
 
 /// Read a comma-separated tag env var into a normalized list (trimmed,

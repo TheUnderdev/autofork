@@ -3,6 +3,7 @@ mod codex;
 mod commands;
 mod hook;
 mod opencode;
+mod runner;
 
 use autofork_core::config::Paths;
 use clap::{Parser, Subcommand};

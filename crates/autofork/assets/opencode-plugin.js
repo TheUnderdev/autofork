@@ -310,13 +310,24 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
           fork: spec.name,
           run_ref: forked.id,
         });
-        // Pin the parent's model and agent: a forked session doesn't inherit
-        // them, and prompt-cache reuse needs an identical request prefix.
+        // Pin the run's model and agent: a forked session doesn't inherit
+        // them. Default is the parent's own (prompt-cache reuse needs an
+        // identical request prefix); a fork's `model:`/`mode:` overrides win
+        // — the daemon resolves them into the spec (model as
+        // "provider/model", mode as the agent name).
+        let runModel = parent.model;
+        if (spec.model) {
+          const i = spec.model.indexOf("/");
+          if (i > 0) {
+            runModel = { providerID: spec.model.slice(0, i), modelID: spec.model.slice(i + 1) };
+          }
+        }
+        const runAgent = spec.mode ?? parent.agent;
         await client.session.promptAsync({
           path: { id: forked.id },
           body: {
-            ...(parent.model ? { model: parent.model } : {}),
-            ...(parent.agent ? { agent: parent.agent } : {}),
+            ...(runModel ? { model: runModel } : {}),
+            ...(runAgent ? { agent: runAgent } : {}),
             parts: [{ type: "text", text: prompt }],
           },
         });

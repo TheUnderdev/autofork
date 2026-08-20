@@ -2340,3 +2340,186 @@ fn codex_fork_run_sessions_are_never_scheduled() {
     ));
     assert_eq!(h.status_recent_runs(), 1);
 }
+
+#[test]
+fn wake_forks_carry_resolved_model_and_mode() {
+    // Fork frontmatter wins; config [fork_models]/[fork_modes] fills per
+    // client; a client the map doesn't name inherits (None).
+    let mut h = Harness::new("1s", "0");
+    h.append_config("[fork_models]");
+    h.append_config("codex = \"gpt-5.1-codex-mini\"");
+    h.append_config("\"claude-code\" = \"haiku\"");
+    h.write_fork(
+        "journal.md",
+        "---\nfork: true\nrun_on: [idle]\nmodel:\n  opencode: anthropic/claude-haiku-4-5\nmode:\n  codex: workspace-write\n---\nJ",
+    );
+    h.start_daemon();
+
+    // opencode session: frontmatter names its model; no mode → None.
+    assert_ack(h.send_event(oc_event(&h, EventKind::SessionStart, "oc-m")));
+    let rx = h.park_stop_wait(oc_event(&h, EventKind::Stop, "oc-m"));
+    let forks = wake_forks(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert_eq!(
+        forks[0].model.as_deref(),
+        Some("anthropic/claude-haiku-4-5")
+    );
+    assert_eq!(forks[0].mode, None);
+
+    // codex session: frontmatter has no codex model → config fallback; mode
+    // from frontmatter.
+    let sid = "01a01f24-dddd-76c3-a00a-74ac3948e630";
+    assert_ack(h.send_event(cx_event(&h, EventKind::SessionStart, sid)));
+    let rx = h.park_stop_wait(cx_event(&h, EventKind::Stop, sid));
+    let forks = wake_forks(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert_eq!(forks[0].model.as_deref(), Some("gpt-5.1-codex-mini"));
+    assert_eq!(forks[0].mode.as_deref(), Some("workspace-write"));
+
+    // Claude Code session (no client tag): config fallback for its model.
+    assert_ack(h.send_event(h.event(EventKind::SessionStart, "cc1")));
+    let rx = h.park_stop_wait(h.event(EventKind::Stop, "cc1"));
+    let forks = wake_forks(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert_eq!(forks[0].model.as_deref(), Some("haiku"));
+}
+
+#[test]
+fn codex_peek_due_runs_the_goal_fast_path() {
+    // PeekDue selects-and-stamps only chain forks due at idle:0s; the
+    // non-chain idle:0s fork stays unstamped for the parked poll. A cont
+    // completion re-arms the chain for the next PeekDue (the loop); a
+    // settle leaves the next PeekDue empty.
+    let mut h = Harness::new("1h", "0"); // long default idle: only idle:0s fires
+    h.write_fork(
+        "goal.md",
+        "---\nfork: true\nrun_on:\n  - idle: 0s\nchain: true\n---\nGOAL",
+    );
+    h.write_fork(
+        "note.md",
+        "---\nfork: true\nrun_on:\n  - idle: 0s\n---\nNOTE",
+    );
+    h.start_daemon();
+    let sid = "01a01f24-eeee-76c3-a00a-74ac3948e630";
+    assert_ack(h.send_event(cx_event(&h, EventKind::SessionStart, sid)));
+
+    // Iteration 1.
+    let ResponseBody::Due { forks } = h.request(RequestBody::PeekDue {
+        session_id: sid.into(),
+    }) else {
+        panic!("expected Due");
+    };
+    assert_eq!(forks.len(), 1, "only the chain fork rides the fast path");
+    assert_eq!(forks[0].name, "goal");
+    assert!(forks[0].chain);
+    assert_ack(h.request(RequestBody::ForkSpawned {
+        session_id: sid.into(),
+        fork: "goal".into(),
+        run_ref: "01a01f30-aaaa-7000-8000-000000000001".into(),
+    }));
+    assert_ack(h.request(RequestBody::ForkCompleted {
+        session_id: sid.into(),
+        fork: "goal".into(),
+        run_ref: "01a01f30-aaaa-7000-8000-000000000001".into(),
+        status: "completed".into(),
+        cont: Some(true),
+    }));
+
+    // Iteration 2: the cont re-armed the latch.
+    let ResponseBody::Due { forks } = h.request(RequestBody::PeekDue {
+        session_id: sid.into(),
+    }) else {
+        panic!("expected Due");
+    };
+    assert_eq!(forks.len(), 1);
+    assert_ack(h.request(RequestBody::ForkSpawned {
+        session_id: sid.into(),
+        fork: "goal".into(),
+        run_ref: "01a01f30-aaaa-7000-8000-000000000002".into(),
+    }));
+    assert_ack(h.request(RequestBody::ForkCompleted {
+        session_id: sid.into(),
+        fork: "goal".into(),
+        run_ref: "01a01f30-aaaa-7000-8000-000000000002".into(),
+        status: "completed".into(),
+        cont: None, // settle
+    }));
+
+    // Settled: nothing due on the fast path any more this pause.
+    let ResponseBody::Due { forks } = h.request(RequestBody::PeekDue {
+        session_id: sid.into(),
+    }) else {
+        panic!("expected Due");
+    };
+    assert!(forks.is_empty(), "settled chain must not re-fire");
+
+    // The non-chain idle:0s fork was never stamped: the regular parked poll
+    // still fires it.
+    let rx = h.park_stop_wait(cx_event(&h, EventKind::Stop, sid));
+    let forks = wake_forks(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert_eq!(forks.len(), 1);
+    assert_eq!(forks[0].name, "note");
+}
+
+#[test]
+fn spooled_reports_deliver_once_in_order() {
+    let mut h = Harness::new("1h", "0");
+    h.start_daemon();
+    assert_ack(h.send_event(h.event(EventKind::SessionStart, "cc-spool")));
+    assert_ack(h.request(RequestBody::SpoolReport {
+        session_id: "cc-spool".into(),
+        fork: "journal".into(),
+        text: "first".into(),
+    }));
+    assert_ack(h.request(RequestBody::SpoolReport {
+        session_id: "cc-spool".into(),
+        fork: "notes".into(),
+        text: "second".into(),
+    }));
+    let ResponseBody::Reports { blocks } = h.request(RequestBody::TakeReports {
+        session_id: "cc-spool".into(),
+    }) else {
+        panic!("expected Reports");
+    };
+    assert_eq!(blocks, vec!["first".to_string(), "second".to_string()]);
+    let ResponseBody::Reports { blocks } = h.request(RequestBody::TakeReports {
+        session_id: "cc-spool".into(),
+    }) else {
+        panic!("expected Reports");
+    };
+    assert!(blocks.is_empty(), "taking clears the spool");
+}
+
+#[test]
+fn codex_poll_reserves_idle_zero_chain_forks_for_peek_due() {
+    // The waiter's parked poll and the Stop hook's PeekDue both fire at the
+    // pause's first Stop; the poll must leave `idle: 0s` chain forks to the
+    // fast path (a poll win would strand the goal loop on the queue path).
+    let mut h = Harness::new("1h", "0");
+    h.write_fork(
+        "goal.md",
+        "---\nfork: true\nrun_on:\n  - idle: 0s\nchain: true\n---\nGOAL",
+    );
+    h.start_daemon();
+    let sid = "01a01f24-ffff-76c3-a00a-74ac3948e630";
+    assert_ack(h.send_event(cx_event(&h, EventKind::SessionStart, sid)));
+
+    // The parked poll must NOT fire the goal fork...
+    let rx = h.park_stop_wait(cx_event(&h, EventKind::Stop, sid));
+    assert!(
+        rx.recv_timeout(Duration::from_millis(2500)).is_err(),
+        "the poll grabbed a fast-path fork"
+    );
+    // ...and the latch is untouched, so PeekDue still gets it.
+    let ResponseBody::Due { forks } = h.request(RequestBody::PeekDue {
+        session_id: sid.into(),
+    }) else {
+        panic!("expected Due");
+    };
+    assert_eq!(forks.len(), 1);
+    assert_eq!(forks[0].name, "goal");
+
+    // opencode sessions are NOT reserved (no fast path there): same fork
+    // definition fires on the poll.
+    assert_ack(h.send_event(oc_event(&h, EventKind::SessionStart, "oc-goal")));
+    let rx = h.park_stop_wait(oc_event(&h, EventKind::Stop, "oc-goal"));
+    let forks = wake_forks(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert_eq!(forks[0].name, "goal");
+}

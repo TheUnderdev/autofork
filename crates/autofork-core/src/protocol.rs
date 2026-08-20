@@ -57,6 +57,24 @@ pub enum RequestBody {
         #[serde(default, rename = "continue", skip_serializing_if = "Option::is_none")]
         cont: Option<bool>,
     },
+    /// The codex Stop hook's goal fast path: evaluate NOW whether any
+    /// `chain: true` fork is due at this pause's first Stop (the `idle: 0s`
+    /// goal recipe) and, if so, select-and-stamp exactly those and return
+    /// them as structured specs (a `Due` response). Non-chain forks are left
+    /// unstamped for the regular parked poll. Additive frame (proto 1); old
+    /// daemons answer `Error`, which callers treat as "nothing due".
+    PeekDue { session_id: String },
+    /// Spool a headless fork run's report for later silent delivery (the
+    /// Claude Code headless runner). Delivered and cleared by `TakeReports`.
+    SpoolReport {
+        session_id: String,
+        fork: String,
+        text: String,
+    },
+    /// Take (and clear) the spooled reports for a session — called by the
+    /// UserPromptSubmit hook to deliver them as additionalContext. Additive
+    /// frame; old daemons answer `Error`, treated as "none".
+    TakeReports { session_id: String },
     /// Ask the daemon to exit. With `drain`, it finishes cleanly first.
     /// Frozen shape — never change.
     Shutdown { drain: bool },
@@ -184,6 +202,16 @@ pub enum ResponseBody {
     Pruned {
         sessions: Vec<SessionInfo>,
     },
+    /// Answer to `PeekDue`: the chain forks selected to run right now
+    /// (empty = nothing due on the fast path). Additive.
+    Due {
+        forks: Vec<WakeFork>,
+    },
+    /// Answer to `TakeReports`: the spooled report blocks, oldest first
+    /// (now cleared). Additive.
+    Reports {
+        blocks: Vec<String>,
+    },
     Error {
         code: ErrorCode,
         message: String,
@@ -255,6 +283,15 @@ pub struct WakeFork {
     /// completion frame). Additive field (no proto bump).
     #[serde(default)]
     pub chain: bool,
+    /// Model to run the fork with, already resolved for the session's client
+    /// (fork frontmatter over config `[fork_models]`). `None` = inherit the
+    /// session's model. Additive field (no proto bump).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Operation mode for the run, resolved like `model` (permission mode /
+    /// sandbox / agent, per client). `None` = the client's default. Additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
     /// The prompt to run the fork with (already carries the fork file path,
     /// trigger, session/conversation ids and project root).
     pub prompt: String,
@@ -289,6 +326,13 @@ pub struct ForkInfo {
     /// field (no proto bump).
     #[serde(default)]
     pub gate: bool,
+    /// Display form of the fork's `model:` (scalar or "client: value, …").
+    /// Additive field (no proto bump).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Display form of the fork's `mode:`. Additive field (no proto bump).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
     pub warnings: Vec<String>,
 }
 
@@ -354,6 +398,8 @@ mod tests {
                     overlap: false,
                     after: Vec::new(),
                     chain: false,
+                    model: None,
+                    mode: None,
                     prompt: "Read the file /x/journal.md".into(),
                 }]),
             },

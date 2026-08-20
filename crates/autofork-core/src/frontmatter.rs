@@ -7,16 +7,106 @@
 //! notes, with a migration warning when they carry fork-like frontmatter.
 //!
 //! Supported top-level keys: `fork`, `description`, `run_on`, `throttle`,
-//! `after`, `priority`, `overlap`, `tags`, `chain`, `chain_limit`, `gate`.
-//! Unknown keys are ignored for
+//! `after`, `priority`, `overlap`, `tags`, `chain`, `chain_limit`, `gate`,
+//! `model`, `mode`. Unknown keys are ignored for
 //! forward compatibility; invalid values warn and fall back rather than
-//! dropping the fork. The keys `delivery`, `model`, `allowed_tools`,
-//! `permission_mode` are parsed-and-ignored with a deprecation warning (v0.5
-//! forks inherit the session's permissions and model; report delivery is
-//! native). There is deliberately no RAG surface in this format.
+//! dropping the fork. `model` and `mode` (which client runs use for the fork,
+//! since v0.17) take either one scalar or a map keyed by client name
+//! (`claude-code` / `opencode` / `codex`) — fork files are shared across
+//! clients, and a bare model id rarely means anything to more than one. The
+//! keys `delivery`, `allowed_tools`, `permission_mode` are parsed-and-ignored
+//! with a deprecation warning (report delivery is native; `mode` supersedes
+//! `permission_mode`). There is deliberately no RAG surface in this format.
 
 use crate::duration::parse_duration_yaml;
 use serde::Deserialize;
+use std::collections::BTreeMap;
+
+/// A frontmatter value that may differ per client: one scalar used verbatim
+/// wherever the fork runs, or a map keyed by client name (`claude-code`,
+/// `opencode`, `codex`). Fork files are shared across clients, and a model
+/// id or mode value rarely means anything to more than one of them.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ClientScoped {
+    #[default]
+    Unset,
+    Scalar(String),
+    PerClient(BTreeMap<String, String>),
+}
+
+impl ClientScoped {
+    /// The value for a given client name; a scalar applies to every client.
+    pub fn resolve(&self, client: &str) -> Option<&str> {
+        match self {
+            ClientScoped::Unset => None,
+            ClientScoped::Scalar(s) => Some(s),
+            ClientScoped::PerClient(m) => m.get(client).map(String::as_str),
+        }
+    }
+
+    pub fn is_set(&self) -> bool {
+        !matches!(self, ClientScoped::Unset)
+    }
+
+    /// One-line display form for `autofork forks`.
+    pub fn display(&self) -> Option<String> {
+        match self {
+            ClientScoped::Unset => None,
+            ClientScoped::Scalar(s) => Some(s.clone()),
+            ClientScoped::PerClient(m) => Some(
+                m.iter()
+                    .map(|(k, v)| format!("{k}: {v}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+        }
+    }
+}
+
+/// Parse a scalar-or-map client-scoped value; invalid shapes warn and yield
+/// `Unset` (never drop the fork).
+fn parse_client_scoped(
+    v: &serde_yaml::Value,
+    key: &str,
+    name: &str,
+    warnings: &mut Vec<String>,
+) -> ClientScoped {
+    match v {
+        serde_yaml::Value::String(s) if !s.trim().is_empty() => {
+            ClientScoped::Scalar(s.trim().to_string())
+        }
+        serde_yaml::Value::Mapping(m) => {
+            let mut out = BTreeMap::new();
+            for (k, val) in m {
+                match (k.as_str(), val.as_str()) {
+                    (Some(client), Some(value))
+                        if !client.trim().is_empty() && !value.trim().is_empty() =>
+                    {
+                        out.insert(client.trim().to_string(), value.trim().to_string());
+                    }
+                    _ => warnings.push(format!(
+                        "fork '{name}': {key} map entries must be 'client: value' strings; \
+                         skipping one"
+                    )),
+                }
+            }
+            if out.is_empty() {
+                warnings.push(format!(
+                    "fork '{name}': {key} map has no valid entries, ignoring"
+                ));
+                ClientScoped::Unset
+            } else {
+                ClientScoped::PerClient(out)
+            }
+        }
+        _ => {
+            warnings.push(format!(
+                "fork '{name}': {key} must be a string or a client-keyed map, ignoring"
+            ));
+            ClientScoped::Unset
+        }
+    }
+}
 
 /// A parsed fork definition (frontmatter only; the body is the prompt).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +146,17 @@ pub struct ForkDef {
     /// the held forks' idle deadlines measure from that moment. The "goal
     /// fork" key: goal work first, consolidation forks after.
     pub gate: bool,
+    /// Model for this fork's runs (scalar or client-keyed map). Unset =
+    /// config `[fork_models]` default for the client, else inherit the
+    /// session's model. Native-execution clients honor it; the Claude Code
+    /// subagent runner cannot (fork subagents always inherit the parent
+    /// model).
+    pub model: ClientScoped,
+    /// Operation mode for this fork's runs (scalar or client-keyed map):
+    /// permission mode on Claude Code (headless runner), sandbox mode on
+    /// codex, agent on opencode. Unset = config `[fork_modes]` default for
+    /// the client, else the client's own default.
+    pub mode: ClientScoped,
 }
 
 impl Default for ForkDef {
@@ -71,6 +172,8 @@ impl Default for ForkDef {
             chain: false,
             chain_limit: None,
             gate: false,
+            model: ClientScoped::Unset,
+            mode: ClientScoped::Unset,
         }
     }
 }
@@ -341,11 +444,14 @@ struct RawFork {
     chain_limit: Option<serde_yaml::Value>,
     #[serde(default)]
     gate: Option<serde_yaml::Value>,
+    // Live again since v0.17 (scalar or client-keyed map).
+    #[serde(default)]
+    model: Option<serde_yaml::Value>,
+    #[serde(default)]
+    mode: Option<serde_yaml::Value>,
     // Deprecated since v0.5: parsed only to warn, then ignored.
     #[serde(default)]
     delivery: Option<serde_yaml::Value>,
-    #[serde(default)]
-    model: Option<serde_yaml::Value>,
     #[serde(default)]
     allowed_tools: Option<serde_yaml::Value>,
     #[serde(default)]
@@ -376,8 +482,9 @@ impl RawFork {
             || self.chain.is_some()
             || self.chain_limit.is_some()
             || self.gate.is_some()
-            || self.delivery.is_some()
             || self.model.is_some()
+            || self.mode.is_some()
+            || self.delivery.is_some()
             || self.allowed_tools.is_some()
             || self.permission_mode.is_some()
     }
@@ -393,6 +500,9 @@ pub struct ParsedFork {
 }
 
 /// The outcome of parsing a `.md` file in a forks tree.
+// Parse results are transient (one per discovery pass, never stored), so the
+// variant size gap is not worth a Box indirection at every use site.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum ForkParse {
     /// A real fork (frontmatter carried `fork: true`).
@@ -470,16 +580,15 @@ pub fn parse_fork_file(name: &str, content: &str) -> ForkParse {
     }
 
     // Deprecated-and-ignored keys.
-    if raw.delivery.is_some() || raw.model.is_some() {
+    if raw.delivery.is_some() {
         warnings.push(format!(
-            "fork '{name}': v0.5 ignores 'delivery' and 'model' — delivery is native \
-             and the fork inherits the session's model"
+            "fork '{name}': v0.5 ignores 'delivery' — report delivery is native"
         ));
     }
     if raw.allowed_tools.is_some() || raw.permission_mode.is_some() {
         warnings.push(format!(
-            "fork '{name}': v0.5 ignores 'allowed_tools' and 'permission_mode' — a fork \
-             inherits the session's permissions"
+            "fork '{name}': 'allowed_tools' and 'permission_mode' are ignored — use \
+             'mode:' to pick the run's operation mode (since v0.17)"
         ));
     }
 
@@ -609,6 +718,17 @@ pub fn parse_fork_file(name: &str, content: &str) -> ForkParse {
         .map(|v| parse_tags(v, name, &mut warnings))
         .unwrap_or_default();
 
+    let model = raw
+        .model
+        .as_ref()
+        .map(|v| parse_client_scoped(v, "model", name, &mut warnings))
+        .unwrap_or_default();
+    let mode = raw
+        .mode
+        .as_ref()
+        .map(|v| parse_client_scoped(v, "mode", name, &mut warnings))
+        .unwrap_or_default();
+
     for w in &warnings {
         tracing::warn!(fork = name, "{w}");
     }
@@ -625,6 +745,8 @@ pub fn parse_fork_file(name: &str, content: &str) -> ForkParse {
             chain,
             chain_limit,
             gate,
+            model,
+            mode,
         },
         body: body.to_string(),
         warnings,
@@ -761,6 +883,35 @@ mod tests {
         );
         assert!(p.warnings.iter().any(|w| w.contains("delivery")));
         assert!(p.warnings.iter().any(|w| w.contains("allowed_tools")));
+        // `model:` is live again since v0.17 — no warning, parsed.
+        assert_eq!(p.def.model, ClientScoped::Scalar("haiku".into()));
+        assert!(!p.warnings.iter().any(|w| w.contains("'model'")));
+    }
+
+    #[test]
+    fn model_and_mode_scalar_or_client_map() {
+        let p = parse("---\nfork: true\nmodel: haiku\nmode: acceptEdits\n---\n");
+        assert!(p.warnings.is_empty());
+        assert_eq!(p.def.model.resolve("claude-code"), Some("haiku"));
+        assert_eq!(p.def.model.resolve("codex"), Some("haiku")); // scalar = every client
+        assert_eq!(p.def.mode.resolve("opencode"), Some("acceptEdits"));
+
+        let p = parse(
+            "---\nfork: true\nmodel:\n  claude-code: haiku\n  codex: gpt-5.1-codex-mini\n---\n",
+        );
+        assert!(p.warnings.is_empty());
+        assert_eq!(p.def.model.resolve("claude-code"), Some("haiku"));
+        assert_eq!(p.def.model.resolve("codex"), Some("gpt-5.1-codex-mini"));
+        assert_eq!(p.def.model.resolve("opencode"), None); // unnamed client = inherit
+        assert_eq!(
+            p.def.model.display().as_deref(),
+            Some("claude-code: haiku, codex: gpt-5.1-codex-mini")
+        );
+
+        // Junk shapes warn and fall back to Unset — never drop the fork.
+        let p = parse("---\nfork: true\nmodel: [a, b]\n---\n");
+        assert!(p.warnings.iter().any(|w| w.contains("model")));
+        assert!(!p.def.model.is_set());
     }
 
     #[test]

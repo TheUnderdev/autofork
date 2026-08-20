@@ -245,6 +245,12 @@ pub fn list_forks(paths: &Paths, project: Option<std::path::PathBuf>) -> Result<
         if f.gate {
             details.push("gate".into());
         }
+        if let Some(m) = &f.model {
+            details.push(format!("model: {m}"));
+        }
+        if let Some(m) = &f.mode {
+            details.push(format!("mode: {m}"));
+        }
         if !f.tags.is_empty() {
             details.push(format!("tags: {}", f.tags.join(", ")));
         }
@@ -365,6 +371,10 @@ pub fn run_fork(paths: &Paths, name: Option<String>, tag: Option<String>) -> Res
             skill: autofork_core::discovery::skill_sibling(&e.path)
                 .map(|p| p.to_string_lossy().into_owned()),
             chain: e.parsed.def.chain,
+            // The manual print targets the Claude Code subagent path, which
+            // cannot apply model/mode overrides.
+            model: None,
+            mode: None,
         })
         .collect();
     let payload = build_wake_payload(

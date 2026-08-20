@@ -20,7 +20,7 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
-const SCHEMA_VERSION: i32 = 9;
+const SCHEMA_VERSION: i32 = 10;
 
 /// Split a comma-joined tag column back into a list (trimmed, empties
 /// dropped). `NULL` (unset) stays `None`.
@@ -303,6 +303,24 @@ impl Store {
             conn.execute_batch(
                 "BEGIN;
                  ALTER TABLE sessions ADD COLUMN client TEXT;
+                 COMMIT;",
+            )?;
+        }
+        if version < 10 {
+            // Headless fork-run reports awaiting silent delivery: spooled by
+            // the runner, taken (and cleared) by the UserPromptSubmit hook on
+            // the session's next prompt. Survives daemon retirement.
+            conn.execute_batch(
+                "BEGIN;
+                 CREATE TABLE IF NOT EXISTS report_spool (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     session_id TEXT NOT NULL,
+                     fork_name TEXT NOT NULL,
+                     text TEXT NOT NULL,
+                     created_at INTEGER NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS report_spool_session
+                     ON report_spool(session_id);
                  COMMIT;",
             )?;
         }
@@ -873,6 +891,38 @@ impl Store {
     /// How many wakes of this fork were issued in this session at or after
     /// `since` — the chain-limit gauge (a chain's runs all land in one pause,
     /// whose baseline is `since`).
+    /// Spool a headless fork run's report for later delivery (the Claude Code
+    /// headless runner's silent path).
+    pub fn spool_report(
+        &self,
+        session_id: &str,
+        fork_name: &str,
+        text: &str,
+        t: i64,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO report_spool (session_id, fork_name, text, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![session_id, fork_name, text, t],
+        )?;
+        Ok(())
+    }
+
+    /// Take (and clear) a session's spooled reports, oldest first.
+    pub fn take_reports(&self, session_id: &str) -> rusqlite::Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT text FROM report_spool WHERE session_id = ?1 ORDER BY id ASC")?;
+        let blocks: Vec<String> = stmt
+            .query_map(params![session_id], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        self.conn.execute(
+            "DELETE FROM report_spool WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        Ok(blocks)
+    }
+
     pub fn count_runs_since(
         &self,
         session_id: &str,

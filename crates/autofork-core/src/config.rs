@@ -46,6 +46,31 @@ pub struct Config {
     /// explicit contract). 0 disables. Tripping it is loud (a warn log), never
     /// silent.
     pub runaway_limit: u64,
+    /// Default model per client for fork runs (`[fork_models]`, keyed by
+    /// `claude-code` / `opencode` / `codex`). A fork's own `model:` wins;
+    /// unset = the run inherits the session's model. The point: forks doing
+    /// routine consolidation don't need the parent's expensive model.
+    pub fork_models: BTreeMap<String, String>,
+    /// Default operation mode per client for fork runs (`[fork_modes]`):
+    /// permission mode (claude-code headless runner), sandbox (codex), agent
+    /// (opencode). A fork's own `mode:` wins.
+    pub fork_modes: BTreeMap<String, String>,
+    /// How Claude Code fork runs execute: `"subagent"` (the session's own
+    /// model spawns fork subagents — cache-hot, but the wake/spawn/relay
+    /// turns are visible in your conversation) or `"headless"` (the parked
+    /// Stop hook runs `claude -p --fork-session` subprocesses itself and
+    /// reports arrive silently as additionalContext on your next prompt —
+    /// the opencode-style quiet mode; forks of interactive sessions pay a
+    /// cold prompt cache, which cheap fork models make irrelevant).
+    pub fork_runner: ForkRunner,
+}
+
+/// The Claude Code fork execution mode (see `Config::fork_runner`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ForkRunner {
+    #[default]
+    Subagent,
+    Headless,
 }
 
 impl Default for Config {
@@ -60,6 +85,9 @@ impl Default for Config {
             tag_throttles: BTreeMap::new(),
             chain_limit: 25,
             runaway_limit: 30,
+            fork_models: BTreeMap::new(),
+            fork_modes: BTreeMap::new(),
+            fork_runner: ForkRunner::Subagent,
         }
     }
 }
@@ -78,6 +106,11 @@ struct RawConfig {
     tag_throttles: BTreeMap<String, toml::Value>,
     chain_limit: Option<toml::Value>,
     runaway_limit: Option<toml::Value>,
+    #[serde(default)]
+    fork_models: BTreeMap<String, toml::Value>,
+    #[serde(default)]
+    fork_modes: BTreeMap<String, toml::Value>,
+    fork_runner: Option<toml::Value>,
     // ---- deprecated since v0.5: accepted, warned, ignored ----
     concurrency: Option<toml::Value>,
     fork_timeout: Option<toml::Value>,
@@ -153,6 +186,36 @@ fn apply_layer(cfg: &mut Config, raw: RawConfig, project_level: bool, warnings: 
         let key = format!("tag_throttles.{tag}");
         if let Some(secs) = parse_toml_duration(&v, &key, warnings) {
             cfg.tag_throttles.insert(tag, secs);
+        }
+    }
+    // Per-key extend, same layering as tag_throttles.
+    for (client, v) in raw.fork_models {
+        match v.as_str() {
+            Some(s) if !s.trim().is_empty() => {
+                cfg.fork_models.insert(client, s.trim().to_string());
+            }
+            _ => warnings.push(format!(
+                "'fork_models.{client}' must be a model id string, ignoring"
+            )),
+        }
+    }
+    for (client, v) in raw.fork_modes {
+        match v.as_str() {
+            Some(s) if !s.trim().is_empty() => {
+                cfg.fork_modes.insert(client, s.trim().to_string());
+            }
+            _ => warnings.push(format!(
+                "'fork_modes.{client}' must be a mode string, ignoring"
+            )),
+        }
+    }
+    if let Some(v) = &raw.fork_runner {
+        match v.as_str().map(str::trim) {
+            Some("subagent") => cfg.fork_runner = ForkRunner::Subagent,
+            Some("headless") => cfg.fork_runner = ForkRunner::Headless,
+            _ => {
+                warnings.push("'fork_runner' must be \"subagent\" or \"headless\", ignoring".into())
+            }
         }
     }
 

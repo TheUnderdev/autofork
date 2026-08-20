@@ -151,6 +151,29 @@ a missing marker can't silently disable a real fork. `fork: false` is an explici
 | `chain` | `true` — a run may request another by ending its report with `<<autofork:continue>>` | `false` |
 | `chain_limit` | max chain runs within one pause | config `chain_limit` (25) |
 | `gate` | `true` — hold the other idle forks while this fork's run/chain is unsettled | `false` |
+| `model` | model for this fork's runs: a scalar, or a map keyed by client (`claude-code:` / `opencode:` / `codex:`) | config `[fork_models]`, else inherit the session's |
+| `mode` | operation mode for the runs (permission mode / codex sandbox / opencode agent), scalar or client map | config `[fork_modes]`, else the client default |
+
+`model:` and `mode:` (v0.17) exist because a fork rarely needs the parent
+session's expensive model: your session runs on the big model, the journal
+fork runs on a cheap one. Fork files are shared across clients and a model id
+rarely means anything to more than one of them, so the map form names each
+client explicitly:
+
+```yaml
+model:
+  claude-code: haiku
+  opencode: anthropic/claude-haiku-4-5
+  codex: gpt-5.1-codex-mini
+mode:
+  codex: workspace-write
+```
+
+A scalar applies wherever the fork runs; a client the map doesn't name
+inherits the session's model. Caveat: the Claude Code **subagent** runner
+cannot apply either key (fork subagents always inherit the parent session's
+model and permissions) — they take effect on opencode, codex, and Claude
+Code's headless runner below.
 
 Moments for `run_on`:
 
@@ -406,11 +429,43 @@ disable_tags = ["noisy"]       # default tag blocklist (see below)
 
 [tag_throttles]                # min gap between wakes of any fork carrying a tag
 ci = "1h"
+
+fork_runner = "subagent"       # Claude Code execution mode: "subagent" | "headless" (see below)
+
+[fork_models]                  # default fork model per client; a fork's own `model:` wins
+"claude-code" = "haiku"
+opencode = "anthropic/claude-haiku-4-5"
+codex = "gpt-5.1-codex-mini"
+
+[fork_modes]                   # default operation mode per client; a fork's `mode:` wins
+"claude-code" = "acceptEdits"  # headless-runner permission mode
+codex = "workspace-write"      # codex sandbox
 ```
 
 `wake_debounce` gives near-simultaneous forks (idle deadlines close together, say) a moment to
 coalesce into a single wake with multiple spawn blocks. A prompt arriving during the window cancels
 the wake cleanly and stamps no throttles.
+
+### The headless runner (Claude Code)
+
+By default, Claude Code forks run as **fork subagents** spawned by your session's own model: the
+wake reminder, the spawn calls and the completion relays are all turns in your conversation. That
+buys near-total prompt-cache reuse — and costs visible noise.
+
+`fork_runner = "headless"` is the opencode-style quiet mode: the parked Stop hook consumes wakes
+itself and runs each fork as a `claude -p --resume <conversation> --fork-session` subprocess — a
+true fork of your conversation, run outside your session. Reports are spooled and delivered
+**silently** on your next prompt (hook `additionalContext`: your model sees them, your transcript
+doesn't show them). Nothing about forks ever appears in your conversation.
+
+The trade: a headless fork of an interactive session cannot reuse its prompt cache (Claude Code
+stamps request prefixes per mode), so each run reads the inherited history cold — which is why
+headless pairs naturally with cheap fork models (`[fork_models]`, above): pay haiku input prices
+for the copy instead of burning your session's model on a journal update. Runs default to
+`--permission-mode acceptEdits` (headless runs can't answer permission prompts); set a fork's
+`mode:` or `[fork_modes]` for more or less. Chain forks work, with one semantic shift: the parent
+only sees reports at your next prompt, so a goal loop advances between your messages rather than
+autonomously.
 
 ### Tag filtering
 
@@ -590,16 +645,32 @@ Because the queued report arrives as a real turn, your model reacts to every for
 Claude Code the completion notification behaves the same way). Chain forks work unchanged: a
 report carrying the continue sentinel re-arms the fork after your session digests the report.
 
+### The goal fast path (codex Stop hook)
+
+Codex Stop hooks run synchronously and may **block-and-inject**: a hook that answers
+`{"decision": "block", "reason": …}` has its reason recorded as a continuation prompt, and the
+model reacts in the same turn. autofork's codex Stop hook uses exactly that for goal forks: when a
+`chain: true` fork is due at the pause's very first Stop (the `idle: 0s` goal recipe), the hook
+runs it right there — the session deliberately holds while the fork evaluates — and injects the
+report as the continuation. The parent reacts immediately: a true autonomous goal loop with zero
+dead time, on every codex version. Anything that isn't an `idle: 0s` chain fork exits the hook
+instantly and stays on the waiter path.
+
 ### Cache economics on codex
 
-A codex thread fork gets a fresh thread id, and codex keys the OpenAI prompt cache on it — so
-**every fork run pays a cold prompt-cache write** for the inherited history (measured:
-`cached_input_tokens: 0` on the fork's first request). OpenAI charges no premium for cache
-writes, so a fork costs plain input-token pricing for the parent context once, per run. Keep
-heavyweight forks on sensible throttles for very large sessions.
+A codex thread fork gets a fresh thread id, and codex keys the OpenAI prompt cache on it — so a
+native fork run reads the inherited history **cold** (measured: `cached_input_tokens: 0`).
+autofork therefore runs a fork the cheap way when it can: if the run uses the parent's model and
+the parent's rollout is a self-contained plain-JSONL file, the run is executed as a **cache
+copy** — the rollout is copied into a throwaway `CODEX_HOME` keeping its session id, and resumed
+there. Same id → same prompt-cache key → the parent's warm prefix is reused (~93% measured), and
+the parent's real home is never touched. The preflight fails closed to the native fork
+(compressed rollouts, paginated history, reference-backed forks), and
+`AUTOFORK_CODEX_NO_CACHE_COPY=1` disables the copy path outright. A fork on a *different* model
+is a different cache anyway, so it always uses the native fork.
 
-Requires codex >= 0.148 (lifecycle hooks, `codex exec fork`, and the queue RPC — all verified
-against that release).
+Requires codex >= 0.148 (lifecycle hooks, `codex exec fork`, the queue RPC, and Stop-hook
+blocking — all verified against that release).
 
 ## Other tools
 
