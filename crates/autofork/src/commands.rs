@@ -117,20 +117,47 @@ pub fn status(paths: &Paths) -> Result<(), String> {
     Ok(())
 }
 
-/// A display form of a session id that stays distinguishable: Claude Code's
-/// UUIDs are random from the first character, so 8 chars identify them; but
-/// opencode ids (`ses_<time-ordered>`) share their leading characters across
-/// sessions created near in time — truncating them made every session of a
-/// stretch display identically ("the same session twice"). Show those whole.
-/// Codex ids are UUIDv7 — time-ordered too (the leading 48 bits are a
-/// timestamp), so they get the same treatment; the version nibble tells the
-/// two UUID kinds apart.
+/// Width of a displayed session id. 8 chars of the id's random part keep
+/// sessions apart (~1 in 10^5 odds of a clash across a lifetime of sessions)
+/// while staying scannable in a column.
+const SESSION_ID_WIDTH: usize = 8;
+
+/// A short display form of a session id, taken from wherever that id keeps its
+/// entropy so distinct sessions never render alike.
+///
+/// Claude Code's UUIDv4s are random from the first character, so the leading 8
+/// identify them — and they match the `<uuid>.jsonl` transcript names, so the
+/// head is the useful half.
+///
+/// The other two clients mint time-ordered ids whose *leading* characters are
+/// shared by every session created near in time: opencode's are
+/// `ses_<12 hex of time+counter><random>`, codex's are UUIDv7 (the leading 48
+/// bits are a timestamp; the version nibble tells the two UUID kinds apart).
+/// Truncating those from the front made a whole stretch of sessions display
+/// identically ("the same session twice"), so they used to print whole — 28 and
+/// 36 characters of column. Their entropy is at the end, so take the tail
+/// instead: short *and* distinguishable, and it drops opencode's `ses_` on the
+/// way.
 fn display_session_id(id: &str) -> &str {
     let uuid_v7 = id.len() >= 15 && id.as_bytes().get(14) == Some(&b'7');
-    if id.contains('-') && !uuid_v7 {
-        &id[..id.len().min(8)]
+    let time_ordered = uuid_v7 || !id.contains('-');
+    if time_ordered {
+        // Slice on a char boundary: opencode's random part is base62, and a
+        // hand-set id could hold anything.
+        let start = id
+            .char_indices()
+            .rev()
+            .nth(SESSION_ID_WIDTH - 1)
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        &id[start..]
     } else {
-        id
+        let end = id
+            .char_indices()
+            .nth(SESSION_ID_WIDTH)
+            .map(|(i, _)| i)
+            .unwrap_or(id.len());
+        &id[..end]
     }
 }
 
@@ -585,6 +612,41 @@ pub fn doctor(paths: &Paths) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_ids_display_short_and_distinct_per_client() {
+        // Claude Code (UUIDv4): random from char 0 — head, and it still
+        // prefix-matches the `<uuid>.jsonl` transcript name.
+        assert_eq!(
+            display_session_id("2b08b037-f88a-41b8-8bc5-0b2c4d7c3a9e"),
+            "2b08b037"
+        );
+        // Codex (UUIDv7): the leading 13 chars are a timestamp, so two sessions
+        // minted in the same millisecond-ish window share them — take the tail.
+        assert_eq!(
+            display_session_id("01a01f41-013c-7f60-92dd-f333fdc264ce"),
+            "fdc264ce"
+        );
+        // ...and the version nibble keeps the two UUID kinds apart: these two
+        // v7 ids share everything but their random tail, and must not collide.
+        assert_ne!(
+            display_session_id("01a01f41-013c-7f60-92dd-f333fdc264ce"),
+            display_session_id("01a01f41-013c-7f60-92dd-f333f0000001"),
+        );
+        // opencode: `ses_` + 12 hex of time/counter + random base62. The tail
+        // drops the prefix for free.
+        assert_eq!(
+            display_session_id("ses_05520be3fffeAkRrvVv2zeqqvw"),
+            "v2zeqqvw"
+        );
+        // Ids shorter than the width survive whole rather than panicking.
+        assert_eq!(display_session_id("abc"), "abc");
+        assert_eq!(display_session_id(""), "");
+        // Multi-byte chars must not split mid-codepoint (a byte slice would
+        // panic). Both branches: no dash = tail, dash = head.
+        assert_eq!(display_session_id("ñññññññññ"), "ññññññññ");
+        assert_eq!(display_session_id("áéíóúáéíóú-x"), "áéíóúáéí");
+    }
 
     #[test]
     fn version_parsing_and_gating() {
