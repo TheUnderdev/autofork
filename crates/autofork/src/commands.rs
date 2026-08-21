@@ -164,7 +164,7 @@ fn print_sessions_header(info: &StatusInfo) {
         println!("fork runs in flight:");
         for r in &info.running {
             println!(
-                "  {} — {} — started {}",
+                "  {} — {} — {}",
                 r.fork,
                 display_session_id(&r.session_id),
                 fmt_ago(t, r.started_at),
@@ -175,10 +175,9 @@ fn print_sessions_header(info: &StatusInfo) {
         println!("recent wakes:");
         for r in &info.recent_runs {
             println!(
-                "  {} ({}) [{}] — {} — {}",
+                "  {} ({}) — {} — {}",
                 r.fork,
                 r.trigger,
-                r.state,
                 display_session_id(&r.session_id),
                 fmt_ago(t, r.started_at),
             );
