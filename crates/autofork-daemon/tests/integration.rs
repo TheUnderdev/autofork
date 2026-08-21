@@ -25,6 +25,9 @@ struct Harness {
     wake_grace_secs: Option<u64>,
     gate_grace_secs: Option<u64>,
     chain_grace_secs: Option<u64>,
+    liveness_sweep_secs: Option<u64>,
+    session_sweep_secs: Option<u64>,
+    final_runner_bin: Option<PathBuf>,
 }
 
 impl Harness {
@@ -52,6 +55,9 @@ impl Harness {
             wake_grace_secs: None,
             gate_grace_secs: None,
             chain_grace_secs: None,
+            liveness_sweep_secs: None,
+            session_sweep_secs: None,
+            final_runner_bin: None,
         }
     }
 
@@ -73,6 +79,42 @@ impl Harness {
     fn chain_grace_secs(mut self, secs: u64) -> Self {
         self.chain_grace_secs = Some(secs);
         self
+    }
+
+    /// Tighten the harness-liveness sweep (default 15s) so a test doesn't
+    /// wait on it.
+    fn liveness_sweep_secs(mut self, secs: u64) -> Self {
+        self.liveness_sweep_secs = Some(secs);
+        self
+    }
+
+    /// Tighten the session-timeout reaper (default 300s).
+    fn session_sweep_secs(mut self, secs: u64) -> Self {
+        self.session_sweep_secs = Some(secs);
+        self
+    }
+
+    /// Stand in for the `autofork final-run` end-runner: a stub script that
+    /// records its argv, so a flush can be asserted without resuming a real
+    /// conversation.
+    fn recording_final_runner(&mut self) -> PathBuf {
+        let record = self.project.join("final-run.argv");
+        let script = self.project.join("fake-final-run.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\n",
+                record.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        self.final_runner_bin = Some(script);
+        record
     }
 
     /// Append one raw line to the daemon's user config (call before
@@ -182,6 +224,15 @@ impl Harness {
         if let Some(secs) = self.chain_grace_secs {
             cmd.env("AUTOFORK_CHAIN_GRACE_SECS", secs.to_string());
         }
+        if let Some(secs) = self.liveness_sweep_secs {
+            cmd.env("AUTOFORK_LIVENESS_SWEEP_SECS", secs.to_string());
+        }
+        if let Some(secs) = self.session_sweep_secs {
+            cmd.env("AUTOFORK_SESSION_SWEEP_SECS", secs.to_string());
+        }
+        if let Some(bin) = &self.final_runner_bin {
+            cmd.env("AUTOFORK_FINAL_RUNNER_BIN", bin);
+        }
         let child = cmd.spawn().unwrap();
         self.daemon = Some(child);
         let start = Instant::now();
@@ -225,6 +276,7 @@ impl Harness {
             context_window: None,
             client: None,
             busy: None,
+            harness: None,
         }
     }
 
@@ -2779,4 +2831,196 @@ fn own_fork_spawns_never_count_as_background_work() {
     let rx = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
     let payload = wake_payload(rx.recv_timeout(Duration::from_secs(10)).unwrap());
     assert!(payload.contains("due: second"), "{payload}");
+}
+
+// ---- harness liveness: closes the client itself never reported ----
+
+/// A process that is definitely gone: spawned, waited on, reaped.
+fn dead_harness() -> autofork_core::harness::Harness {
+    let mut child = Command::new("true").spawn().unwrap();
+    let pid = child.id();
+    child.wait().unwrap();
+    autofork_core::harness::Harness {
+        pid,
+        start: None,
+        bin: None,
+    }
+}
+
+/// A live process to anchor a session on, killed when the test says so.
+struct FakeClient(Child);
+
+impl FakeClient {
+    fn spawn() -> Self {
+        FakeClient(
+            Command::new("sleep")
+                .arg("120")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        )
+    }
+    fn harness(&self) -> autofork_core::harness::Harness {
+        autofork_core::harness::of_pid(self.0.id()).unwrap()
+    }
+    fn kill(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn a_dead_harness_closes_the_session_without_any_session_end() {
+    // The exit that used to go unnoticed: the client is gone, no SessionEnd
+    // hook ever arrived, and no parked poll existed to lose. The sweep asks
+    // the OS instead.
+    let mut h = Harness::new("30m", "0").liveness_sweep_secs(1);
+    let log = h.write_logging_hook("cleanup.md", "[session_end]");
+    h.start_daemon();
+
+    let mut ev = h.event(EventKind::SessionStart, "s-gone");
+    ev.harness = Some(dead_harness());
+    assert_ack(h.send_event(ev));
+
+    let lines = h.wait_for_hook_lines(&log, 1, Duration::from_secs(15));
+    assert_eq!(lines[0], "session_end||gone||s-gone");
+}
+
+#[test]
+fn a_live_harness_survives_the_session_timeout_reaper() {
+    // The other half of the same honesty: a session whose client is provably
+    // running is not "timed out" however long it has been quiet.
+    let mut h = Harness::new("30m", "0")
+        .liveness_sweep_secs(1)
+        .session_sweep_secs(1);
+    h.append_config("session_timeout = \"1s\"");
+    let log = h.write_logging_hook("cleanup.md", "[session_end]");
+    h.start_daemon();
+
+    let mut client = FakeClient::spawn();
+    let mut ev = h.event(EventKind::SessionStart, "s-live");
+    ev.harness = Some(client.harness());
+    assert_ack(h.send_event(ev));
+
+    std::thread::sleep(Duration::from_secs(4));
+    assert!(
+        std::fs::read_to_string(&log).unwrap_or_default().is_empty(),
+        "a live client's session must not be reaped"
+    );
+    client.kill();
+}
+
+#[test]
+fn a_close_the_client_never_reported_still_flushes_its_idle_forks() {
+    // The visible half of the bug: the consolidation forks that should run
+    // when a session ends. The SessionEnd hook is the usual carrier — when it
+    // doesn't run, the daemon's own close path carries them instead.
+    let mut h = Harness::new("30m", "0").liveness_sweep_secs(1);
+    let record = h.recording_final_runner();
+    h.write_fork(
+        "handover.md",
+        "---\nfork: true\nrun_on:\n  - idle: 30m\n---\nHAND OVER",
+    );
+    h.start_daemon();
+
+    let mut client = FakeClient::spawn();
+    let mut ev = h.event(EventKind::SessionStart, "s-flush");
+    ev.harness = Some(client.harness());
+    assert_ack(h.send_event(ev));
+    // A Stop rosters the fork (and parks a poll, as a real idle session has).
+    let _rx = h.park_stop_wait({
+        let mut ev = h.event(EventKind::Stop, "s-flush");
+        ev.harness = Some(client.harness());
+        ev
+    });
+    std::thread::sleep(Duration::from_millis(300));
+
+    client.kill();
+
+    let start = Instant::now();
+    let argv = loop {
+        let argv = std::fs::read_to_string(&record).unwrap_or_default();
+        if !argv.is_empty() {
+            break argv;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "the end-runner never ran"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(argv.contains("final-run"), "{argv}");
+    assert!(argv.contains("--session s-flush"), "{argv}");
+    let specs_path = argv
+        .split_whitespace()
+        .skip_while(|a| *a != "--specs")
+        .nth(1)
+        .expect("the runner is handed a specs file");
+    let specs = std::fs::read_to_string(specs_path).unwrap();
+    assert!(specs.contains("handover"), "{specs}");
+}
+
+#[test]
+fn an_orphaned_stop_wait_cannot_resurrect_a_dead_session() {
+    // A parked poll that outlived its client (headless mode re-parks after
+    // every run) used to re-open the session on every re-park and hold it
+    // "alive" on a heartbeat with nobody behind it.
+    let mut h = Harness::new("30m", "0");
+    let log = h.write_logging_hook("cleanup.md", "[session_end]");
+    h.start_daemon();
+
+    assert_ack(h.send_event(h.event(EventKind::SessionStart, "s-orphan")));
+    let mut ev = h.event(EventKind::Stop, "s-orphan");
+    ev.harness = Some(dead_harness());
+    // Answered immediately (not parked), and the session is closed.
+    let rx = h.park_stop_wait(ev);
+    let resp = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(
+        matches!(resp, ResponseBody::Waited),
+        "expected Waited, got {resp:?}"
+    );
+    let lines = h.wait_for_hook_lines(&log, 1, Duration::from_secs(5));
+    assert_eq!(lines[0], "session_end||gone||s-orphan");
+}
+
+#[test]
+fn a_session_inherited_dead_from_a_previous_daemon_closes_without_flushing() {
+    // A reboot (or a killed daemon) leaves open rows whose clients died at
+    // some unknown past moment. Closing them is right; resuming those
+    // conversations to run consolidation forks is not.
+    let mut h = Harness::new("30m", "0").liveness_sweep_secs(1);
+    let record = h.recording_final_runner();
+    let log = h.write_logging_hook("cleanup.md", "[session_end]");
+    h.write_fork(
+        "handover.md",
+        "---\nfork: true\nrun_on:\n  - idle: 30m\n---\nHAND OVER",
+    );
+    h.start_daemon();
+
+    let mut client = FakeClient::spawn();
+    let mut ev = h.event(EventKind::SessionStart, "s-inherited");
+    ev.harness = Some(client.harness());
+    assert_ack(h.send_event(ev));
+    let _rx = h.park_stop_wait({
+        let mut ev = h.event(EventKind::Stop, "s-inherited");
+        ev.harness = Some(client.harness());
+        ev
+    });
+    std::thread::sleep(Duration::from_millis(300));
+
+    // The daemon dies first, then the client: the next daemon never saw the
+    // session alive (whole-second stamps, hence the wait).
+    h.kill_daemon();
+    client.kill();
+    std::thread::sleep(Duration::from_secs(2));
+    h.start_daemon();
+
+    let lines = h.wait_for_hook_lines(&log, 1, Duration::from_secs(15));
+    assert_eq!(lines[0], "session_end||gone||s-inherited");
+    assert!(
+        !record.exists(),
+        "an inherited dead session must not flush: {:?}",
+        std::fs::read_to_string(&record)
+    );
 }

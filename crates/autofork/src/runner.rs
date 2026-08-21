@@ -29,6 +29,7 @@ use autofork_core::protocol::{RequestBody, WakeFork};
 use std::collections::HashMap;
 use std::io::Read;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// Wall-clock cap on one `claude -p` fork run, overridable via
@@ -81,6 +82,31 @@ pub struct RunResult {
     pub wake_block: Option<String>,
 }
 
+/// Whether this process is currently executing fork runs. The harness
+/// watchdog leaves a *parked* orphan alone only when it is idle: a run
+/// already in flight is allowed to finish (its work and its spooled report
+/// outlive the client that started it — the deliberate "fork children survive
+/// a closed terminal" behavior), and the process exits once it is done.
+static RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Watch the client process behind a parked hook and exit when it dies.
+///
+/// The parked stop-wait hook is the one autofork process that outlives its
+/// turn, so it is also the one that can be orphaned: Claude Code can exit
+/// without its SessionEnd hook completing, and in headless mode this process
+/// would then keep re-parking polls, which the daemon reads as a live
+/// session — the reported "autofork didn't notice I closed the session".
+/// Exiting closes the socket, which is the daemon's poll-loss signal.
+pub fn watch_harness(harness: Option<autofork_core::harness::Harness>) {
+    let Some(harness) = harness else { return };
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(5));
+        if !harness.alive() && !RUNNING.load(Ordering::SeqCst) {
+            std::process::exit(0);
+        }
+    });
+}
+
 /// Consume one wake's forks headlessly. Returns the report blocks of any
 /// chain runs that asked to continue: the caller (the parked Stop hook) wakes
 /// the parent session with them instead of re-parking, so a goal loop
@@ -99,6 +125,7 @@ pub fn execute_wake(
 ) -> Vec<String> {
     // Batch-parallel like the opencode plugin: each fork run is independent
     // (the daemon holds `after` dependents until predecessors complete).
+    RUNNING.store(true, Ordering::SeqCst);
     let mut handles = Vec::new();
     for spec in forks {
         let paths = Paths::new(paths.base.clone());
@@ -148,6 +175,7 @@ pub fn execute_wake(
             wake_blocks.push(block);
         }
     }
+    RUNNING.store(false, Ordering::SeqCst);
     wake_blocks
 }
 

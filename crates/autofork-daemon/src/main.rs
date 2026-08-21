@@ -1,5 +1,7 @@
 mod daemon;
+mod flush;
 mod hooks;
+mod liveness;
 mod planner;
 mod server;
 mod sweep;
@@ -94,6 +96,11 @@ async fn async_main(paths: Paths, store: Store) {
     // Close sessions that timed out (crashed without a SessionEnd).
     let sweeper = daemon.clone();
     tokio::spawn(async move { sweep::session_reaper(sweeper).await });
+
+    // Close sessions whose client process is gone (the OS-level answer, for
+    // every exit a SessionEnd hook or a parked poll didn't cover).
+    let liveness = daemon.clone();
+    tokio::spawn(async move { liveness::harness_reaper(liveness).await });
 
     let reaper = daemon.clone();
     tokio::spawn(async move { reaper.quiet_reaper().await });

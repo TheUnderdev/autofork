@@ -75,6 +75,11 @@ fn run_hook_inner(kind: HookKind) -> Option<()> {
     let enable_tags = tags_from_env("AUTOFORK_ENABLE_TAGS");
     let disable_tags = tags_from_env("AUTOFORK_DISABLE_TAGS");
 
+    // The client process behind this hook — the session's liveness anchor,
+    // resolved once and reused (a parked poll outlives its parent, so it must
+    // remember who that parent WAS).
+    let harness = autofork_core::harness::client_process();
+
     let event = |ev: EventKind| Event {
         event: ev,
         session_id: input.session_id.clone(),
@@ -95,6 +100,7 @@ fn run_hook_inner(kind: HookKind) -> Option<()> {
         context_window: None,
         client: None,
         busy: None,
+        harness: harness.clone(),
     };
 
     match kind {
@@ -154,6 +160,13 @@ fn run_hook_inner(kind: HookKind) -> Option<()> {
             let _ = client.request(RequestBody::Event(ev));
         }
         HookKind::StopWait => {
+            // This process outlives the turn: it parks a long poll (up to 4h)
+            // and, in headless mode, keeps re-parking. If Claude Code dies
+            // meanwhile — the exit path where no SessionEnd hook ever
+            // completes — nothing else would end it, and a poll that keeps
+            // re-parking would hold the session "alive" in the daemon
+            // forever. Watch the client and leave when it does.
+            crate::runner::watch_harness(harness.clone());
             // Runs async (Claude Code doesn't block): fine to spawn + retire.
             let client = Client::connect_or_spawn(&paths, Duration::from_secs(10)).ok()?;
             let mut client = client.ensure_current_version(&paths).ok()?;
@@ -208,8 +221,13 @@ fn run_hook_inner(kind: HookKind) -> Option<()> {
                     }
                     // Re-park on a fresh connection (the wake resolved this
                     // one's poll); a brief pause guards against a misbehaving
-                    // daemon spinning us.
+                    // daemon spinning us. A client that died while the run was
+                    // in flight gets no fresh poll: the run's work and its
+                    // spooled report survive, the session does not.
                     std::thread::sleep(Duration::from_secs(1));
+                    if harness.as_ref().is_some_and(|h| !h.alive()) {
+                        return Some(());
+                    }
                     let c = Client::connect_or_spawn(&paths, Duration::from_secs(10)).ok()?;
                     client = c.ensure_current_version(&paths).ok()?;
                 }

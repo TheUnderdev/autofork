@@ -397,9 +397,10 @@ or `opencode`).
 
 `AUTOFORK_END_REASON` values: what the client reported for a clean end (Claude Code:
 `clear`/`logout`/`prompt_input_exit`/`other`; opencode: `disposed` when the instance shuts down
-normally, `deleted` when the session is deleted), or the daemon's own liveness fallbacks: `lost`
-(the session's parked poll dropped and the grace window expired — the process likely died),
-`pruned` (`autofork prune`), `timeout` (the session-timeout reaper).
+normally, `deleted` when the session is deleted), or the daemon's own liveness fallbacks: `gone`
+(the client's OS process no longer exists — see below), `lost` (the session's parked poll dropped
+and the grace window expired), `pruned` (`autofork prune`), `timeout` (the session-timeout
+reaper). `autofork status` lists the most recent closes with their reason.
 
 **Design your integration around one honest caveat:** no callback can cover SIGKILL, a kernel
 panic, or power loss — and if the machine dies, the daemon dies too. `session_end` is best-effort
@@ -538,6 +539,31 @@ they can: Claude Code spools them under the conversation (delivered if you resum
 spools them the same way, opencode runs are work-only. `flush_on_close = false` opts out if
 close-time runs aren't wanted.
 
+### Session liveness
+
+A session is open for exactly as long as the process behind it is. Since v0.23 every hook forwards
+the client's pid (Claude Code exports its own as `CLAUDE_PID`; codex's waiter knows it; otherwise
+the CLI walks its ancestry past any wrapper shell) together with a start-time token that makes the
+identity immune to pid reuse, and the daemon checks it every 15 seconds. A client that is gone
+closes its session with reason `gone` — **and flushes**, so the consolidation forks still run.
+
+This matters because the two older signals both depend on the client behaving on the way out, and
+both are missable:
+
+- the `SessionEnd` hook has to run *and finish* — a client that exits first (or exits in a way that
+  skips hooks) never delivers it;
+- a parked `Stop` poll has to be there to lose — a session that ends mid-turn has none, and a poll
+  process that gets orphaned instead of killed keeps the socket open, which read as a *live*
+  session.
+
+Each of those left the session `[open]` until the 12h `session_timeout` reaper, with its
+flush-on-close forks silently dropped. Now the OS is the authority: a parked poll also watches its
+client and exits with it (a fork run already in flight still finishes), an orphaned poll can no
+longer re-open a dead session, a session whose client is provably running is never reaped for
+being idle, and `[stale?]` in `autofork status` means "its process is gone" rather than a guess
+from idleness. Sessions carried over from a previous daemon (a reboot, a killed daemon) are closed
+but not flushed — those forks would be consolidating a conversation that ended who knows when.
+
 ### Tag filtering
 
 Forks can carry `tags:` in their frontmatter, and a session can then narrow which forks fire. The
@@ -584,11 +610,7 @@ forever, so issuance stays the stamp point.)
   it to the 1M tier as a fallback. The per-model window config was dropped in v0.5.
 - A wake requires a live parked `Stop` hook. If the daemon dies while a session is idle, that idle
   opportunity is simply missed — the next turn re-arms it. A hook never wedges or errors a session.
-- A session whose Claude process dies (killed terminal, restart) is closed automatically: its parked
-  poll drops, and after a short grace with no new event the daemon marks it closed. A stray open
-  session that crashed mid-turn shows a `[stale?]` hint in `autofork status` — harmless (it can
-  never fire a fork), and reaped once idle past `session_timeout`; `autofork prune` closes such
-  sessions immediately.
+- A session whose client process dies is closed automatically — see **Session liveness** above.
 
 ## v0.4 → v0.5 migration
 

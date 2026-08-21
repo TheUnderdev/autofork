@@ -91,6 +91,9 @@ pub struct Daemon {
     pub close_gen: AtomicU64,
     pub connections: AtomicUsize,
     pub last_busy: AtomicI64,
+    /// When this daemon came up. A session with no activity since is one it
+    /// inherited from a previous daemon rather than one it watched die.
+    pub started_at: i64,
     pub shutdown: tokio::sync::Notify,
 }
 
@@ -185,6 +188,7 @@ impl Daemon {
             close_gen: AtomicU64::new(0),
             connections: AtomicUsize::new(0),
             last_busy: AtomicI64::new(now()),
+            started_at: now(),
             shutdown: tokio::sync::Notify::new(),
         })
     }
@@ -266,6 +270,14 @@ impl Daemon {
     /// live-but-long-idle session; the grace-close will close it, and the next
     /// real event re-opens it — acceptable self-correction.
     pub fn on_poll_lost(self: &Arc<Self>, session_id: &str) {
+        // No need to wait out the grace when the OS already has the answer:
+        // the process the session belongs to is gone.
+        if self.harness_gone(session_id) {
+            tracing::info!(session = %session_id,
+                "stop-wait lost and the client process is gone, closing now");
+            self.close_session_firing_hooks(session_id, "gone");
+            return;
+        }
         let gen = self.close_gen.fetch_add(1, Ordering::SeqCst) + 1;
         self.pending_close
             .lock()
@@ -295,17 +307,79 @@ impl Daemon {
         });
     }
 
+    /// Sessions whose recorded client process no longer exists — the OS-level
+    /// answer to "is this session still alive", independent of whether the
+    /// client managed to run a `SessionEnd` hook or leave a poll parked.
+    /// Sessions with no harness anchor (older clients, opencode) are left to
+    /// the poll-loss and timeout paths.
+    pub fn dead_harness_sessions(&self) -> Vec<(String, i64)> {
+        let store = self.store.lock().unwrap();
+        store
+            .list_open_sessions()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| s.harness.as_ref().is_some_and(|h| !h.alive()))
+            .map(|s| (s.session_id, s.last_activity))
+            .collect()
+    }
+
+    /// Whether a session's recorded client process is known to be gone.
+    pub fn harness_gone(&self, session_id: &str) -> bool {
+        let store = self.store.lock().unwrap();
+        matches!(store.get_session(session_id), Ok(Some(s))
+            if s.harness.as_ref().is_some_and(|h| !h.alive()))
+    }
+
     /// Close a session, firing its `session_end` lifecycle hooks exactly once
     /// (only the call that transitions open → closed fires; racing close
-    /// paths — client end, poll loss, prune, timeout — are safe). Fork-run
-    /// sessions close silently. Returns whether this call closed it.
+    /// paths — client end, poll loss, harness death, prune, timeout — are
+    /// safe). Fork-run sessions close silently. Returns whether this call
+    /// closed it.
+    ///
+    /// `flush_on_close` is honored HERE, not only in the `SessionEnd` hook:
+    /// the batch is selected (and stamped) before the close purges the roster,
+    /// and handed to a detached end-runner. The hook path stamps the same
+    /// forks through `TakeFinalRuns`, so whichever side reaches them first
+    /// runs them exactly once — and a close the client never reported still
+    /// gets its consolidation forks.
     pub fn close_session_firing_hooks(self: &Arc<Self>, session_id: &str, reason: &str) -> bool {
+        self.close_session_with_flush(session_id, reason, true)
+    }
+
+    /// [`close_session_firing_hooks`] with the flush made explicit. Passing
+    /// `false` closes without running the flush-on-close batch: for a session
+    /// this daemon never saw alive (a dead row inherited at startup), the
+    /// forks would be consolidating a conversation that ended who-knows-when.
+    pub fn close_session_with_flush(
+        self: &Arc<Self>,
+        session_id: &str,
+        reason: &str,
+        flush: bool,
+    ) -> bool {
+        let row_before = {
+            let store = self.store.lock().unwrap();
+            store.get_session(session_id).ok().flatten()
+        };
+        let final_runs = match row_before.as_ref() {
+            Some(r) if flush && r.status == SessionStatus::Open => {
+                crate::flush::take_final_runs_for_close(self, r, reason)
+            }
+            _ => Vec::new(),
+        };
         let (row, transitioned) = {
             let store = self.store.lock().unwrap();
             let row = store.get_session(session_id).ok().flatten();
-            let transitioned = store.close_session(session_id).unwrap_or(false);
+            let transitioned = store
+                .close_session(session_id, reason, now())
+                .unwrap_or(false);
             (row, transitioned)
         };
+        // Specs we stamped are ours to run even if a racing closer won the
+        // transition: the session is closed either way, and dropping them
+        // here would silently lose the batch.
+        if let Some(r) = row_before.as_ref() {
+            crate::flush::spawn_end_runner(self, r, &final_runs);
+        }
         if !transitioned {
             return false;
         }
@@ -354,7 +428,7 @@ impl Daemon {
     /// the plugin's eligibility check (lost title marker, duplicate plugin
     /// instance, event race at creation) would otherwise become a scheduled
     /// session whose idle forks fork it again — forks breeding forks.
-    fn is_fork_run_session(&self, id: &str) -> bool {
+    pub(crate) fn is_fork_run_session(&self, id: &str) -> bool {
         let store = self.store.lock().unwrap();
         store.is_fork_run_ref(id).unwrap_or(false)
     }
@@ -395,6 +469,9 @@ impl Daemon {
                         .unwrap_or(false);
                     if let Some(w) = ev.context_window {
                         let _ = store.set_context_window(&ev.session_id, w);
+                    }
+                    if let Some(h) = ev.harness.as_ref() {
+                        let _ = store.set_harness(&ev.session_id, h);
                     }
                     newly
                 };
@@ -524,6 +601,9 @@ impl Daemon {
                         )
                         .unwrap_or(false);
                     let _ = store.set_last_activity(&ev.session_id, t);
+                    if let Some(h) = ev.harness.as_ref() {
+                        let _ = store.set_harness(&ev.session_id, h);
+                    }
                     // Genuine activity begins a new pause: advance the epoch
                     // (releasing per-pause idle latches), reset the baseline,
                     // and drop any dependents still held for the old moment
@@ -586,6 +666,19 @@ impl Daemon {
                 "refusing to schedule a fork-run session");
             return ResponseBody::Waited;
         }
+        // A poll from a process whose client is already dead is an orphan: a
+        // stop-wait hook that outlived the client that spawned it. Parking it
+        // would re-open the session (the upsert below) and keep it "alive"
+        // forever on a heartbeat nobody is behind. Close instead, and answer
+        // Waited so the orphan exits.
+        if let Some(h) = ev.harness.as_ref() {
+            if !h.alive() {
+                tracing::info!(session = %ev.session_id, pid = h.pid,
+                    "stop-wait from an orphaned poll: client process is gone");
+                self.close_session_firing_hooks(&ev.session_id, "gone");
+                return ResponseBody::Waited;
+            }
+        }
         // A new poll parking proves the session is alive.
         self.clear_pending_close(&ev.session_id);
         let t = now();
@@ -609,6 +702,9 @@ impl Daemon {
             let _ = store.set_last_activity(&ev.session_id, t);
             if let Some(w) = ev.context_window {
                 let _ = store.set_context_window(&ev.session_id, w);
+            }
+            if let Some(h) = ev.harness.as_ref() {
+                let _ = store.set_harness(&ev.session_id, h);
             }
             newly
         };

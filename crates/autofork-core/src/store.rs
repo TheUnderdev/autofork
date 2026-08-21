@@ -20,7 +20,7 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
-const SCHEMA_VERSION: i32 = 11;
+const SCHEMA_VERSION: i32 = 12;
 
 /// Split a comma-joined tag column back into a list (trimmed, empties
 /// dropped). `NULL` (unset) stays `None`.
@@ -64,6 +64,14 @@ pub struct SessionRow {
     /// forks, if any (set at its wake issuance, cleared when its run/chain
     /// settles or on genuine user activity).
     pub active_gate: Option<String>,
+    /// The client OS process this session's hooks come from, when the client
+    /// reports one (Claude Code, codex). `None` = no anchor: liveness falls
+    /// back to the parked poll and the `SessionEnd` hook.
+    pub harness: Option<crate::harness::Harness>,
+    /// When the session closed, and why (`client`/`lost`/`gone`/`pruned`/
+    /// `timeout`) — `None` while it is open.
+    pub closed_at: Option<i64>,
+    pub close_reason: Option<String>,
     /// The harness the session's events come from (`opencode`; `None` =
     /// Claude Code). Kept across events that omit it, like `model`.
     pub client: Option<String>,
@@ -344,6 +352,22 @@ impl Store {
                  COMMIT;",
             )?;
         }
+        if version < 12 {
+            // The client process a session belongs to (pid + start-time token
+            // + binary), so liveness can be settled against the OS instead of
+            // hoping for a `SessionEnd` hook or a parked poll to lose; plus a
+            // record of when and why each session closed, which turns "it
+            // sometimes misses my close" into a readable fact.
+            conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE sessions ADD COLUMN harness_pid INTEGER;
+                 ALTER TABLE sessions ADD COLUMN harness_start INTEGER;
+                 ALTER TABLE sessions ADD COLUMN harness_bin TEXT;
+                 ALTER TABLE sessions ADD COLUMN closed_at INTEGER;
+                 ALTER TABLE sessions ADD COLUMN close_reason TEXT;
+                 COMMIT;",
+            )?;
+        }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(Self { conn })
     }
@@ -415,7 +439,8 @@ impl Store {
                 "SELECT session_id, project_root, cwd, transcript_path, status, last_activity,
                         transcript_offset, prompt_tokens, model, created_at,
                         enable_tags, disable_tags, pause_epoch, pause_started_at,
-                        context_window, active_gate, client
+                        context_window, active_gate, client,
+                        harness_pid, harness_start, harness_bin, closed_at, close_reason
                  FROM sessions WHERE session_id = ?1",
                 params![session_id],
                 Self::row_to_session,
@@ -446,6 +471,19 @@ impl Store {
             context_window: row.get::<_, Option<i64>>(14)?.map(|n| n as u64),
             active_gate: row.get(15)?,
             client: row.get(16)?,
+            harness: row
+                .get::<_, Option<i64>>(17)?
+                .map(|pid| crate::harness::Harness {
+                    pid: pid as u32,
+                    start: row.get(18).ok().flatten(),
+                    bin: row
+                        .get::<_, Option<String>>(19)
+                        .ok()
+                        .flatten()
+                        .map(PathBuf::from),
+                }),
+            closed_at: row.get(20)?,
+            close_reason: row.get(21)?,
         })
     }
 
@@ -558,10 +596,50 @@ impl Store {
             "SELECT session_id, project_root, cwd, transcript_path, status, last_activity,
                     transcript_offset, prompt_tokens, model, created_at,
                     enable_tags, disable_tags, pause_epoch, pause_started_at,
-                    context_window, active_gate, client
+                    context_window, active_gate, client,
+                    harness_pid, harness_start, harness_bin, closed_at, close_reason
              FROM sessions WHERE status = 'open' ORDER BY last_activity DESC",
         )?;
         let rows = stmt.query_map([], Self::row_to_session)?;
+        rows.collect()
+    }
+
+    /// Record (or refresh) the client process a session belongs to. Every
+    /// hook event carries it, so a session that survives a client restart
+    /// under the same id — `--resume` in a new terminal — re-anchors on the
+    /// new process rather than staying pinned to the dead one.
+    pub fn set_harness(
+        &self,
+        session_id: &str,
+        harness: &crate::harness::Harness,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET harness_pid = ?2, harness_start = ?3, harness_bin = ?4
+             WHERE session_id = ?1",
+            params![
+                session_id,
+                harness.pid as i64,
+                harness.start,
+                harness
+                    .bin
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The most recently closed sessions with a recorded reason, newest
+    /// first (`autofork status`'s close log).
+    pub fn list_recent_closes(&self, limit: usize) -> rusqlite::Result<Vec<(String, String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_id, close_reason, closed_at FROM sessions
+             WHERE status = 'closed' AND closed_at IS NOT NULL AND close_reason IS NOT NULL
+             ORDER BY closed_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
         rows.collect()
     }
 
@@ -612,12 +690,17 @@ impl Store {
     /// Close a session and clear its roster, latches, spawns and pending
     /// deps. Returns whether this call transitioned it open → closed (the
     /// `session_end` lifecycle-hook edge; racing close paths fire once).
-    pub fn close_session(&self, session_id: &str) -> rusqlite::Result<bool> {
+    pub fn close_session(
+        &self,
+        session_id: &str,
+        reason: &str,
+        now: i64,
+    ) -> rusqlite::Result<bool> {
         let tx = self.conn.unchecked_transaction()?;
         let n = tx.execute(
-            "UPDATE sessions SET status = 'closed'
+            "UPDATE sessions SET status = 'closed', closed_at = ?2, close_reason = ?3
              WHERE session_id = ?1 AND status = 'open'",
-            params![session_id],
+            params![session_id, now, reason],
         )?;
         for table in [
             "fork_roster",
@@ -1204,7 +1287,7 @@ mod tests {
         assert_eq!(roster[1].ran_at, None);
 
         assert!(s.try_latch_fire("a", "j", "context_tokens:5", 200).unwrap());
-        s.close_session("a").unwrap();
+        s.close_session("a", "test", 0).unwrap();
         assert!(s.roster("a").unwrap().is_empty());
         assert_eq!(
             s.get_session("a").unwrap().unwrap().status,
@@ -1534,7 +1617,7 @@ mod tests {
             110,
         )
         .unwrap();
-        s.close_session("a").unwrap();
+        s.close_session("a", "test", 0).unwrap();
         assert!(!s.is_fork_spawn("a", Some("toolu_1"), None).unwrap());
         assert!(s.list_pending_deps("a").unwrap().is_empty());
     }
@@ -1575,8 +1658,8 @@ mod tests {
             Some("opencode")
         );
         // Close transitions exactly once; reopening reports newly-opened again.
-        assert!(s.close_session("a").unwrap());
-        assert!(!s.close_session("a").unwrap());
+        assert!(s.close_session("a", "test", 0).unwrap());
+        assert!(!s.close_session("a", "test", 0).unwrap());
         assert!(s
             .upsert_session(
                 "a",
@@ -1668,7 +1751,7 @@ mod tests {
 
         // Closing the session purges them.
         s.record_bg_task("a", "toolu_two", "bg2", 300).unwrap();
-        s.close_session("a").unwrap();
+        s.close_session("a", "test", 0).unwrap();
         assert_eq!(s.pending_bg_tasks("a", 0).unwrap(), 0);
     }
 }

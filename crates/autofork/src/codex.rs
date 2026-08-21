@@ -149,6 +149,7 @@ fn run_hook_inner(kind: CxHookKind) -> Option<()> {
         context_window: None,
         client: Some(CLIENT.to_string()),
         busy: None,
+        harness: autofork_core::harness::client_process(),
     };
 
     match kind {
@@ -648,6 +649,7 @@ fn waiter_loop(paths: &Paths, args: &WaiterArgs) {
         context_window: state.context_window,
         client: Some(CLIENT.to_string()),
         busy: busy.then_some(true),
+        harness: autofork_core::harness::of_pid(args.codex_pid),
     };
 
     loop {

@@ -198,6 +198,17 @@ fn print_sessions_header(info: &StatusInfo) {
             );
         }
     }
+    if !info.recent_closes.is_empty() {
+        println!("recent closes:");
+        for c in &info.recent_closes {
+            println!(
+                "  {} — {} — {}",
+                display_session_id(&c.session_id),
+                c.reason,
+                fmt_ago(t, c.closed_at),
+            );
+        }
+    }
     if !info.recent_runs.is_empty() {
         println!("recent wakes:");
         for r in &info.recent_runs {

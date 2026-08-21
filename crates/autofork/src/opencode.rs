@@ -135,6 +135,7 @@ fn run_hook_inner(kind: OcHookKind) -> Option<()> {
         context_window: input.context_window,
         client: Some(CLIENT.to_string()),
         busy: input.busy,
+        harness: None,
     };
 
     match kind {

@@ -160,6 +160,14 @@ pub struct Event {
     /// A busy poll never arms idle deadlines or sets the pause baseline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub busy: Option<bool>,
+    /// The client process this event's hook was spawned by (pid + start-time
+    /// token + binary): the session's liveness anchor. The daemon can ask the
+    /// OS whether that process still exists, so a close is noticed even when
+    /// no `SessionEnd` arrives and no parked poll is there to lose. Additive
+    /// field (no proto bump); old daemons ignore it, and a `None` session
+    /// keeps the pre-v0.23 poll-and-hook behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<crate::harness::Harness>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -248,6 +256,23 @@ pub struct StatusInfo {
     /// The "is it safe to close this session?" answer. Additive field.
     #[serde(default)]
     pub running: Vec<RunInfo>,
+    /// The most recently closed sessions and why they closed — the record
+    /// that turns "autofork didn't notice I closed that session" into a
+    /// checkable fact. Additive field.
+    #[serde(default)]
+    pub recent_closes: Vec<CloseInfo>,
+}
+
+/// One closed session: when, and by which close path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloseInfo {
+    pub session_id: String,
+    /// `clear`/`logout`/`prompt_input_exit`/`other`/`ended` (the client said
+    /// so), `gone` (its process disappeared), `lost` (its poll dropped),
+    /// `timeout`/`pruned` (a reaper).
+    pub reason: String,
+    /// Unix epoch seconds.
+    pub closed_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -387,6 +412,7 @@ mod tests {
                 context_window: None,
                 client: None,
                 busy: None,
+                harness: None,
             }),
         };
         let line = encode(&req).unwrap();

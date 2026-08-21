@@ -4,7 +4,7 @@
 
 use crate::daemon::Daemon;
 use autofork_core::protocol::{
-    encode, ErrorCode, ForkInfo, Request, RequestBody, Response, ResponseBody, RunInfo,
+    encode, CloseInfo, ErrorCode, ForkInfo, Request, RequestBody, Response, ResponseBody, RunInfo,
     SessionInfo, StatusInfo,
 };
 use autofork_core::PROTO_VERSION;
@@ -219,9 +219,15 @@ async fn dispatch(daemon: &Arc<Daemon>, body: RequestBody) -> ResponseBody {
     }
 }
 
-/// The `[stale?]` heuristic — cheap honesty for a mid-turn crash the poll-loss
-/// path can't see: open, no parked poll, and idle far past the deadline.
+/// The `[stale?]` heuristic. When the session carries a harness anchor there
+/// is no heuristic left: the client process either exists or it doesn't (and
+/// the liveness sweep is about to close it if it doesn't). Only anchor-less
+/// sessions — older clients, opencode — fall back to the guess a mid-turn
+/// crash used to need: open, no parked poll, idle far past the deadline.
 fn is_stale(daemon: &Arc<Daemon>, s: &autofork_core::store::SessionRow, now: i64) -> bool {
+    if let Some(h) = s.harness.as_ref() {
+        return !h.alive();
+    }
     let deadline = daemon
         .cfg_for(Some(&s.project_root))
         .default_idle_deadline_secs;
@@ -273,6 +279,16 @@ fn status(daemon: &Arc<Daemon>) -> ResponseBody {
             started_at: spawned_at,
         })
         .collect();
+    let recent_closes = store
+        .list_recent_closes(8)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(session_id, reason, closed_at)| CloseInfo {
+            session_id,
+            reason,
+            closed_at,
+        })
+        .collect();
     ResponseBody::StatusInfo(StatusInfo {
         version: Daemon::version().to_string(),
         daemon_proto: PROTO_VERSION,
@@ -280,6 +296,7 @@ fn status(daemon: &Arc<Daemon>) -> ResponseBody {
         sessions,
         recent_runs,
         running,
+        recent_closes,
     })
 }
 
