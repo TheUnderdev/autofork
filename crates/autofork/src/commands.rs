@@ -175,7 +175,7 @@ fn print_sessions_header(info: &StatusInfo) {
         println!("recent wakes:");
         for r in &info.recent_runs {
             println!(
-                "  {} ({}) [{}] — session {} — {}",
+                "  {} ({}) [{}] — {} — {}",
                 r.fork,
                 r.trigger,
                 r.state,
