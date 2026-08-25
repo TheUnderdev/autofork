@@ -216,7 +216,7 @@ pub fn default_run_on() -> Vec<ForkRunOn> {
 /// Only `Idle` and the three `Context*` variants are *supported* in v0.5 (see
 /// [`ForkRunOn::is_supported`]); the rest are recognized (so a migration
 /// warning can be produced) but never fire.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ForkRunOn {
     /// An idle pause. With `after_secs` unset, fires at the configured
     /// default idle deadline; with it set (`- idle: 20m`), fires once the
@@ -244,6 +244,14 @@ pub enum ForkRunOn {
     ManualStop,
     /// Daemon startup found this session. Not supported since v0.5.
     Boot,
+    /// A watched path changed (`changed: <glob>`) — an *external* trigger:
+    /// it fires from the filesystem, not from the session's own lifecycle.
+    /// The pattern is stored as written; the daemon absolutizes it against
+    /// the definition's project root before watching.
+    Changed { pattern: String },
+    /// A named event was emitted (`event: <name>`, raised by
+    /// `autofork emit <name>`) — the non-filesystem external trigger.
+    Event { name: String },
 }
 
 impl ForkRunOn {
@@ -264,6 +272,8 @@ impl ForkRunOn {
             ForkRunOn::SessionEnd => "session_end".into(),
             ForkRunOn::ManualStop => "manual_stop".into(),
             ForkRunOn::Boot => "boot".into(),
+            ForkRunOn::Changed { pattern } => format!("changed:{pattern}"),
+            ForkRunOn::Event { name } => format!("event:{name}"),
         }
     }
 
@@ -276,6 +286,8 @@ impl ForkRunOn {
                 | ForkRunOn::ContextUsedPct(_)
                 | ForkRunOn::ContextLeft(_)
                 | ForkRunOn::Every { .. }
+                | ForkRunOn::Changed { .. }
+                | ForkRunOn::Event { .. }
         )
     }
 }
@@ -297,10 +309,45 @@ fn parse_token_count(v: &serde_yaml::Value) -> Option<u64> {
     }
 }
 
+/// A `changed:` pattern, validated. An empty pattern is rejected loudly: a
+/// blank glob would absolutize to the project root and watch everything.
+fn parse_changed(pattern: &str, warnings: &mut Vec<String>) -> Option<ForkRunOn> {
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        warnings.push("empty 'changed' pattern, skipping".into());
+        return None;
+    }
+    Some(ForkRunOn::Changed {
+        pattern: pattern.to_string(),
+    })
+}
+
+/// An `event:` name, validated.
+fn parse_event(name: &str, warnings: &mut Vec<String>) -> Option<ForkRunOn> {
+    let name = name.trim();
+    if name.is_empty() {
+        warnings.push("empty 'event' name, skipping".into());
+        return None;
+    }
+    Some(ForkRunOn::Event {
+        name: name.to_string(),
+    })
+}
+
 /// Parse one `run_on` entry: a plain string (`idle`, `compact`, …) or a
 /// single-key map (`idle: 20m`, `context_tokens: 150000`, …).
 fn parse_run_on_entry(v: &serde_yaml::Value, warnings: &mut Vec<String>) -> Option<ForkRunOn> {
     if let serde_yaml::Value::String(s) = v {
+        // `- "changed: src/**/*.rs"` reads more naturally than the map form
+        // in a flow list, and a pattern containing a colon only survives
+        // quoting — so accept the inline string spelling for the external
+        // triggers too.
+        if let Some(rest) = s.strip_prefix("changed:") {
+            return parse_changed(rest, warnings);
+        }
+        if let Some(rest) = s.strip_prefix("event:") {
+            return parse_event(rest, warnings);
+        }
         return match s.as_str() {
             "idle" => Some(ForkRunOn::Idle { after_secs: None }),
             "compact" | "compaction" => Some(ForkRunOn::Compact),
@@ -327,6 +374,8 @@ fn parse_run_on_entry(v: &serde_yaml::Value, warnings: &mut Vec<String>) -> Opti
                     "context_tokens" => parse_token_count(val).map(ForkRunOn::ContextTokens),
                     "context_used" => parse_percent(val).map(ForkRunOn::ContextUsedPct),
                     "context_left" => parse_token_count(val).map(ForkRunOn::ContextLeft),
+                    "changed" => return val.as_str().and_then(|p| parse_changed(p, warnings)),
+                    "event" => return val.as_str().and_then(|n| parse_event(n, warnings)),
                     other => {
                         warnings.push(format!("unknown run_on trigger '{other}', skipping"));
                         return None;
@@ -788,6 +837,40 @@ mod tests {
             ForkParse::Fork(p) => p,
             other => panic!("expected a fork, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn external_run_on_triggers_parse_and_are_supported() {
+        let p = parse(
+            "---\nfork: true\nrun_on:\n  - changed: src/**/*.rs\n  - \"event: deploy\"\n---\nbody",
+        );
+        assert_eq!(
+            p.def.run_on,
+            vec![
+                ForkRunOn::Changed {
+                    pattern: "src/**/*.rs".into()
+                },
+                ForkRunOn::Event {
+                    name: "deploy".into()
+                },
+            ]
+        );
+        assert!(p.def.run_on.iter().all(|t| t.is_supported()));
+        assert_eq!(p.def.run_on[0].label(), "changed:src/**/*.rs");
+        assert_eq!(p.def.run_on[1].label(), "event:deploy");
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+    }
+
+    #[test]
+    fn empty_external_values_are_rejected() {
+        let p = parse("---\nfork: true\nrun_on: [\"changed:  \", \"event: \"]\n---\nbody");
+        assert!(p.warnings.iter().any(|w| w.contains("empty 'changed'")));
+        assert!(p.warnings.iter().any(|w| w.contains("empty 'event'")));
+        // Nothing valid survived, so the fork falls back to the documented
+        // default (an idle pause) rather than silently never firing — the
+        // same treatment every other invalid `run_on` gets.
+        assert_eq!(p.def.run_on, default_run_on());
+        assert!(p.warnings.iter().any(|w| w.contains("no valid triggers")));
     }
 
     #[test]

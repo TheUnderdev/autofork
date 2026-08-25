@@ -202,6 +202,12 @@ Moments for `run_on`:
   next genuine activity re-arms it — a session left idle overnight runs nothing. Combine with
   `idle:` for "on a 4-minute pause, or hourly regardless": `run_on: [idle: 4m, every: 1h]` — an
   idle-triggered run resets the hourly clock (and usually absorbs that one post-pause fire too).
+- `changed: <glob>` (v0.24) — a watched path was written, created or deleted. The first **external**
+  moment: it fires from the outside world, not from the session's own lifecycle, so a fork can react
+  to another session's work, a `git pull`, or a build artifact landing. See
+  [External moments](#external-moments-changed-and-event).
+- `event: <name>` (v0.24) — someone ran `autofork emit <name>`. The same external moment for things
+  that are not files.
 
 Unknown keys are ignored; invalid values warn and fall back to defaults (`autofork forks` shows the
 warnings). Fork bodies should be **idempotent** — a fork may fire on any idle pause.
@@ -390,6 +396,8 @@ Events (`on`):
 | `activity` | each genuine user prompt (the same signal that starts a new pause) | — |
 | `idle` / `idle: <dur>` | the session has been idle that long — **once per pause**, while the session stays open and parked (bare `idle` uses `default_idle_deadline`) | `AUTOFORK_IDLE_SECS` |
 | `session_end` | the session ended, from any path | `AUTOFORK_END_REASON` |
+| `changed: <glob>` | a watched path was written, created or deleted — **external**, so it can fire mid-turn (see [External moments](#external-moments-changed-and-event)) | `AUTOFORK_WATCH`, `AUTOFORK_CHANGED_PATHS` |
+| `event: <name>` | `autofork emit <name>` was run | `AUTOFORK_EMIT_NAME`, `AUTOFORK_EMIT_PAYLOAD` |
 
 Every firing also carries `AUTOFORK_HOOK_NAME`, `AUTOFORK_EVENT`, `AUTOFORK_SESSION_ID` (the
 parent session id), `AUTOFORK_PROJECT_ROOT`, `AUTOFORK_CWD`, and `AUTOFORK_CLIENT` (`claude-code`
@@ -414,6 +422,146 @@ go to the daemon log (`autofork logs`); a failing or timing-out hook is logged a
 inert. Fork-run sessions (opencode) never fire lifecycle hooks. `autofork hooks` lists what's
 discovered, with warnings.
 
+A hook may also carry `throttle:` (v0.24) — a minimum gap between its runs, in the same spelling
+forks use. It matters most for the external moments below, which the outside world can raise far
+faster than a session's lifecycle ever does.
+
+## Feeds: a command that speaks into the session
+
+Forks answer "run a **model** over this session's context". Lifecycle hooks answer "run a
+**command** at a session's lifecycle moments". A **feed** is the missing quadrant: a *command*
+that produces *context*.
+
+|                        | produced by a **model** | produced by a **command** |
+|---|---|---|
+| **effect: outside world** | — | lifecycle hooks (leases, locks) |
+| **effect: session context** | forks (reports) | **feeds** |
+
+A feed is a lifecycle hook with `deliver:` set — same file, same discovery, same `on:` moments:
+
+```markdown
+---
+hook: true
+description: keep the session current on recent handovers
+on:
+  - session_start
+  - "changed: ~/notes/handovers/**/*.md"
+deliver: context
+throttle: 30s
+max_bytes: 6000
+command: handover-brief
+---
+Prints an index of the most recent handovers at session start, and just the
+changed one when another session writes it.
+```
+
+`deliver:` takes three values:
+
+| value | what happens | cost |
+|---|---|---|
+| `none` (default) | stdout goes to the daemon log — the classic lifecycle hook | — |
+| `context` | the block is delivered **silently** on the session's next prompt | no turn, invisible in the transcript |
+| `wake` | the block is delivered by **waking the session**, which reacts to it in a turn | one turn |
+
+The output is framed exactly like a fork report (`source: autofork`, then `feed: <name> (<event>)`)
+so the model can tell a command's output from a model's report, and so every delivery lane's
+"is this autofork's own injection?" check keeps working.
+
+Three rules make a feed writable as *just print the current view*:
+
+- **Empty output means nothing to say.** A feed with no news prints nothing and costs the session
+  not one token. This is the normal quiet path, not a failure.
+- **Unchanged output is never delivered twice** (for `deliver: context`). The daemon hashes each
+  delivered block per (session, feed); an identical block is skipped. So the simple implementation
+  — print the whole current index every time — is also the correct one. `deliver: wake` is exempt
+  on purpose: you asked to interrupt the session, and "the deploy failed" arriving twice is news
+  the second time too. What bounds a wake feed is its trigger and its `throttle:`.
+- **`max_bytes:` truncates rather than drops** (default 8000). One chatty feed must not crowd out
+  the fork reports sharing the same lane.
+
+Environment: a feed gets the same `AUTOFORK_*` variables every hook gets, plus `AUTOFORK_DELIVER`.
+External moments add `AUTOFORK_TRIGGER` and, per kind, `AUTOFORK_WATCH` + `AUTOFORK_CHANGED_PATHS`
+(newline-separated) or `AUTOFORK_EMIT_NAME` + `AUTOFORK_EMIT_PAYLOAD`.
+
+**Per-client delivery**, because each harness has a different silent lane:
+
+| client | `deliver: context` | `deliver: wake` |
+|---|---|---|
+| Claude Code | spooled, delivered as `additionalContext` at your next prompt | the parked Stop poll exits 2 with the block |
+| codex | spooled, delivered as `additionalContext` at your next prompt | the Stop hook blocks-and-injects it at the next turn end |
+| opencode | injected as a **no-reply message** (it has no additionalContext lane) — zero turns, and it can land mid-run | injected as a real turn, with your model/agent pinned |
+
+One honest limit: on Claude Code and codex there is no channel into a *running* turn. A quiet feed
+therefore reaches the model at its next prompt, and a wake feed at the next turn boundary. opencode
+is the one client that can take an injection mid-run.
+
+## External moments: `changed:` and `event:`
+
+Every moment before v0.24 was derived from the session's own lifecycle. These two are not: they
+fire when the *outside world* moves, and they work identically for forks (`run_on:`) and hooks
+(`on:`).
+
+```yaml
+run_on:
+  - "changed: ~/notes/handovers/**/*.md"   # a watched path was written/created/deleted
+  - "event: deploy"                        # someone ran `autofork emit deploy`
+```
+
+Both spellings work — the map form (`- changed: src/**/*.rs`) and the quoted-string form. Prefer
+the quoted form for a pattern containing a colon, which a YAML plain scalar cannot hold.
+
+Patterns support `*`, `?` and `**` (a whole-segment wildcard). A leading `~/` expands to your home
+directory; a relative pattern resolves against the session's **project root**, so a definition can
+say `docs/**/*.md` and mean its own project. There are no character classes or brace expansion:
+write two patterns instead.
+
+**autofork watches by polling.** Every `watch_interval` (default 2s) the daemon stats the files
+each pattern matches and diffs that against the previous sweep. It does not subscribe to filesystem
+events, deliberately: a poll needs no extra dependency, hits no per-platform watch limit, opens no
+descriptor per directory, and costs exactly what the interval says. What you give up is instant
+delivery — a change is noticed within one interval, and then lands at the session's next turn
+boundary or next prompt (see the delivery table above).
+
+Three behaviours worth knowing:
+
+- **The first sweep of a pattern is a baseline, never a trigger.** A session that starts and
+  immediately matches five hundred files is not told all five hundred just changed.
+- **A burst is one trigger.** Changes settle for `watch_debounce` (default 2s) before firing, so an
+  editor's write-then-rename and a `git pull`'s hundred files arrive as a single fire carrying the
+  whole path set. A directory written to continuously still fires, at most one interval late.
+- **Deletions count.** A file that disappears is a change — a feed that lists a directory needs to
+  know.
+
+Scan guards: `.git`, `node_modules`, `target`, `.venv` and `__pycache__` are never walked into (a
+`git pull` still rewrites the *worktree*, which is what patterns point at); the walk stops 24 levels
+below a pattern's deepest wildcard-free directory; and a pattern matching more than
+`watch_max_files` (default 20000) is watched up to the cap **and warned about in the daemon log**,
+rather than silently degrading.
+
+A fork woken by an external trigger is told what the trigger carried — the changed paths, or the
+emit payload — in its spawn prompt (capped at 40 lines), so it can act on what moved instead of
+re-deriving it.
+
+Throttles and the runaway breaker apply to `changed:` and `event:` exactly as they do to `idle:`
+(unlike `every:`, which is exempt — an interval is an explicit contract, a filesystem is not). The
+queued trigger is consumed when the wake is issued, so a fork fires once per change, not once per
+poll until the next one.
+
+### `autofork emit`
+
+```
+autofork emit deploy --payload "build 412 is live"
+autofork emit handover-written --payload -     # read the payload from stdin
+autofork emit ping --project                   # only sessions under this project root
+autofork emit ping --session <id>              # only that session
+```
+
+The non-filesystem sibling of `changed:`, for when the thing that happened is not a file: a job
+finished, a deploy landed, another tool has news. It reaches every open session on this machine
+whose forks or hooks listen for the name (scoped by the flags above), and prints how many it
+reached. Use it instead of a filesystem proxy when the producer can just say so — it is precise,
+instant, and needs no sweep.
+
 ## CLI
 
 ```
@@ -422,6 +570,7 @@ autofork forks           # forks visible from here, with warnings
 autofork hooks           # lifecycle hooks visible from here, with warnings
 autofork run <name>      # print the spawn instruction to paste into an interactive session
 autofork run --tag <tag> # print instructions for every fork carrying <tag>
+autofork emit <name>     # raise a named external event for every listening session
 autofork logs [-f]       # daemon log
 autofork prune           # close [stale?] sessions now instead of waiting for the session timeout
 autofork doctor          # install checks
@@ -458,6 +607,9 @@ fork_runner = "headless"       # Claude Code execution mode; "subagent" opts int
 flush_on_close = true          # run the pause's unrun idle forks when a session ends (see below)
 background_hold = true         # a session waiting on background work isn't idle yet (see below)
 background_hold_timeout = "30m" # after this, one unfinished task stops holding; 0 = hold forever
+watch_interval = "2s"          # how often `changed:` patterns are swept; 0 disables them
+watch_debounce = "2s"          # a burst of writes settles this long, then fires once
+watch_max_files = 20000        # cap on files one watched pattern may track (warned when hit)
 
 [fork_models]                  # default fork model per client; a fork's own `model:` wins
 "claude-code" = ["sonnet", "haiku"]   # one id, or a fallback list tried in order

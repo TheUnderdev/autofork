@@ -175,6 +175,48 @@ impl Harness {
         }
     }
 
+    /// Write a *feed*: a lifecycle hook whose stdout is delivered into the
+    /// session. The command prints `body` plus whatever `extra` shell snippet
+    /// appends, so a test can assert on the trigger env the hook received.
+    fn write_feed(&self, rel: &str, on: &str, deliver: &str, body: &str) {
+        let path = self.project.join(".autofork/hooks").join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            // A literal block scalar, because a feed body naturally contains
+            // `: ` — which a YAML plain scalar cannot.
+            format!(
+                "---\nhook: true\non: {on}\ndeliver: {deliver}\n\
+                 command: |-\n  printf '%s' \"{body}\"\n---\nfeed documentation\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Wait until `TakeReports` yields at least one spooled block, then
+    /// return them (feeds run asynchronously, like every hook command).
+    fn wait_for_reports(&self, session: &str, timeout: Duration) -> Vec<String> {
+        let start = Instant::now();
+        loop {
+            if let ResponseBody::Reports { blocks } = self.request(RequestBody::TakeReports {
+                session_id: session.to_string(),
+            }) {
+                if !blocks.is_empty() {
+                    return blocks;
+                }
+            }
+            assert!(start.elapsed() < timeout, "no feed block was spooled");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// A path inside the project that a `changed:` pattern can watch.
+    fn watched_dir(&self) -> PathBuf {
+        let dir = self.project.join("watched");
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     fn write_transcript(&self, tokens: u64) -> PathBuf {
         let path = self.project.join("transcript.jsonl");
         std::fs::write(
@@ -3023,4 +3065,227 @@ fn a_session_inherited_dead_from_a_previous_daemon_closes_without_flushing() {
         "an inherited dead session must not flush: {:?}",
         std::fs::read_to_string(&record)
     );
+}
+
+// ---------------------------------------------------------------------------
+// v0.24: feeds (`deliver:`) and the external moments (`changed:` / `event:`)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_feed_spools_its_stdout_as_a_context_block() {
+    let mut h = Harness::new("30m", "0");
+    h.write_feed("brief.md", "[activity]", "context", "RECENT: one, two");
+    h.start_daemon();
+
+    assert_ack(h.send_event(h.event(EventKind::SessionStart, "s1")));
+    assert_ack(h.send_event(h.prompt_submit("s1", true)));
+
+    let blocks = h.wait_for_reports("s1", Duration::from_secs(10));
+    assert_eq!(blocks.len(), 1, "{blocks:?}");
+    // Framed like a fork report (so every delivery lane's sniff keeps
+    // working) but named a feed, so the model can tell a command's output
+    // from a model's report.
+    assert!(blocks[0].contains("source: autofork"), "{}", blocks[0]);
+    assert!(
+        blocks[0].contains("feed: brief (activity)"),
+        "{}",
+        blocks[0]
+    );
+    assert!(blocks[0].contains("RECENT: one, two"), "{}", blocks[0]);
+}
+
+#[test]
+fn a_feed_does_not_deliver_the_same_block_twice() {
+    let mut h = Harness::new("30m", "0");
+    h.write_feed("brief.md", "[activity]", "context", "UNCHANGED");
+    h.start_daemon();
+
+    assert_ack(h.send_event(h.event(EventKind::SessionStart, "s1")));
+    assert_ack(h.send_event(h.prompt_submit("s1", true)));
+    let first = h.wait_for_reports("s1", Duration::from_secs(10));
+    assert_eq!(first.len(), 1);
+
+    // Same output, second firing: the dedupe is what lets a feed command be
+    // written the simple way — print the whole current view every time.
+    assert_ack(h.send_event(h.prompt_submit("s1", true)));
+    std::thread::sleep(Duration::from_secs(2));
+    match h.request(RequestBody::TakeReports {
+        session_id: "s1".into(),
+    }) {
+        ResponseBody::Reports { blocks } => {
+            assert!(
+                blocks.is_empty(),
+                "unchanged output was re-delivered: {blocks:?}"
+            )
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn a_wake_feed_resolves_a_parked_poll_with_its_blocks() {
+    let mut h = Harness::new("30m", "0");
+    h.write_feed("urgent.md", "[activity]", "wake", "SOMETHING MOVED");
+    h.start_daemon();
+
+    assert_ack(h.send_event(h.event(EventKind::SessionStart, "s1")));
+    // Activity runs the feed; the block is queued because no poll is parked
+    // yet — which is the normal case, since the outside world does not keep
+    // to the session's rhythm.
+    assert_ack(h.send_event(h.prompt_submit("s1", true)));
+    std::thread::sleep(Duration::from_secs(1));
+
+    let rx = h.park_stop_wait(h.event(EventKind::Stop, "s1"));
+    match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+        ResponseBody::Wake {
+            payload,
+            forks,
+            feed,
+        } => {
+            let feed = feed.expect("a feed wake carries its blocks");
+            assert!(feed.wake, "deliver: wake must ask for a turn");
+            assert_eq!(feed.blocks.len(), 1);
+            assert!(feed.blocks[0].contains("SOMETHING MOVED"));
+            assert!(payload.contains("SOMETHING MOVED"), "{payload}");
+            // A feed wake spawns nothing: it must not look like a fork wake.
+            assert!(forks.is_none() || forks.as_ref().unwrap().is_empty());
+        }
+        other => panic!("expected a feed wake, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_watched_path_changing_fires_a_hook_with_the_paths() {
+    let mut h = Harness::new("30m", "0");
+    h.append_config("watch_interval = 1");
+    h.append_config("watch_debounce = 0");
+    let watched = h.watched_dir();
+    let log = h.project.join("changed.log");
+    let hook = h.project.join(".autofork/hooks/notes.md");
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    std::fs::write(
+        &hook,
+        format!(
+            "---\nhook: true\non:\n  - \"changed: {}/**/*.md\"\n\
+             command: printf '%s|%s\\n' \"$AUTOFORK_EVENT\" \"$AUTOFORK_CHANGED_PATHS\" >> \"{}\"\n---\nwatcher\n",
+            watched.display(),
+            log.display()
+        ),
+    )
+    .unwrap();
+    h.start_daemon();
+    assert_ack(h.send_event(h.event(EventKind::SessionStart, "s1")));
+
+    // The first sweep of a pattern is a baseline, never a trigger: give it
+    // one, then write.
+    std::thread::sleep(Duration::from_secs(2));
+    std::fs::write(watched.join("new.md"), "hello").unwrap();
+
+    let lines = h.wait_for_hook_lines(&log, 1, Duration::from_secs(20));
+    assert!(lines[0].starts_with("changed|"), "{lines:?}");
+    assert!(lines[0].contains("new.md"), "{lines:?}");
+}
+
+#[test]
+fn a_watched_path_changing_wakes_a_fork_once() {
+    let mut h = Harness::new("30m", "0");
+    h.append_config("watch_interval = 1");
+    h.append_config("watch_debounce = 0");
+    let watched = h.watched_dir();
+    h.write_fork(
+        "review.md",
+        &format!(
+            "---\nfork: true\nrun_on:\n  - \"changed: {}/**/*.rs\"\n---\nReview what changed.\n",
+            watched.display()
+        ),
+    );
+    h.start_daemon();
+    assert_ack(h.send_event(h.event(EventKind::SessionStart, "s1")));
+    std::thread::sleep(Duration::from_secs(2));
+
+    let rx = h.park_stop_wait(h.event(EventKind::Stop, "s1"));
+    std::fs::write(watched.join("lib.rs"), "fn main() {}").unwrap();
+
+    match rx.recv_timeout(Duration::from_secs(20)).unwrap() {
+        ResponseBody::Wake { payload, forks, .. } => {
+            assert!(payload.contains("review"), "{payload}");
+            let forks = forks.expect("structured specs");
+            assert_eq!(forks.len(), 1);
+            assert!(forks[0].trigger.starts_with("changed:"), "{:?}", forks[0]);
+            // The fork is told WHAT moved — the difference between a targeted
+            // run and a blind re-scan.
+            assert!(forks[0].prompt.contains("lib.rs"), "{}", forks[0].prompt);
+        }
+        other => panic!("expected a wake, got {other:?}"),
+    }
+
+    // The trigger was consumed at issuance: a fresh poll must not re-fire it
+    // (nothing has changed since).
+    let rx2 = h.park_stop_wait(h.event(EventKind::Stop, "s1"));
+    match rx2.recv_timeout(Duration::from_secs(4)) {
+        Err(mpsc::RecvTimeoutError::Timeout) => {}
+        Ok(other) => panic!("the consumed trigger re-fired: {other:?}"),
+        Err(e) => panic!("{e:?}"),
+    }
+}
+
+#[test]
+fn emit_triggers_a_listening_fork_and_hook() {
+    let mut h = Harness::new("30m", "0");
+    let log = h.write_logging_hook("announce.md", "[\"event: deploy\"]");
+    h.write_fork(
+        "on-deploy.md",
+        "---\nfork: true\nrun_on:\n  - \"event: deploy\"\n---\nCheck the deploy.\n",
+    );
+    h.start_daemon();
+    assert_ack(h.send_event(h.event(EventKind::SessionStart, "s1")));
+
+    let rx = h.park_stop_wait(h.event(EventKind::Stop, "s1"));
+    std::thread::sleep(Duration::from_millis(300));
+
+    match h.request(RequestBody::Emit {
+        name: "deploy".into(),
+        payload: Some("build 412 is live".into()),
+        project_root: None,
+        session_id: None,
+    }) {
+        ResponseBody::Emitted { sessions } => assert_eq!(sessions, 1),
+        other => panic!("unexpected {other:?}"),
+    }
+
+    match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+        ResponseBody::Wake { forks, .. } => {
+            let forks = forks.expect("structured specs");
+            assert_eq!(forks.len(), 1);
+            assert_eq!(forks[0].name, "on-deploy");
+            assert_eq!(forks[0].trigger, "event:deploy");
+            assert!(
+                forks[0].prompt.contains("build 412 is live"),
+                "the emit payload must reach the fork: {}",
+                forks[0].prompt
+            );
+        }
+        other => panic!("expected a wake, got {other:?}"),
+    }
+
+    let lines = h.wait_for_hook_lines(&log, 1, Duration::from_secs(10));
+    assert!(lines[0].starts_with("event|"), "{lines:?}");
+}
+
+#[test]
+fn emit_can_be_scoped_to_one_session() {
+    let mut h = Harness::new("30m", "0");
+    h.start_daemon();
+    assert_ack(h.send_event(h.event(EventKind::SessionStart, "s1")));
+    assert_ack(h.send_event(h.event(EventKind::SessionStart, "s2")));
+
+    match h.request(RequestBody::Emit {
+        name: "ping".into(),
+        payload: None,
+        project_root: None,
+        session_id: Some("s2".into()),
+    }) {
+        ResponseBody::Emitted { sessions } => assert_eq!(sessions, 1),
+        other => panic!("unexpected {other:?}"),
+    }
 }

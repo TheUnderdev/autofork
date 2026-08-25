@@ -94,6 +94,24 @@ pub struct Config {
     /// to a resume — would otherwise silence the session's idle forks for
     /// good. `0` disables the timeout (hold forever).
     pub background_hold_timeout_secs: u64,
+    /// How often the daemon sweeps the paths that `changed:` triggers watch
+    /// (seconds). autofork watches by **polling** — a stat sweep of each
+    /// pattern's literal prefix — rather than by subscribing to filesystem
+    /// events: no new dependency, no per-platform watch limits, no descriptor
+    /// storm on a big tree, and the cost is bounded by the interval. The
+    /// trade is latency: a change is noticed within one interval, not
+    /// instantly. `0` disables `changed:` triggers entirely.
+    pub watch_interval_secs: u64,
+    /// A watched pattern that changed waits this long for the writes around
+    /// it to settle before firing (seconds), so an editor's write-then-rename
+    /// and a `git pull`'s hundred files arrive as ONE trigger carrying the
+    /// whole path set. `0` fires on the sweep that saw the change.
+    pub watch_debounce_secs: u64,
+    /// Cap on files one watched pattern may track. A pattern that matches
+    /// more is watched up to the cap and warned about — a stat sweep of an
+    /// unbounded tree every `watch_interval` is a cost the user did not ask
+    /// for, and silently degrading is worse than saying so.
+    pub watch_max_files: usize,
 }
 
 /// The Claude Code fork execution mode (see `Config::fork_runner`).
@@ -148,6 +166,9 @@ impl Default for Config {
             flush_on_close: true,
             background_hold: true,
             background_hold_timeout_secs: 30 * 60,
+            watch_interval_secs: 2,
+            watch_debounce_secs: 2,
+            watch_max_files: 20_000,
         }
     }
 }
@@ -174,6 +195,9 @@ struct RawConfig {
     flush_on_close: Option<toml::Value>,
     background_hold: Option<toml::Value>,
     background_hold_timeout: Option<toml::Value>,
+    watch_interval: Option<toml::Value>,
+    watch_debounce: Option<toml::Value>,
+    watch_max_files: Option<toml::Value>,
     // ---- deprecated since v0.5: accepted, warned, ignored ----
     concurrency: Option<toml::Value>,
     fork_timeout: Option<toml::Value>,
@@ -337,6 +361,22 @@ fn apply_layer(cfg: &mut Config, raw: RawConfig, project_level: bool, warnings: 
         // and the sections above push to it directly.
         if let Some(s) = parse_toml_duration(v, "background_hold_timeout", warnings) {
             cfg.background_hold_timeout_secs = s;
+        }
+    }
+    if let Some(v) = &raw.watch_interval {
+        if let Some(s) = parse_toml_duration(v, "watch_interval", warnings) {
+            cfg.watch_interval_secs = s;
+        }
+    }
+    if let Some(v) = &raw.watch_debounce {
+        if let Some(s) = parse_toml_duration(v, "watch_debounce", warnings) {
+            cfg.watch_debounce_secs = s;
+        }
+    }
+    if let Some(v) = &raw.watch_max_files {
+        match v.as_integer().filter(|n| *n > 0) {
+            Some(n) => cfg.watch_max_files = n as usize,
+            None => warnings.push("watch_max_files must be a positive integer; ignored".into()),
         }
     }
     if let Some(v) = &raw.fork_runner {

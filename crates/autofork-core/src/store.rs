@@ -20,7 +20,7 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
-const SCHEMA_VERSION: i32 = 12;
+const SCHEMA_VERSION: i32 = 13;
 
 /// Split a comma-joined tag column back into a list (trimmed, empties
 /// dropped). `NULL` (unset) stays `None`.
@@ -368,6 +368,52 @@ impl Store {
                  COMMIT;",
             )?;
         }
+        if version < 13 {
+            // v0.24: external triggers (`changed:` / `event:`) and feeds.
+            //
+            // `pending_triggers` is the queue between the outside world and a
+            // session's next evaluation: the watcher (or `autofork emit`)
+            // records one row per (session, kind, key), merging detail when
+            // the same trigger fires again before it is consumed. It is a
+            // TABLE rather than in-memory state because a trigger that
+            // arrives while no poll is parked must survive until the session
+            // next stops — and must survive a daemon restart, which an idle
+            // pause easily outlives.
+            //
+            // `hook_state` carries the two things a feed needs to be quiet:
+            // when it last ran (its `throttle:`) and the hash of what it last
+            // delivered (the dedupe that lets a feed command print its whole
+            // current view every time and still only reach the model when
+            // something actually changed).
+            conn.execute_batch(
+                "BEGIN;
+                 CREATE TABLE IF NOT EXISTS pending_triggers (
+                   session_id TEXT NOT NULL,
+                   kind       TEXT NOT NULL,
+                   key        TEXT NOT NULL,
+                   detail     TEXT NOT NULL DEFAULT '',
+                   created_at INTEGER NOT NULL,
+                   PRIMARY KEY (session_id, kind, key)
+                 );
+                 CREATE TABLE IF NOT EXISTS wake_spool (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   session_id TEXT NOT NULL,
+                   hook_name  TEXT NOT NULL,
+                   text       TEXT NOT NULL,
+                   created_at INTEGER NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS wake_spool_session
+                     ON wake_spool(session_id);
+                 CREATE TABLE IF NOT EXISTS hook_state (
+                   session_id  TEXT NOT NULL,
+                   hook_name   TEXT NOT NULL,
+                   last_run_at INTEGER,
+                   last_hash   TEXT,
+                   PRIMARY KEY (session_id, hook_name)
+                 );
+                 COMMIT;",
+            )?;
+        }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(Self { conn })
     }
@@ -708,6 +754,9 @@ impl Store {
             "fork_spawns",
             "pending_deps",
             "bg_tasks",
+            "pending_triggers",
+            "hook_state",
+            "wake_spool",
         ] {
             tx.execute(
                 &format!("DELETE FROM {table} WHERE session_id = ?1"),
@@ -716,6 +765,211 @@ impl Store {
         }
         tx.commit()?;
         Ok(n > 0)
+    }
+
+    // ---- external triggers (`changed:` / `event:`) ----
+
+    /// Record that an external trigger fired for a session, to be consumed by
+    /// the session's next evaluation. Re-firing before consumption merges the
+    /// detail (the changed paths accumulate) rather than replacing it: a
+    /// coalesced burst must not lose the paths it coalesced, and a trigger
+    /// held back by a throttle must not silently drop what it was holding.
+    /// `cap` bounds the merged detail so a pathological writer cannot grow
+    /// one row without limit.
+    pub fn record_pending_trigger(
+        &self,
+        session_id: &str,
+        kind: &str,
+        key: &str,
+        detail: &str,
+        cap: usize,
+        now: i64,
+    ) -> rusqlite::Result<()> {
+        let existing: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT detail FROM pending_triggers
+                 WHERE session_id = ?1 AND kind = ?2 AND key = ?3",
+                params![session_id, kind, key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let merged = match existing {
+            None => detail.to_string(),
+            Some(prev) => {
+                let mut lines: Vec<&str> = prev.lines().collect();
+                for l in detail.lines() {
+                    if !lines.contains(&l) {
+                        lines.push(l);
+                    }
+                }
+                let mut out = lines.join("\n");
+                if out.len() > cap {
+                    let mut cut = cap;
+                    while cut > 0 && !out.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    out.truncate(cut);
+                }
+                out
+            }
+        };
+        self.conn.execute(
+            "INSERT INTO pending_triggers (session_id, kind, key, detail, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(session_id, kind, key)
+             DO UPDATE SET detail = excluded.detail",
+            params![session_id, kind, key, merged, now],
+        )?;
+        Ok(())
+    }
+
+    /// The external triggers waiting for a session: `(kind, key, detail)`.
+    pub fn pending_triggers(
+        &self,
+        session_id: &str,
+    ) -> rusqlite::Result<Vec<(String, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT kind, key, detail FROM pending_triggers
+             WHERE session_id = ?1 ORDER BY created_at ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![session_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Consume one external trigger (called when a wake carrying it is
+    /// issued). Returns whether a row was actually removed.
+    pub fn clear_pending_trigger(
+        &self,
+        session_id: &str,
+        kind: &str,
+        key: &str,
+    ) -> rusqlite::Result<bool> {
+        let n = self.conn.execute(
+            "DELETE FROM pending_triggers
+             WHERE session_id = ?1 AND kind = ?2 AND key = ?3",
+            params![session_id, kind, key],
+        )?;
+        Ok(n > 0)
+    }
+
+    // ---- wake-delivered feed blocks ----
+
+    /// Queue a `deliver: wake` block for a session. It waits here until a
+    /// parked poll can carry it (Claude Code, opencode) or the session's next
+    /// Stop hook takes it (codex) — a queue rather than a direct handoff
+    /// because a feed fires when the outside world moves, which is rarely
+    /// when the session happens to be listening.
+    pub fn spool_wake_block(
+        &self,
+        session_id: &str,
+        hook: &str,
+        text: &str,
+        now: i64,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO wake_spool (session_id, hook_name, text, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![session_id, hook, text, now],
+        )?;
+        Ok(())
+    }
+
+    /// Take (and clear) a session's queued wake blocks, oldest first.
+    pub fn take_wake_blocks(&self, session_id: &str) -> rusqlite::Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT text FROM wake_spool WHERE session_id = ?1 ORDER BY id ASC")?;
+        let blocks: Vec<String> = stmt
+            .query_map(params![session_id], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        self.conn.execute(
+            "DELETE FROM wake_spool WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        Ok(blocks)
+    }
+
+    /// Whether a session has any queued wake blocks (a cheap check for the
+    /// parked poll's hot path).
+    pub fn has_wake_blocks(&self, session_id: &str) -> rusqlite::Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM wake_spool WHERE session_id = ?1",
+            params![session_id],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Whether a session has any spooled report blocks waiting.
+    pub fn has_reports(&self, session_id: &str) -> rusqlite::Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM report_spool WHERE session_id = ?1",
+            params![session_id],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    // ---- hook / feed state ----
+
+    /// When a hook last ran for this session (its `throttle:` gauge).
+    pub fn hook_last_run(&self, session_id: &str, hook: &str) -> rusqlite::Result<Option<i64>> {
+        self.conn
+            .query_row(
+                "SELECT last_run_at FROM hook_state WHERE session_id = ?1 AND hook_name = ?2",
+                params![session_id, hook],
+                |r| r.get(0),
+            )
+            .optional()
+            .map(Option::flatten)
+    }
+
+    /// Stamp a hook run.
+    pub fn stamp_hook_run(&self, session_id: &str, hook: &str, now: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO hook_state (session_id, hook_name, last_run_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(session_id, hook_name) DO UPDATE SET last_run_at = excluded.last_run_at",
+            params![session_id, hook, now],
+        )?;
+        Ok(())
+    }
+
+    /// Record the hash of the block a feed last delivered to this session,
+    /// returning whether it CHANGED (and so should be delivered). An
+    /// unchanged block is the normal case for a feed that prints its whole
+    /// current view on every fire — dedupe here is what makes that the right
+    /// way to write one.
+    pub fn feed_hash_changed(
+        &self,
+        session_id: &str,
+        hook: &str,
+        hash: &str,
+    ) -> rusqlite::Result<bool> {
+        let prev: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT last_hash FROM hook_state WHERE session_id = ?1 AND hook_name = ?2",
+                params![session_id, hook],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        if prev.as_deref() == Some(hash) {
+            return Ok(false);
+        }
+        self.conn.execute(
+            "INSERT INTO hook_state (session_id, hook_name, last_hash)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(session_id, hook_name) DO UPDATE SET last_hash = excluded.last_hash",
+            params![session_id, hook, hash],
+        )?;
+        Ok(true)
     }
 
     // ---- roster ----

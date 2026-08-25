@@ -194,9 +194,23 @@ fn run_hook_inner(kind: HookKind) -> Option<()> {
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_else(|| input.session_id.clone());
                 let mut reports = std::collections::HashMap::new();
-                while let Ok(ResponseBody::Wake { forks, .. }) =
-                    client.stop_wait(event(EventKind::Stop))
+                while let Ok(ResponseBody::Wake {
+                    payload,
+                    forks,
+                    feed,
+                }) = client.stop_wait(event(EventKind::Stop))
                 {
+                    // A feed wake carries text, not forks: a `deliver: wake`
+                    // lifecycle hook's output, which the session is meant to
+                    // react to. Same delivery as the goal fast path below —
+                    // stderr + exit 2 — because a quiet spool would defeat
+                    // the point of having asked for a wake. (Quiet feeds
+                    // never reach here: they ride the spool the prompt hook
+                    // drains, invisible to this loop.)
+                    if feed.is_some_and(|f| !f.blocks.is_empty()) {
+                        eprintln!("{payload}");
+                        std::process::exit(2);
+                    }
                     let wake_blocks = crate::runner::execute_wake(
                         &paths,
                         &input.session_id,

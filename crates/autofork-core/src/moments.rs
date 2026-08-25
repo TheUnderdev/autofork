@@ -52,7 +52,7 @@ pub fn resolve_context_window(
 
 /// A fork moment: an event at which rostered forks may fire (matched against
 /// each fork's `run_on` config).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ForkMoment {
     /// The session has been idle for exactly this deadline (seconds).
     Idle { deadline_secs: u64 },
@@ -73,6 +73,41 @@ pub enum ForkMoment {
         now: i64,
         pause_started_at: Option<i64>,
     },
+    /// An external trigger fired since the last evaluation: a watched path
+    /// changed (`changed: <glob>` — `key` is the pattern as written in the
+    /// definition) or a named event was emitted (`event: <name>`). Unlike
+    /// every other moment, this one is not derived from the session's own
+    /// lifecycle: the daemon records it when the outside world moves and
+    /// hands it to the next evaluation.
+    External { kind: ExternalKind, key: String },
+}
+
+/// Which flavour of external trigger an [`ForkMoment::External`] carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalKind {
+    /// A watched path changed.
+    Changed,
+    /// `autofork emit <name>` was run.
+    Event,
+}
+
+impl ExternalKind {
+    /// The stable wire/store label (`changed` / `event`).
+    pub fn label(&self) -> &'static str {
+        match self {
+            ExternalKind::Changed => "changed",
+            ExternalKind::Event => "event",
+        }
+    }
+
+    /// Parse a stored label back.
+    pub fn from_label(s: &str) -> Option<Self> {
+        match s {
+            "changed" => Some(ExternalKind::Changed),
+            "event" => Some(ExternalKind::Event),
+            _ => None,
+        }
+    }
 }
 
 /// The base instant an `every:` interval measures from: the fork's last run
@@ -144,10 +179,24 @@ pub fn match_moments(
                     },
                     ForkRunOn::ContextLeft(n),
                 ) => max_tokens.is_some_and(|max| max.saturating_sub(*prompt_tokens) <= *n),
+                (
+                    ForkMoment::External {
+                        kind: ExternalKind::Changed,
+                        key,
+                    },
+                    ForkRunOn::Changed { pattern },
+                ) => key == pattern,
+                (
+                    ForkMoment::External {
+                        kind: ExternalKind::Event,
+                        key,
+                    },
+                    ForkRunOn::Event { name },
+                ) => key == name,
                 _ => false,
             };
             if hit {
-                return Some(*trigger);
+                return Some(trigger.clone());
             }
         }
     }

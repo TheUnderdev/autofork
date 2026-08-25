@@ -199,6 +199,19 @@ fn run_hook_inner(kind: CxHookKind) -> Option<()> {
                 spawn_daemon_detached(&paths);
                 return Some(());
             };
+            // `deliver: wake` feed blocks go out the same door, and go
+            // first: they are already produced (a command ran), and codex's
+            // synchronous Stop hook can inject them right here instead of
+            // waking a session that is in the act of stopping. This is why
+            // the daemon never hands a codex poll a feed wake.
+            let mut feed_blocks: Vec<String> = Vec::new();
+            if let Ok(ResponseBody::Reports { blocks }) =
+                client.request(RequestBody::TakeWakeBlocks {
+                    session_id: input.session_id.clone(),
+                })
+            {
+                feed_blocks = blocks;
+            }
             let due = match client.request(RequestBody::PeekDue {
                 session_id: input.session_id.clone(),
             }) {
@@ -208,6 +221,13 @@ fn run_hook_inner(kind: CxHookKind) -> Option<()> {
                         "stop hook: peek_due empty for {} -> {other:?}",
                         input.session_id
                     ));
+                    if !feed_blocks.is_empty() {
+                        let out = serde_json::json!({
+                            "decision": "block",
+                            "reason": autofork_core::wake::build_feed_wake_payload(&feed_blocks),
+                        });
+                        println!("{out}");
+                    }
                     return Some(()); // nothing due / old daemon: stay silent
                 }
             };
@@ -217,7 +237,7 @@ fn run_hook_inner(kind: CxHookKind) -> Option<()> {
                 due.len()
             ));
             set_stop_rollout(input.transcript_path.clone());
-            let mut blocks = Vec::new();
+            let mut blocks = feed_blocks;
             for spec in due {
                 // Sequential and synchronous: this IS the goal loop's
                 // iteration, and the session is deliberately held while the

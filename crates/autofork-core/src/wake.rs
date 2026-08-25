@@ -133,6 +133,42 @@ pub fn report_block(fork: &str, trigger: &str, status: &str, body: &str) -> Stri
     format!("---\nsource: autofork\nfork: {fork} (trigger: {trigger}) — {status}\n---\n{body}")
 }
 
+/// Frame a *feed* block: the stdout of a `deliver:` lifecycle hook, on its
+/// way into a session's context. Deliberately the same envelope shape as a
+/// fork report (same [`WAKE_MARKER`] header, so every delivery lane's
+/// "is this autofork's own injection?" sniff keeps working), with `feed:`
+/// instead of `fork:` so the model can tell a command's output from a
+/// model's report.
+pub fn feed_block(hook: &str, event: &str, body: &str) -> String {
+    format!("---\nsource: autofork\nfeed: {hook} ({event})\n---\n{body}")
+}
+
+/// Build the wake payload that carries `deliver: wake` feed blocks into a
+/// session. Same delivery mechanics as a chain wake (stderr + exit 2) with a
+/// different closer: a feed is information, not a fork asking for another
+/// run, so the model must not be told to "act on the report" — only to take
+/// it into account.
+pub fn build_feed_wake_payload(blocks: &[String]) -> String {
+    let mut text = blocks.join("\n\n");
+    if text.len() > CHAIN_WAKE_CAP {
+        let mut cut = CHAIN_WAKE_CAP;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
+        text.push_str("\n[…feed truncated to fit the wake payload]");
+    }
+    format!("{text}\n\n{FEED_CLOSER}")
+}
+
+/// Closing instruction of a feed wake. Wakes normally hand the model a spawn
+/// instruction, so a bare block of text would be read as one; say plainly
+/// that this is context, and what to do with it.
+const FEED_CLOSER: &str = "The block above is context autofork delivered to you — the output \
+     of a lifecycle feed, not a fork report and not an instruction to spawn anything. Take it \
+     into account. Act on it only if it bears on what you are doing or what the user last \
+     asked; otherwise carry on with the work in hand, or simply stop.";
+
 /// Cap on a chain wake payload: Claude Code shows the Stop hook's stderr to
 /// the model, and an unbounded report would crowd the turn it is meant to
 /// drive.
@@ -217,6 +253,12 @@ pub struct DueFork {
     pub model_fallbacks: Vec<String>,
     /// Operation mode for the run, resolved like `model`.
     pub mode: Option<String>,
+    /// What an external trigger carried: the changed paths of a `changed:`
+    /// fire, or the payload of an `event:`. Passed to the fork so it can act
+    /// on *what* moved instead of re-deriving it — a fork woken by a change
+    /// with no idea what changed is the difference between a targeted run and
+    /// a full re-scan.
+    pub detail: Option<String>,
 }
 
 /// A fork the daemon is holding back until its predecessors finish, named in
@@ -262,8 +304,17 @@ fn spawn_prompt(
     } else {
         String::new()
     };
+    let detail_line = match fork
+        .detail
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+    {
+        Some(d) => format!(" What the trigger carried:\n{}\n", trim_detail(d)),
+        None => String::new(),
+    };
     format!(
-        "Read the file {path} and follow the instructions in its body.{skill_line} \
+        "Read the file {path} and follow the instructions in its body.{skill_line}{detail_line} \
          {SPAWN_CTX_PREFIX}{name}', trigger '{trigger}', parent session {session_id}, conversation \
          {conversation_id}, project root {project_root}. The conversation id is stable when \
          a session is resumed (a resumed session gets a fresh session id); key any \
@@ -272,6 +323,30 @@ fn spawn_prompt(
         name = fork.name,
         trigger = fork.trigger,
     )
+}
+
+/// Cap the trigger detail carried into a spawn prompt. A `git pull` can
+/// change a thousand files; the fork needs to know what moved, not to have
+/// its prompt drowned in a file list.
+fn trim_detail(detail: &str) -> String {
+    const MAX_LINES: usize = 40;
+    const MAX_BYTES: usize = 4_000;
+    let lines: Vec<&str> = detail.lines().collect();
+    let mut out = if lines.len() > MAX_LINES {
+        let head = lines[..MAX_LINES].join("\n");
+        format!("{head}\n[…and {} more]", lines.len() - MAX_LINES)
+    } else {
+        detail.to_string()
+    };
+    if out.len() > MAX_BYTES {
+        let mut cut = MAX_BYTES;
+        while cut > 0 && !out.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        out.truncate(cut);
+        out.push_str("\n[…truncated]");
+    }
+    out
 }
 
 fn overlap_line(fork: &DueFork) -> &'static str {
@@ -472,6 +547,7 @@ mod tests {
             model: None,
             model_fallbacks: Vec::new(),
             mode: None,
+            detail: None,
         }
     }
 

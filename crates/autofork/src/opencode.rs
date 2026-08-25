@@ -34,7 +34,9 @@ pub enum OcHookKind {
     /// pause epoch.
     PromptSubmit,
     /// The session went idle: long-poll for due forks. Answers on stdout:
-    /// `{"wake":{"payload":…,"forks":[…]}}` or `{"waited":true}`.
+    /// `{"wake":{"payload":…,"forks":[…],"feed":…}}` or `{"waited":true}`.
+    /// `feed` (additive) carries lifecycle-feed blocks to inject instead of
+    /// forks to run.
     StopWait,
     /// The session was deleted.
     SessionEnd,
@@ -178,11 +180,26 @@ fn run_hook_inner(kind: OcHookKind) -> Option<()> {
             let client = Client::connect_or_spawn(&paths, Duration::from_secs(10)).ok()?;
             let mut client = client.ensure_current_version(&paths).ok()?;
             match client.stop_wait(event(EventKind::Stop)) {
-                Ok(ResponseBody::Wake { payload, forks }) => {
+                Ok(ResponseBody::Wake {
+                    payload,
+                    forks,
+                    feed,
+                }) => {
+                    // A wake carries either fork specs (spawn these) or feed
+                    // blocks (put this text in the session) — never both, so
+                    // the plugin can branch on which key is present. `wake`
+                    // says whether the blocks should start a turn the model
+                    // reacts to (`deliver: wake`) or ride in silently as a
+                    // no-reply message (`deliver: context`, opencode's stand-in
+                    // for the additionalContext lane it does not have).
                     let out = serde_json::json!({
                         "wake": {
                             "payload": payload,
                             "forks": forks.unwrap_or_default(),
+                            "feed": feed.as_ref().map(|f| serde_json::json!({
+                                "blocks": f.blocks,
+                                "wake": f.wake,
+                            })),
                         }
                     });
                     println!("{out}");

@@ -1,8 +1,19 @@
 //! Lifecycle hooks: small shell commands the daemon runs at session
-//! lifecycle moments — no model, no fork, no context. Built for resource
+//! lifecycle moments — no model, no fork, no tokens. Built for resource
 //! integrations (workspace leases, seat locks, scratch allocations) that need
 //! to follow a session's life: acquire on start, renew on activity, release
 //! on end, park after an idle timeout.
+//!
+//! Since v0.24 a hook may also **speak into the session**: `deliver: context`
+//! turns its stdout into a block delivered silently on the session's next
+//! prompt, and `deliver: wake` delivers it by waking the session. A hook with
+//! a `deliver:` is a *feed* — the missing quadrant between forks (a model
+//! produces context) and plain hooks (a command produces an outside-world
+//! effect): a command that produces context, with no model and no tokens.
+//!
+//! v0.24 also adds the two **external** moments, `changed: <glob>` and
+//! `event: <name>`: triggers that fire from the outside world (a file being
+//! written, `autofork emit`) rather than from the session's own lifecycle.
 //!
 //! A hook is a markdown file with YAML frontmatter, discovered from
 //! `.autofork/hooks/` trees (per ancestor directory, nearest first, then the
@@ -40,7 +51,7 @@ const MAX_HOOK_NESTING_DEPTH: usize = 8;
 pub const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 60;
 
 /// A lifecycle moment a hook fires at (`on`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HookOn {
     /// A session registered with the daemon (startup, resume, clear — any
     /// event that opens a session row).
@@ -56,7 +67,52 @@ pub enum HookOn {
     /// The session ended — gracefully or via the daemon's liveness fallbacks
     /// (`AUTOFORK_END_REASON` says which).
     SessionEnd,
+    /// A watched path changed (`changed: <glob>`). External: it fires from
+    /// the filesystem, not from the session's lifecycle, so it can fire
+    /// while the session is mid-turn.
+    Changed { pattern: String },
+    /// A named event was emitted with `autofork emit <name>`.
+    Event { name: String },
 }
+
+/// Where a hook's stdout goes (`deliver:`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HookDeliver {
+    /// Nowhere: stdout goes to the daemon log. The classic lifecycle hook.
+    #[default]
+    None,
+    /// Into the session's context, quietly: the block is spooled and
+    /// delivered as `additionalContext` on the session's next prompt (Claude
+    /// Code, codex) or injected as a no-reply message (opencode). No turn is
+    /// spent and nothing shows in the transcript.
+    Context,
+    /// Into the session's context by waking it: the parked Stop poll resolves
+    /// with the block, so the session reacts to it in a turn of its own.
+    /// Costs a turn — for changes a session must act on, not for awareness.
+    Wake,
+}
+
+impl HookDeliver {
+    /// Stable label (documentation, listings).
+    pub fn label(&self) -> &'static str {
+        match self {
+            HookDeliver::None => "none",
+            HookDeliver::Context => "context",
+            HookDeliver::Wake => "wake",
+        }
+    }
+
+    /// Whether this delivery puts anything into the session's context.
+    pub fn delivers(&self) -> bool {
+        !matches!(self, HookDeliver::None)
+    }
+}
+
+/// Default cap on a delivered block's size (bytes). Claude Code caps
+/// `additionalContext` at 10k characters and the spool may hold several
+/// blocks, so a feed that prints a whole directory still leaves room for the
+/// fork reports sharing the lane.
+pub const DEFAULT_HOOK_MAX_BYTES: usize = 8_000;
 
 impl HookOn {
     /// Stable label (documentation, listings).
@@ -70,6 +126,8 @@ impl HookOn {
                 after_secs: Some(s),
             } => format!("idle:{s}"),
             HookOn::SessionEnd => "session_end".into(),
+            HookOn::Changed { pattern } => format!("changed:{pattern}"),
+            HookOn::Event { name } => format!("event:{name}"),
         }
     }
 }
@@ -85,6 +143,15 @@ pub struct HookDef {
     pub command: String,
     /// Kill the command after this long (seconds).
     pub timeout_secs: u64,
+    /// Where the command's stdout goes (`deliver:`).
+    pub deliver: HookDeliver,
+    /// Cap on a delivered block, in bytes (`max_bytes:`). Ignored when
+    /// `deliver` is `none`.
+    pub max_bytes: usize,
+    /// Minimum gap between runs of this hook, in seconds (`throttle:`).
+    /// Matters for the external moments, which the outside world can raise
+    /// far faster than a session's lifecycle ever does.
+    pub throttle_secs: Option<u64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -100,6 +167,12 @@ struct RawHook {
     command: Option<serde_yaml::Value>,
     #[serde(default)]
     timeout: Option<serde_yaml::Value>,
+    #[serde(default)]
+    deliver: Option<serde_yaml::Value>,
+    #[serde(default)]
+    max_bytes: Option<serde_yaml::Value>,
+    #[serde(default)]
+    throttle: Option<serde_yaml::Value>,
 }
 
 /// The outcome of parsing a `.md` file in a hooks tree.
@@ -121,10 +194,40 @@ pub struct ParsedHook {
     pub warnings: Vec<String>,
 }
 
+/// A `changed:` pattern, validated (an empty glob would watch everything).
+fn parse_changed_on(pattern: &str, warnings: &mut Vec<String>) -> Option<HookOn> {
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        warnings.push("empty 'changed' pattern, skipping".into());
+        return None;
+    }
+    Some(HookOn::Changed {
+        pattern: pattern.to_string(),
+    })
+}
+
+/// An `event:` name, validated.
+fn parse_event_on(name: &str, warnings: &mut Vec<String>) -> Option<HookOn> {
+    let name = name.trim();
+    if name.is_empty() {
+        warnings.push("empty 'event' name, skipping".into());
+        return None;
+    }
+    Some(HookOn::Event {
+        name: name.to_string(),
+    })
+}
+
 fn parse_on_entry(v: &serde_yaml::Value, warnings: &mut Vec<String>) -> Option<HookOn> {
     if let serde_yaml::Value::String(s) = v {
         // Accept both `- idle: 5m` (a YAML map) and `- "idle: 5m"` (a quoted
         // string), since the latter reads naturally in flow lists.
+        if let Some(rest) = s.strip_prefix("changed:") {
+            return parse_changed_on(rest, warnings);
+        }
+        if let Some(rest) = s.strip_prefix("event:") {
+            return parse_event_on(rest, warnings);
+        }
         if let Some(rest) = s.strip_prefix("idle:") {
             return match parse_duration_yaml(&serde_yaml::Value::String(rest.trim().into())) {
                 Some(secs) => Some(HookOn::Idle {
@@ -160,6 +263,12 @@ fn parse_on_entry(v: &serde_yaml::Value, warnings: &mut Vec<String>) -> Option<H
                     }
                     return parsed;
                 }
+                if key == "changed" {
+                    return val.as_str().and_then(|p| parse_changed_on(p, warnings));
+                }
+                if key == "event" {
+                    return val.as_str().and_then(|n| parse_event_on(n, warnings));
+                }
                 warnings.push(format!("unknown hook event '{key}', skipping"));
                 return None;
             }
@@ -186,7 +295,7 @@ pub fn parse_hook_file(name: &str, content: &str) -> HookParse {
     if !matches!(&raw.hook, Some(serde_yaml::Value::Bool(true))) {
         return HookParse::NotHook {
             hook_like: !matches!(&raw.hook, Some(serde_yaml::Value::Bool(false)))
-                && (raw.on.is_some() || raw.command.is_some()),
+                && (raw.on.is_some() || raw.command.is_some() || raw.deliver.is_some()),
         };
     }
 
@@ -230,6 +339,49 @@ pub fn parse_hook_file(name: &str, content: &str) -> HookParse {
         },
     };
 
+    let deliver = match &raw.deliver {
+        None => HookDeliver::None,
+        Some(serde_yaml::Value::String(s)) => match s.trim() {
+            "none" => HookDeliver::None,
+            "context" => HookDeliver::Context,
+            "wake" => HookDeliver::Wake,
+            other => {
+                warnings.push(format!(
+                    "hook '{name}': unknown deliver '{other}', using 'none'"
+                ));
+                HookDeliver::None
+            }
+        },
+        Some(_) => {
+            warnings.push(format!("hook '{name}': invalid 'deliver', using 'none'"));
+            HookDeliver::None
+        }
+    };
+
+    let max_bytes = match &raw.max_bytes {
+        None => DEFAULT_HOOK_MAX_BYTES,
+        Some(v) => match v.as_u64().filter(|n| *n > 0) {
+            Some(n) => n as usize,
+            None => {
+                warnings.push(format!(
+                    "hook '{name}': invalid 'max_bytes', using the default"
+                ));
+                DEFAULT_HOOK_MAX_BYTES
+            }
+        },
+    };
+
+    let throttle_secs = match &raw.throttle {
+        None => None,
+        Some(v) => match parse_duration_yaml(v) {
+            Some(s) => Some(s),
+            None => {
+                warnings.push(format!("hook '{name}': invalid throttle, ignoring"));
+                None
+            }
+        },
+    };
+
     for w in &warnings {
         tracing::warn!(hook = name, "{w}");
     }
@@ -240,6 +392,9 @@ pub fn parse_hook_file(name: &str, content: &str) -> HookParse {
             on,
             command,
             timeout_secs,
+            deliver,
+            max_bytes,
+            throttle_secs,
         },
         warnings,
     })
@@ -482,6 +637,72 @@ mod tests {
                 .timeout_secs,
             120
         );
+    }
+
+    #[test]
+    fn deliver_max_bytes_and_throttle_parse() {
+        let p = parse(
+            "---\nhook: true\non: [activity]\ncommand: c\n\
+             deliver: context\nmax_bytes: 1200\nthrottle: 45s\n---\n",
+        );
+        assert_eq!(p.def.deliver, HookDeliver::Context);
+        assert_eq!(p.def.max_bytes, 1200);
+        assert_eq!(p.def.throttle_secs, Some(45));
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+
+        // Defaults: a plain hook delivers nothing.
+        let p = parse("---\nhook: true\non: [activity]\ncommand: c\n---\n");
+        assert_eq!(p.def.deliver, HookDeliver::None);
+        assert!(!p.def.deliver.delivers());
+        assert_eq!(p.def.max_bytes, DEFAULT_HOOK_MAX_BYTES);
+        assert_eq!(p.def.throttle_secs, None);
+
+        // Bad values warn and fall back rather than disabling the hook.
+        let p = parse("---\nhook: true\non: [activity]\ncommand: c\ndeliver: shout\n---\n");
+        assert_eq!(p.def.deliver, HookDeliver::None);
+        assert!(p.warnings.iter().any(|w| w.contains("shout")));
+        let p = parse("---\nhook: true\non: [activity]\ncommand: c\nmax_bytes: 0\n---\n");
+        assert_eq!(p.def.max_bytes, DEFAULT_HOOK_MAX_BYTES);
+        assert!(p.warnings.iter().any(|w| w.contains("max_bytes")));
+    }
+
+    #[test]
+    fn external_moments_parse_in_both_spellings() {
+        // Map form and quoted-string form must agree — the string form is
+        // the only one that survives a pattern containing a colon.
+        let p = parse(
+            "---\nhook: true\non:\n  - changed: ~/notes/**/*.md\n  - \"event: deploy\"\n\
+             command: c\n---\n",
+        );
+        assert_eq!(
+            p.def.on,
+            vec![
+                HookOn::Changed {
+                    pattern: "~/notes/**/*.md".into()
+                },
+                HookOn::Event {
+                    name: "deploy".into()
+                },
+            ]
+        );
+        assert_eq!(p.def.on[0].label(), "changed:~/notes/**/*.md");
+        assert_eq!(p.def.on[1].label(), "event:deploy");
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+
+        // An empty pattern would watch everything: rejected, loudly.
+        let p = parse("---\nhook: true\non: [\"changed: \"]\ncommand: c\n---\n");
+        assert!(p.def.on.is_empty());
+        assert!(p.warnings.iter().any(|w| w.contains("empty 'changed'")));
+    }
+
+    #[test]
+    fn a_deliver_key_alone_marks_a_file_hook_like() {
+        // The forgotten-marker guard must catch a feed too, or a `deliver:`
+        // with no `hook: true` would be silently inert.
+        assert!(matches!(
+            parse_hook_file("n", "---\ndeliver: context\n---\n"),
+            HookParse::NotHook { hook_like: true }
+        ));
     }
 
     #[test]

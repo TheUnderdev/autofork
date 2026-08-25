@@ -82,6 +82,25 @@ pub enum RequestBody {
     /// filled in, for a detached end-runner to execute after the session
     /// dies. Answered with `Due`. Additive frame.
     TakeFinalRuns { session_id: String },
+    /// Raise a named external event (`autofork emit <name>`): every open
+    /// session whose forks/hooks listen for `event: <name>` gets it. Additive
+    /// frame; old daemons answer `Error`, which the CLI reports as "this
+    /// daemon is too old".
+    Emit {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payload: Option<String>,
+        /// Restrict delivery to sessions under this root (`--project`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_root: Option<PathBuf>,
+        /// Restrict delivery to one session (`--session`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+    },
+    /// Take (and clear) the `deliver: wake` feed blocks queued for a session.
+    /// Used by clients whose parked poll cannot carry them (codex, whose Stop
+    /// hook injects synchronously instead). Additive frame.
+    TakeWakeBlocks { session_id: String },
     /// Ask the daemon to exit. With `drain`, it finishes cleanly first.
     /// Frozen shape — never change.
     Shutdown { drain: bool },
@@ -205,6 +224,12 @@ pub enum ResponseBody {
         payload: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         forks: Option<Vec<WakeFork>>,
+        /// Feed blocks this wake carries: the stdout of `deliver:` lifecycle
+        /// hooks, already framed. Present instead of (never alongside) fork
+        /// specs — a feed wake spawns nothing, it only delivers text.
+        /// Additive field; old clients ignore it and see a fork-less wake.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        feed: Option<FeedWake>,
     },
     /// The stop-wait resolved without a wake (cancelled by activity, nothing
     /// due, or the daemon is retiring): the hook exits 0 silently.
@@ -222,10 +247,15 @@ pub enum ResponseBody {
     Due {
         forks: Vec<WakeFork>,
     },
-    /// Answer to `TakeReports`: the spooled report blocks, oldest first
-    /// (now cleared). Additive.
+    /// Answer to `TakeReports` / `TakeWakeBlocks`: the spooled blocks, oldest
+    /// first (now cleared). Additive.
     Reports {
         blocks: Vec<String>,
+    },
+    /// Answer to `Emit`: how many open sessions the event was recorded for.
+    /// Additive.
+    Emitted {
+        sessions: usize,
     },
     Error {
         code: ErrorCode,
@@ -301,6 +331,18 @@ pub struct RunInfo {
 
 /// One due fork, structured, for programmatic clients: everything needed to
 /// run it without parsing the human/model-facing wake payload.
+/// The feed payload of a wake: framed blocks plus how the client should put
+/// them into the session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeedWake {
+    /// The framed blocks, oldest first.
+    pub blocks: Vec<String>,
+    /// `true` — deliver by starting a turn the model reacts to (`deliver:
+    /// wake`). `false` — deliver quietly, spending no turn (`deliver:
+    /// context` on clients that have no silent lane of their own).
+    pub wake: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WakeFork {
     pub name: String,
@@ -444,12 +486,17 @@ mod tests {
                     mode: None,
                     prompt: "Read the file /x/journal.md".into(),
                 }]),
+                feed: None,
             },
         };
         let line = encode(&resp).unwrap();
         let back: Response = serde_json::from_str(line.trim()).unwrap();
         match back.body {
-            ResponseBody::Wake { payload, forks } => {
+            ResponseBody::Wake {
+                payload,
+                forks,
+                feed: _,
+            } => {
                 assert_eq!(payload, "hello");
                 let forks = forks.expect("structured forks survive the round trip");
                 assert_eq!(forks.len(), 1);
@@ -465,9 +512,14 @@ mod tests {
         let line = r#"{"proto":1,"id":1,"type":"wake","payload":"p"}"#;
         let resp: Response = serde_json::from_str(line).unwrap();
         match resp.body {
-            ResponseBody::Wake { payload, forks } => {
+            ResponseBody::Wake {
+                payload,
+                forks,
+                feed,
+            } => {
                 assert_eq!(payload, "p");
                 assert!(forks.is_none());
+                assert!(feed.is_none());
             }
             _ => panic!("wrong body"),
         }

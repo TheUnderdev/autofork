@@ -207,6 +207,18 @@ async fn dispatch(daemon: &Arc<Daemon>, body: RequestBody) -> ResponseBody {
             text,
         } => daemon.handle_spool_report(&session_id, &fork, &text),
         RequestBody::TakeReports { session_id } => daemon.handle_take_reports(&session_id),
+        RequestBody::TakeWakeBlocks { session_id } => daemon.handle_take_wake_blocks(&session_id),
+        RequestBody::Emit {
+            name,
+            payload,
+            project_root,
+            session_id,
+        } => daemon.handle_emit(
+            &name,
+            payload.as_deref(),
+            project_root.as_deref(),
+            session_id.as_deref(),
+        ),
         RequestBody::TakeFinalRuns { session_id } => daemon.handle_take_final_runs(&session_id),
         RequestBody::Shutdown { drain } => {
             tracing::info!(drain, "shutdown requested");

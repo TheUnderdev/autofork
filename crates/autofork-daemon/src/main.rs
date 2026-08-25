@@ -6,6 +6,7 @@ mod planner;
 mod server;
 mod sweep;
 mod transcript;
+mod watch;
 
 use autofork_core::config::Paths;
 use autofork_core::store::Store;
@@ -104,6 +105,10 @@ async fn async_main(paths: Paths, store: Store) {
 
     let reaper = daemon.clone();
     tokio::spawn(async move { reaper.quiet_reaper().await });
+
+    // Sweep the paths `changed:` triggers watch.
+    let watcher = daemon.clone();
+    tokio::spawn(async move { watch::watch_loop(watcher).await });
 
     let serve_daemon = daemon.clone();
     tokio::select! {

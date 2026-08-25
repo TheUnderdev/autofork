@@ -10,6 +10,7 @@
 use autofork_core::config::{load_config_at, Config, Paths};
 use autofork_core::moments::{idle_deadlines, resolve_context_window, ForkMoment};
 use autofork_core::protocol::{Event, EventKind, ResponseBody};
+use autofork_core::store::SessionRow;
 use autofork_core::store::{SessionStatus, Store};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -17,6 +18,12 @@ use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::oneshot;
+
+/// Cap on the detail one pending external trigger accumulates (bytes): the
+/// changed-path list of a `changed:` trigger, or an `emit` payload. A burst
+/// that outruns its consumer must not grow a store row without limit; the
+/// paths are a hint for the command, not the authoritative diff.
+pub const EXTERNAL_DETAIL_CAP: usize = 16_000;
 
 pub fn now() -> i64 {
     std::time::SystemTime::now()
@@ -80,6 +87,15 @@ pub struct Daemon {
     /// A `waking: true` PromptSubmit inside the grace window after a chain
     /// continue is downgraded to non-waking.
     pub chain_continued_at: Mutex<HashMap<String, i64>>,
+    /// Per-session re-evaluation signal. A parked poll normally waits on
+    /// timers it computed when it parked — which is right for every trigger
+    /// derived from the session's own lifecycle, and wrong for the external
+    /// ones: a watched file changing, or `autofork emit`, happens on the
+    /// outside world's schedule. Bumping a session's channel wakes its parked
+    /// poll to look again, without resolving it (that is `waits`' job).
+    /// Senders live in an `Arc` so a parked poll's receiver can never observe
+    /// a dropped sender and spin.
+    pub nudges: Mutex<HashMap<String, Arc<tokio::sync::watch::Sender<u64>>>>,
     /// Sessions with a currently-parked stop-wait poll (a liveness heartbeat:
     /// the poll's hook subprocess dies with the Claude process). Values are
     /// reference counts, so the entry exists iff a poll is parked.
@@ -181,6 +197,7 @@ impl Daemon {
             paths,
             store: Mutex::new(store),
             waits: Mutex::new(HashMap::new()),
+            nudges: Mutex::new(HashMap::new()),
             wake_issued_at: Mutex::new(HashMap::new()),
             chain_continued_at: Mutex::new(HashMap::new()),
             parked: Mutex::new(HashMap::new()),
@@ -236,6 +253,25 @@ impl Daemon {
     }
 
     /// Cancel a parked stop-wait for a session (resolves it as `Waited`).
+    /// The session's nudge channel, created on first use.
+    fn nudge_channel(&self, session_id: &str) -> Arc<tokio::sync::watch::Sender<u64>> {
+        let mut map = self.nudges.lock().unwrap();
+        Arc::clone(
+            map.entry(session_id.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::watch::channel(0u64).0)),
+        )
+    }
+
+    /// Ask a session's parked poll (if any) to re-evaluate now: an external
+    /// trigger was recorded, or a feed block is waiting to be delivered. A
+    /// session with no parked poll needs nothing — the state is in the store,
+    /// and its next Stop picks it up.
+    pub fn nudge(&self, session_id: &str) {
+        if let Some(tx) = self.nudges.lock().unwrap().get(session_id) {
+            tx.send_modify(|v| *v = v.wrapping_add(1));
+        }
+    }
+
     fn cancel_wait(&self, session_id: &str) {
         if let Some(tx) = self.waits.lock().unwrap().remove(session_id) {
             let _ = tx.send(());
@@ -768,6 +804,12 @@ impl Daemon {
         }) else {
             return ResponseBody::Waited;
         };
+        // Feed blocks waiting for this session get the poll first: they are
+        // already produced (a command ran, the text exists) and nothing about
+        // them needs a moment to be evaluated.
+        if let Some(resp) = self.take_feed_delivery(&session) {
+            return resp;
+        }
         // Held dependents whose predecessors' completions the transcript (or a
         // notification PromptSubmit) just confirmed release right now — this is
         // the Stop that follows the completion's relay turn, so the reports are
@@ -776,6 +818,7 @@ impl Daemon {
             return ResponseBody::Wake {
                 payload,
                 forks: Some(forks),
+                feed: None,
             };
         }
         // Idle timing is measured from the pause baseline (the first Stop of
@@ -875,8 +918,10 @@ impl Daemon {
         // polls carry the pause start, capping `every:` at one fire per
         // quiet stretch.
         let pause_gate = if busy { None } else { Some(baseline) };
-        let due_now = |slf: &Arc<Self>| -> bool {
-            let moments = elapsed_moments(
+        // Everything elapsed right now, the session's own lifecycle moments
+        // plus whatever the outside world queued for it since the last look.
+        let all_moments = |slf: &Arc<Self>| -> Vec<ForkMoment> {
+            let mut moments = elapsed_moments(
                 prompt_tokens,
                 max_tokens,
                 baseline,
@@ -884,6 +929,11 @@ impl Daemon {
                 now(),
                 pause_gate,
             );
+            moments.extend(slf.external_moments(&ev.session_id));
+            moments
+        };
+        let due_now = |slf: &Arc<Self>| -> bool {
+            let moments = all_moments(slf);
             let mut sel = crate::planner::select_forks(slf, &session, &cfg, &moments);
             crate::planner::reserve_fast_path(&session, &mut sel);
             !sel.is_empty()
@@ -915,27 +965,43 @@ impl Daemon {
         // Deadlines that elapsed before this poll parked (a re-park after a
         // wake turn) fire their hooks right away; the latch dedupes.
         fire_idle_hooks(self, now());
-        let mut due = due_now(self);
+        let due = due_now(self);
+        // External triggers arrive on the outside world's schedule, so the
+        // poll can no longer wait only on the timers it computed at park
+        // time: it also waits on this session's nudge channel. Holding the
+        // sender for the poll's lifetime keeps the receiver from ever seeing
+        // a closed channel (which would spin this loop).
+        let nudge_tx = self.nudge_channel(&ev.session_id);
+        let mut nudge_rx = nudge_tx.subscribe();
         if !due {
-            for &fire_at in &fire_instants {
-                let wait = (fire_at - now()).max(0) as u64;
+            let mut next_instant = 0usize;
+            loop {
+                // `None` = no deadline left to service; park on the nudge and
+                // the cancellations alone, exactly as the old code parked.
+                let sleep_for = fire_instants
+                    .get(next_instant)
+                    .map(|&at| Duration::from_secs((at - now()).max(0) as u64));
                 tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(wait)) => {
+                    _ = async {
+                        match sleep_for {
+                            Some(d) => tokio::time::sleep(d).await,
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => {
+                        next_instant += 1;
                         fire_idle_hooks(self, now());
-                        if due_now(self) { due = true; break; }
+                        if due_now(self) { break; }
+                    }
+                    _ = nudge_rx.changed() => {
+                        if let Some(resp) = self.take_feed_delivery(&session) {
+                            return resp;
+                        }
+                        if due_now(self) { break; }
                     }
                     _ = &mut rx => return ResponseBody::Waited,
                     _ = self.shutdown.notified() => return ResponseBody::Waited,
                 }
             }
-        }
-        if !due {
-            // No deadline yielded anything; park until cancelled or shutdown.
-            tokio::select! {
-                _ = &mut rx => {}
-                _ = self.shutdown.notified() => {}
-            }
-            return ResponseBody::Waited;
         }
 
         // Phase B: debounce so near-simultaneous forks batch into one wake.
@@ -951,20 +1017,14 @@ impl Daemon {
         // Phase C: re-evaluate over every moment elapsed by now (deadlines that
         // landed during the debounce join the batch), then issue one wake —
         // stamping throttles and latches at this point.
-        let moments = elapsed_moments(
-            prompt_tokens,
-            max_tokens,
-            baseline,
-            &deadlines,
-            now(),
-            pause_gate,
-        );
+        let moments = all_moments(self);
         let mut selected = crate::planner::select_forks(self, &session, &cfg, &moments);
         crate::planner::reserve_fast_path(&session, &mut selected);
         if let Some((payload, forks)) = crate::planner::build_wake(self, &session, selected) {
             return ResponseBody::Wake {
                 payload,
                 forks: Some(forks),
+                feed: None,
             };
         }
         // Nothing survived re-evaluation; park.
@@ -1054,6 +1114,134 @@ impl Daemon {
     }
 
     /// Take (and clear) the spooled reports for a session.
+    /// The external triggers queued for a session, as moments. Unlike every
+    /// other moment these are not computed from the session's state: they
+    /// were recorded when the outside world moved and wait in the store until
+    /// an evaluation consumes them.
+    fn external_moments(&self, session_id: &str) -> Vec<ForkMoment> {
+        let store = self.store.lock().unwrap();
+        store
+            .pending_triggers(session_id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(kind, key, _)| {
+                autofork_core::moments::ExternalKind::from_label(&kind)
+                    .map(|kind| ForkMoment::External { kind, key })
+            })
+            .collect()
+    }
+
+    /// The feed delivery a parked poll should carry right now, if any.
+    ///
+    /// Two lanes, and which one a client uses is a property of the client,
+    /// not of the feed:
+    ///
+    /// - **wake blocks** (`deliver: wake`) resolve the poll everywhere except
+    ///   codex, whose Stop hook runs synchronously and injects them itself
+    ///   (block-and-inject beats waking a session that is about to stop).
+    /// - **quiet blocks** (`deliver: context`) ride the report spool, which
+    ///   Claude Code and codex drain as `additionalContext` at the next
+    ///   prompt. opencode has no such lane, so its plugin takes them off the
+    ///   poll and injects them as no-reply messages — no turn spent either
+    ///   way.
+    fn take_feed_delivery(self: &Arc<Self>, session: &SessionRow) -> Option<ResponseBody> {
+        let client = session.client.as_deref();
+        let store = self.store.lock().unwrap();
+        if client != Some("codex") {
+            if let Ok(blocks) = store.take_wake_blocks(&session.session_id) {
+                if !blocks.is_empty() {
+                    tracing::info!(session = %session.session_id, blocks = blocks.len(),
+                        "delivering feed blocks by waking the session");
+                    return Some(ResponseBody::Wake {
+                        payload: autofork_core::wake::build_feed_wake_payload(&blocks),
+                        forks: None,
+                        feed: Some(autofork_core::protocol::FeedWake { blocks, wake: true }),
+                    });
+                }
+            }
+        }
+        if client == Some("opencode") {
+            if let Ok(blocks) = store.take_reports(&session.session_id) {
+                if !blocks.is_empty() {
+                    tracing::info!(session = %session.session_id, blocks = blocks.len(),
+                        "handing spooled feed blocks to the opencode plugin");
+                    return Some(ResponseBody::Wake {
+                        payload: String::new(),
+                        forks: None,
+                        feed: Some(autofork_core::protocol::FeedWake {
+                            blocks,
+                            wake: false,
+                        }),
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    /// `autofork emit <name>`: record the event for every open session that
+    /// could care, fire the hooks listening for it, and nudge the parked
+    /// polls so forks waiting on `event: <name>` are evaluated now rather
+    /// than at the session's next Stop.
+    pub fn handle_emit(
+        self: &Arc<Self>,
+        name: &str,
+        payload: Option<&str>,
+        project_root: Option<&Path>,
+        session_id: Option<&str>,
+    ) -> ResponseBody {
+        self.touch_busy();
+        let sessions = {
+            let store = self.store.lock().unwrap();
+            store.list_open_sessions().unwrap_or_default()
+        };
+        let detail = payload.unwrap_or_default();
+        let t = now();
+        let mut hit = 0usize;
+        for row in sessions {
+            if let Some(sid) = session_id {
+                if row.session_id != sid {
+                    continue;
+                }
+            }
+            if let Some(root) = project_root {
+                if !row.project_root.starts_with(root) {
+                    continue;
+                }
+            }
+            {
+                let store = self.store.lock().unwrap();
+                let _ = store.record_pending_trigger(
+                    &row.session_id,
+                    "event",
+                    name,
+                    detail,
+                    EXTERNAL_DETAIL_CAP,
+                    t,
+                );
+            }
+            crate::hooks::fire_external(
+                self,
+                &crate::hooks::HookCtx::from_row(&row),
+                autofork_core::moments::ExternalKind::Event,
+                name,
+                detail,
+            );
+            self.nudge(&row.session_id);
+            hit += 1;
+        }
+        tracing::info!(event = %name, sessions = hit, "emit delivered");
+        ResponseBody::Emitted { sessions: hit }
+    }
+
+    /// Take a session's queued `deliver: wake` blocks (the codex Stop hook's
+    /// path — see [`Daemon::take_feed_delivery`]).
+    pub fn handle_take_wake_blocks(self: &Arc<Self>, session_id: &str) -> ResponseBody {
+        let store = self.store.lock().unwrap();
+        let blocks = store.take_wake_blocks(session_id).unwrap_or_default();
+        ResponseBody::Reports { blocks }
+    }
+
     pub fn handle_take_reports(self: &Arc<Self>, session_id: &str) -> ResponseBody {
         self.touch_busy();
         let store = self.store.lock().unwrap();

@@ -52,6 +52,15 @@ pub struct SelectedFork {
     /// triggers latch once per pause (key = `idle-pause:<epoch>`). `None` means
     /// no latch (nothing here today, kept for clarity).
     pub latch_key: Option<String>,
+    /// For an external trigger (`changed:` / `event:`), what it carried —
+    /// the changed paths, or the emit payload. Consumed with the trigger at
+    /// wake-issuance and handed to the fork's prompt.
+    pub detail: Option<String>,
+    /// The pending-trigger row this selection consumes at wake-issuance, as
+    /// `(kind, key)`. External triggers latch nothing: the queued row IS the
+    /// latch, and clearing it is what stops the fork re-firing on every poll
+    /// until the next change.
+    pub consumes: Option<(String, String)>,
 }
 
 /// The latch key a matched trigger consumes: context thresholds latch
@@ -66,6 +75,9 @@ fn latch_key_for(trigger: &ForkRunOn, pause_epoch: i64) -> Option<String> {
         // `every` needs no latch: its own interval (measured from the run
         // stamped at issuance) is the re-fire guard.
         ForkRunOn::Every { .. } => None,
+        // External triggers need no latch either: the pending-trigger row the
+        // wake consumes is the guard.
+        ForkRunOn::Changed { .. } | ForkRunOn::Event { .. } => None,
         _ => None,
     }
 }
@@ -125,6 +137,12 @@ pub fn select_forks(
         .as_deref()
         .or(cfg.disable_tags.as_deref());
 
+    let pending: Vec<(String, String, String)> = {
+        let store = daemon.store.lock().unwrap();
+        store
+            .pending_triggers(&session.session_id)
+            .unwrap_or_default()
+    };
     let mut selected: Vec<SelectedFork> = Vec::new();
     let t = now();
     for entry in roster {
@@ -242,6 +260,19 @@ pub fn select_forks(
                 continue;
             }
         }
+        // An external trigger carries what it saw; find the queued row this
+        // match came from so the wake can consume it and pass the detail on.
+        let (detail, consumes) = match &trigger {
+            ForkRunOn::Changed { pattern } => (
+                pending_detail(&pending, "changed", pattern),
+                Some(("changed".to_string(), pattern.clone())),
+            ),
+            ForkRunOn::Event { name } => (
+                pending_detail(&pending, "event", name),
+                Some(("event".to_string(), name.clone())),
+            ),
+            _ => (None, None),
+        };
         selected.push(SelectedFork {
             name: entry.fork_name.clone(),
             path: entry.fork_path.clone(),
@@ -255,10 +286,21 @@ pub fn select_forks(
             model: parsed.def.model.clone(),
             mode: parsed.def.mode.clone(),
             latch_key,
+            detail,
+            consumes,
         });
     }
     apply_gate_filter(daemon, session, &mut selected);
     selected
+}
+
+/// The detail of one queued external trigger, if it is still queued.
+fn pending_detail(pending: &[(String, String, String)], kind: &str, key: &str) -> Option<String> {
+    pending
+        .iter()
+        .find(|(k, s, _)| k == kind && s == key)
+        .map(|(_, _, detail)| detail.clone())
+        .filter(|d| !d.is_empty())
 }
 
 /// On codex sessions, `idle: 0s` chain forks belong to the Stop hook's
@@ -382,6 +424,9 @@ pub fn build_final_runs(daemon: &Arc<Daemon>, session: &SessionRow) -> Vec<WakeF
                 model,
                 model_fallbacks,
                 mode,
+                // Close-time runs are idle forks only; no external trigger
+                // can reach them, so there is nothing to carry.
+                detail: None,
             };
             build_wake_forks(&session.session_id, &conv, &root_str, &[due]).remove(0)
         })
@@ -604,6 +649,14 @@ pub fn build_wake(
             if let Some(key) = &sel.latch_key {
                 let _ = store.try_latch_fire(&session.session_id, &sel.name, key, t);
             }
+            // Consume the external trigger this fork rode in on. Clearing it
+            // here (at issuance, like every other stamp) is what keeps the
+            // fork from re-firing on every subsequent poll until the file
+            // changes again. Several forks may share one trigger; the clear
+            // is idempotent, and the batch is issued together.
+            if let Some((kind, key)) = &sel.consumes {
+                let _ = store.clear_pending_trigger(&session.session_id, kind, key);
+            }
             let report_preds: Vec<String> =
                 deps[i].iter().map(|&j| selected[j].name.clone()).collect();
             // The full gate: `after` deps plus every lower-wave batch-mate.
@@ -645,6 +698,7 @@ pub fn build_wake(
                     model: model.clone(),
                     model_fallbacks: fallbacks.clone(),
                     mode: mode.clone(),
+                    detail: sel.detail.clone(),
                 });
             } else {
                 let _ = store.insert_pending_dep(
@@ -767,6 +821,9 @@ pub fn release_due(daemon: &Arc<Daemon>, session: &SessionRow) -> Option<(String
                 model,
                 model_fallbacks,
                 mode,
+                // A dependent's trigger was consumed when the batch was
+                // issued; its predecessors' reports are the context it gets.
+                detail: None,
             }
         })
         .collect();

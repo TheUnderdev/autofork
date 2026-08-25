@@ -346,8 +346,24 @@ pub fn list_hooks(paths: &Paths, project: Option<std::path::PathBuf>) -> Result<
                 .unwrap_or("(no description)")
         );
         let on: Vec<String> = h.parsed.def.on.iter().map(|o| o.label()).collect();
+        let throttle = match h.parsed.def.throttle_secs {
+            Some(s) => format!(" | throttle: {s}s"),
+            None => String::new(),
+        };
+        // A hook that delivers is a feed: say so, and say where its output
+        // goes — the difference between "runs a command" and "puts text in
+        // my session" is the thing a reader most needs from this listing.
+        let deliver = if h.parsed.def.deliver.delivers() {
+            format!(
+                " | deliver: {} (max {} bytes)",
+                h.parsed.def.deliver.label(),
+                h.parsed.def.max_bytes
+            )
+        } else {
+            String::new()
+        };
         println!(
-            "      on: {} | timeout: {}s",
+            "      on: {} | timeout: {}s{throttle}{deliver}",
             if on.is_empty() {
                 "(nothing — never fires)".to_string()
             } else {
@@ -365,6 +381,62 @@ pub fn list_hooks(paths: &Paths, project: Option<std::path::PathBuf>) -> Result<
         println!("  warning: {w}");
     }
     Ok(())
+}
+
+/// `autofork emit <name>`: raise a named external event. Every open session
+/// whose forks (`run_on: [event: <name>]`) or hooks (`on: [event: <name>]`)
+/// listen for it is triggered — the non-filesystem sibling of `changed:`, for
+/// when the thing that happened is not a file: a job finished, a deploy
+/// landed, another tool wants this machine's sessions to know something.
+pub fn emit_event(
+    paths: &Paths,
+    name: String,
+    payload: Option<String>,
+    project: bool,
+    session: Option<String>,
+) -> Result<(), String> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("an event name is required".into());
+    }
+    let project_root = if project {
+        let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+        Some(autofork_core::project::project_root(&cwd))
+    } else {
+        None
+    };
+    // A payload of `-` reads stdin, so a script can pipe a diff, a summary or
+    // a file list into the event without shell quoting gymnastics.
+    let payload = match payload.as_deref() {
+        Some("-") => {
+            let mut buf = String::new();
+            use std::io::Read;
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .map_err(|e| e.to_string())?;
+            Some(buf.trim().to_string())
+        }
+        _ => payload,
+    };
+    let mut client = Client::connect_or_spawn(paths, Duration::from_secs(5))
+        .map_err(|e| format!("cannot reach the daemon: {e}"))?;
+    match client.request(RequestBody::Emit {
+        name: name.clone(),
+        payload,
+        project_root,
+        session_id: session,
+    }) {
+        Ok(ResponseBody::Emitted { sessions }) => {
+            println!(
+                "emitted '{name}' to {sessions} open session{}",
+                if sessions == 1 { "" } else { "s" }
+            );
+            Ok(())
+        }
+        Ok(ResponseBody::Error { message, .. }) => Err(message),
+        Ok(_) => Err("unexpected answer from the daemon".into()),
+        Err(e) => Err(format!("cannot reach the daemon: {e}")),
+    }
 }
 
 /// Manual runs can no longer spawn anything (forks are subagents of an
@@ -432,6 +504,7 @@ pub fn run_fork(paths: &Paths, name: Option<String>, tag: Option<String>) -> Res
             model: None,
             model_fallbacks: Vec::new(),
             mode: None,
+            detail: None,
         })
         .collect();
     let payload = build_wake_payload(

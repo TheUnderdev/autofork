@@ -39,7 +39,9 @@ enum Command {
     ///
     /// Lifecycle hooks are daemon-run shell commands (no model, no fork) fired
     /// at session moments — session_start, resume, activity, idle, session_end
-    /// — for resource integrations like workspace leases.
+    /// — plus the external moments `changed: <glob>` and `event: <name>`. A
+    /// hook with `deliver:` set is a feed: its stdout goes into the session's
+    /// context, with no model call and no tokens spent.
     Hooks {
         /// Project directory (defaults to the current directory).
         #[arg(long)]
@@ -54,6 +56,25 @@ enum Command {
         /// Select every fork carrying this tag instead of one by name.
         #[arg(long, conflicts_with = "name")]
         tag: Option<String>,
+    },
+    /// Raise a named external event: every open session listening for
+    /// `event: <name>` (a fork's `run_on`, or a hook's `on`) is triggered.
+    ///
+    /// The sibling of `changed:` for things that are not files — a job
+    /// finished, a deploy landed, another tool has news. `--payload -` reads
+    /// the payload from stdin.
+    Emit {
+        /// The event name.
+        name: String,
+        /// Text handed to the triggered forks and hooks (`-` reads stdin).
+        #[arg(long)]
+        payload: Option<String>,
+        /// Only sessions under the current project root.
+        #[arg(long)]
+        project: bool,
+        /// Only this session id.
+        #[arg(long)]
+        session: Option<String>,
     },
     /// Show the daemon log.
     Logs {
@@ -178,6 +199,14 @@ fn main() {
         Command::Forks { project } => exit_on_err(commands::list_forks(&paths, project)),
         Command::Hooks { project } => exit_on_err(commands::list_hooks(&paths, project)),
         Command::Run { name, tag } => exit_on_err(commands::run_fork(&paths, name, tag)),
+        Command::Emit {
+            name,
+            payload,
+            project,
+            session,
+        } => exit_on_err(commands::emit_event(
+            &paths, name, payload, project, session,
+        )),
         Command::Logs { follow } => exit_on_err(commands::logs(&paths, follow)),
         Command::Prune => exit_on_err(commands::prune(&paths)),
         Command::Doctor => exit_on_err(commands::doctor(&paths)),

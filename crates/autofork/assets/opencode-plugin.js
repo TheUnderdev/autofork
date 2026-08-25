@@ -1,6 +1,10 @@
 // autofork opencode plugin v{{VERSION}} — installed by `autofork opencode install`.
 // Do not edit: `autofork opencode install` overwrites this file on update.
 //
+// Also delivers lifecycle *feeds* (a hook with `deliver:`): blocks of text a
+// command produced, injected as a no-reply message (quiet) or a real turn
+// (`deliver: wake`). No model runs for a feed — it is a command's stdout.
+//
 // Bridges opencode sessions to the autofork daemon: when a session idles (or
 // crosses a context threshold), due forks run as *forked sessions* — full
 // copies of the conversation made with opencode's native session fork, which
@@ -260,6 +264,9 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
     if (res?.wake?.forks?.length) {
       await executeWake(id, res.wake.forks);
     }
+    if (res?.wake?.feed?.blocks?.length) {
+      await deliverFeed(id, res.wake.feed);
+    }
     if (superseded || parked.has(id)) return;
     // Whether this was a wake, a cancel, a daemon retire, or an after-release
     // nudge: keep a poll parked for whatever the session is doing now (with a
@@ -273,6 +280,42 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
     backoff.set(id, b);
     await new Promise((r) => setTimeout(r, b.delay));
     if (!parked.has(id)) await park(id);
+  }
+
+  // A lifecycle feed's output, on its way into the session. opencode has no
+  // additionalContext lane, so a *quiet* feed rides the same zero-turn
+  // no-reply message a fork report does — the model sees it on its next
+  // exchange, nothing is spent, and the transcript shows one injected block.
+  // A `deliver: wake` feed is injected as a real turn instead, pinning the
+  // parent's model/agent exactly as a chain report does, and the turn it
+  // starts is flagged non-waking so it does not bump the pause epoch and
+  // re-arm every idle fork.
+  async function deliverFeed(parentID, feed) {
+    if (forkRuns.has(parentID) || ignored.has(parentID)) return;
+    const text = feed.blocks.join("\n\n");
+    try {
+      if (feed.wake) {
+        const parent = sessionState(parentID);
+        injectTurn.add(parentID);
+        await client.session.promptAsync({
+          path: { id: parentID },
+          body: {
+            ...(parent.model ? { model: parent.model } : {}),
+            ...(parent.agent ? { agent: parent.agent } : {}),
+            parts: [{ type: "text", text }],
+          },
+        });
+      } else {
+        await client.session.prompt({
+          path: { id: parentID },
+          body: { noReply: true, parts: [{ type: "text", text }] },
+        });
+      }
+    } catch {
+      // The parent may be gone. Never leave a stale non-waking flag behind
+      // for a turn that will not happen.
+      injectTurn.delete(parentID);
+    }
   }
 
   async function executeWake(parentID, forks) {

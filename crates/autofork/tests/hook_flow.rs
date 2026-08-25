@@ -150,6 +150,7 @@ fn stop_wait_wake_exits_2_with_payload_on_stderr() {
         ResponseBody::Wake {
             payload: "WAKE_PAYLOAD_MARKER".into(),
             forks: None,
+            feed: None,
         },
     );
     wait_for_socket(&env.socket);
@@ -513,6 +514,7 @@ fn headless_wake_runs_forks_and_spools_reports() {
             mode: None,
             prompt: "Read the file /x/journal.md".into(),
         }]),
+        feed: None,
     };
     let (daemon, frames) = mock_headless_daemon(env.socket.clone(), wake);
     wait_for_socket(&env.socket);
