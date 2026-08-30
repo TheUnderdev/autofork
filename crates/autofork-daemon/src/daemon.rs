@@ -7,6 +7,7 @@
 //! PromptSubmit, SessionEnd) just keep session bookkeeping — and PromptSubmit /
 //! SessionEnd cancel any parked stop-wait.
 
+use crate::planner::GateHold;
 use autofork_core::config::{load_config_at, Config, Paths};
 use autofork_core::moments::{idle_deadlines, resolve_context_window, ForkMoment};
 use autofork_core::protocol::{Event, EventKind, ResponseBody};
@@ -934,7 +935,8 @@ impl Daemon {
         };
         let due_now = |slf: &Arc<Self>| -> bool {
             let moments = all_moments(slf);
-            let mut sel = crate::planner::select_forks(slf, &session, &cfg, &moments);
+            let mut sel =
+                crate::planner::select_forks(slf, &session, &cfg, &moments, GateHold::Apply);
             crate::planner::reserve_fast_path(&session, &mut sel);
             !sel.is_empty()
         };
@@ -1018,7 +1020,8 @@ impl Daemon {
         // landed during the debounce join the batch), then issue one wake —
         // stamping throttles and latches at this point.
         let moments = all_moments(self);
-        let mut selected = crate::planner::select_forks(self, &session, &cfg, &moments);
+        let mut selected =
+            crate::planner::select_forks(self, &session, &cfg, &moments, GateHold::Apply);
         crate::planner::reserve_fast_path(&session, &mut selected);
         if let Some((payload, forks)) = crate::planner::build_wake(self, &session, selected) {
             return ResponseBody::Wake {
@@ -1071,7 +1074,8 @@ impl Daemon {
         };
         let cfg = self.cfg_for(Some(&session.project_root));
         let moments = [autofork_core::moments::ForkMoment::Idle { deadline_secs: 0 }];
-        let mut selected = crate::planner::select_forks(self, &session, &cfg, &moments);
+        let mut selected =
+            crate::planner::select_forks(self, &session, &cfg, &moments, GateHold::Apply);
         selected.retain(|s| s.chain);
         match crate::planner::build_wake(self, &session, selected) {
             Some((_payload, forks)) => ResponseBody::Due { forks },

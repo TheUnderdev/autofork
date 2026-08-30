@@ -360,6 +360,11 @@ window still matter mid-goal). A gate whose wake was fumbled (no spawn ever obse
 a grace window (`AUTOFORK_GATE_GRACE_SECS`, default 180s) rather than silencing the session's
 forks for the whole pause; your own next message drops the gate immediately.
 
+At **close** the hold does not apply. There is no settling and no poll left to release held forks
+through, so holding would drop them rather than defer them — the flush batch takes the whole set
+and puts the gate fork first instead. The end-runner is sequential, so a gate still leads and
+everything else still runs after it, in one batch.
+
 ## Lifecycle hooks
 
 Forks answer "run a model over this session's context at the right moment". **Lifecycle hooks**

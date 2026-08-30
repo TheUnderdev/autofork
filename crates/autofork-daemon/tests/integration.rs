@@ -2689,6 +2689,50 @@ fn take_final_runs_flushes_only_unrun_idle_forks_in_order() {
 }
 
 #[test]
+fn a_gate_fork_leads_the_close_batch_instead_of_swallowing_it() {
+    // A `gate: true` fork holds the session's other idle forks while it is
+    // unsettled, and on a live session they fire when it settles. At close
+    // there is no session left to release them into: holding there dropped
+    // them entirely, so a gated setup flushed its gate fork and nothing else.
+    // The whole batch goes out, gate first — the end-runner is sequential, so
+    // that is the same "everything after the gate" the hold means live.
+    let mut h = Harness::new("1s", "0");
+    h.write_fork(
+        "goal-supervisor.md",
+        "---\nfork: true\nrun_on: [idle: 0s]\ngate: true\n---\nSUPERVISE",
+    );
+    h.write_fork(
+        "context-curator.md",
+        "---\nfork: true\nrun_on:\n  - idle: 30m\n---\nCURATE",
+    );
+    h.write_fork(
+        "handover.md",
+        "---\nfork: true\nrun_on:\n  - idle: 30m\n---\nHAND OVER",
+    );
+    h.start_daemon();
+    assert_ack(h.send_event(h.event(EventKind::SessionStart, "s-gated")));
+
+    let ResponseBody::Due { forks } = h.request(RequestBody::TakeFinalRuns {
+        session_id: "s-gated".into(),
+    }) else {
+        panic!("expected Due");
+    };
+    let names: Vec<&str> = forks.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names.first(), Some(&"goal-supervisor"), "{names:?}");
+    assert!(names.contains(&"handover"), "{names:?}");
+    assert!(names.contains(&"context-curator"), "{names:?}");
+    // The gate leads on order alone: no report of its is piped into them.
+    for spec in &forks {
+        assert!(
+            !spec.after.contains(&"goal-supervisor".to_string()),
+            "{:?} should not depend on the gate: {:?}",
+            spec.name,
+            spec.after
+        );
+    }
+}
+
+#[test]
 fn wake_forks_carry_model_fallback_lists() {
     let mut h = Harness::new("1s", "0");
     h.append_config("[fork_models]");

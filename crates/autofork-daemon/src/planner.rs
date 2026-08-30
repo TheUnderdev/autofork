@@ -112,6 +112,23 @@ pub fn refresh_roster(daemon: &Arc<Daemon>, session_id: &str, cwd: &Path) {
     }
 }
 
+/// Whether a selection honors a `gate: true` fork's hold on the session's
+/// other idle forks.
+///
+/// Every live selection does: the held forks keep their latches and fire
+/// intact once the gate settles. The flush-on-close batch does not, and
+/// cannot — a hold there has no later to release into, because the release
+/// (`gate settled: releasing held idle forks`) needs a live session and this
+/// one just ended. Holding at close does not defer those forks, it drops
+/// them. See [`build_final_runs`], which orders the gate first instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateHold {
+    /// A gate fork holds the session's other idle forks (live selections).
+    Apply,
+    /// Select the held forks too (the flush-on-close batch).
+    Skip,
+}
+
 /// Run the selection pipeline for `moments` and return the forks that should
 /// fire (empty = nothing due). Read-only / side-effect-free: no latches or
 /// throttles are stamped here (that happens at wake-issuance in [`build_wake`],
@@ -121,6 +138,7 @@ pub fn select_forks(
     session: &SessionRow,
     cfg: &Config,
     moments: &[ForkMoment],
+    gate_hold: GateHold,
 ) -> Vec<SelectedFork> {
     refresh_roster(daemon, &session.session_id, &session.cwd);
 
@@ -290,7 +308,9 @@ pub fn select_forks(
             consumes,
         });
     }
-    apply_gate_filter(daemon, session, &mut selected);
+    if gate_hold == GateHold::Apply {
+        apply_gate_filter(daemon, session, &mut selected);
+    }
     selected
 }
 
@@ -356,10 +376,18 @@ pub fn build_final_runs(daemon: &Arc<Daemon>, session: &SessionRow) -> Vec<WakeF
         .into_iter()
         .map(|deadline_secs| ForkMoment::Idle { deadline_secs })
         .collect();
-    let mut selected = select_forks(daemon, session, &cfg, &moments);
+    // `GateHold::Skip`: a gate fork holds the session's other idle forks while
+    // it is unsettled, and on a live session they fire when it settles. At
+    // close nothing can settle it and no poll is left to release them
+    // through, so holding here would silently drop them — which is what a
+    // gated setup used to lose the moment the duplicate flush that had been
+    // issuing them separately (and concurrently with the gate's own run) was
+    // fixed. The whole batch is selected instead, and the gate's intent is
+    // carried by ORDER below: the end-runner is sequential, so a gate fork
+    // running first still means everything else runs after it.
+    let mut selected = select_forks(daemon, session, &cfg, &moments, GateHold::Skip);
     // Idle forks only (context/every never ride an Idle moment, but keep the
-    // guard explicit), and never a gate/chain goal loop — a goal fork at
-    // close would hold nothing and chain nowhere.
+    // guard explicit).
     selected.retain(|s| is_idle_trigger(&s.trigger));
     if selected.is_empty() {
         return Vec::new();
@@ -371,7 +399,18 @@ pub fn build_final_runs(daemon: &Arc<Daemon>, session: &SessionRow) -> Vec<WakeF
     );
 
     let deps = resolve_deps(&selected);
-    let eff = effective_priorities(&selected, &deps);
+    let mut eff = effective_priorities(&selected, &deps);
+    // A gate fork leads the batch — the close-time stand-in for the hold it
+    // would have had on a live session. Only the ordering moves: `after`
+    // edges (and the report piping that rides on them) are untouched, so a
+    // gate fork that itself declares `after` still waits for its predecessors.
+    if let Some(min) = eff.iter().copied().min() {
+        for (i, sel) in selected.iter().enumerate() {
+            if sel.gate {
+                eff[i] = min.saturating_sub(1);
+            }
+        }
+    }
     // Topological order: repeatedly emit the lowest-priority fork whose
     // `after` predecessors (within the batch) are all emitted.
     let n = selected.len();
