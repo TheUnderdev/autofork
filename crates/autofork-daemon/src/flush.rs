@@ -8,9 +8,13 @@
 //! all of that, so every close it detects itself (`gone`, `lost`) flushes here
 //! instead of silently dropping the batch.
 //!
-//! Selection is the same `build_final_runs` the hook path uses, and it stamps
-//! what it hands out, so whichever side gets there first runs the forks and
-//! the other finds nothing left to take.
+//! Selection is the same `build_final_runs` the hook path uses, and a session's
+//! final batch is claimed there on the `sessions` row — the one piece of state
+//! a close updates instead of deleting — so whichever side gets there first
+//! runs the forks and the other finds nothing left to take. The in-session
+//! stamps cannot carry that on their own: closing purges the roster, the fires
+//! latch and the spawn rows, which is exactly the state a second selection
+//! would have consulted.
 
 use crate::daemon::Daemon;
 use autofork_core::protocol::WakeFork;

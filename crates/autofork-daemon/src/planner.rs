@@ -324,7 +324,30 @@ pub fn reserve_fast_path(session: &SessionRow, selected: &mut Vec<SelectedFork>)
 /// detached end-runner) executes the batch sequentially itself and pipes
 /// reports locally, since after the session closes there is no parked poll
 /// left to deliver releases through.
+///
+/// A session gets exactly ONE final batch, claimed on its `sessions` row: the
+/// daemon's own close path and the client's `SessionEnd` hook both land here,
+/// and the stamps that keep the second one from re-issuing the first one's
+/// forks (roster `ran_at`, the fires latch, the spawn rows) are all purged by
+/// the close itself. Whoever claims it selects and runs the batch; the other
+/// finds nothing left to take.
 pub fn build_final_runs(daemon: &Arc<Daemon>, session: &SessionRow) -> Vec<WakeFork> {
+    {
+        let store = daemon.store.lock().unwrap();
+        match store.try_claim_final_flush(&session.session_id, now()) {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::debug!(session = %session.session_id,
+                    "flush-on-close: this session's final batch was already taken");
+                return Vec::new();
+            }
+            Err(e) => {
+                tracing::warn!(session = %session.session_id, error = %e,
+                    "flush-on-close: could not claim the final batch, skipping it");
+                return Vec::new();
+            }
+        }
+    }
     let cfg = daemon.cfg_for(Some(&session.project_root));
     let defs = collect_roster_defs(daemon, session);
     let deadlines =

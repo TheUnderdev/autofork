@@ -20,7 +20,7 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
-const SCHEMA_VERSION: i32 = 13;
+const SCHEMA_VERSION: i32 = 14;
 
 /// Split a comma-joined tag column back into a list (trimmed, empties
 /// dropped). `NULL` (unset) stays `None`.
@@ -414,6 +414,20 @@ impl Store {
                  COMMIT;",
             )?;
         }
+        if version < 14 {
+            // The flush-on-close claim. Both close paths (the daemon's own
+            // detection and the client's `SessionEnd` hook) select the final
+            // batch through the same `build_final_runs`, and the close purges
+            // every in-session guard they relied on to not hand out the same
+            // fork twice — roster `ran_at`, the fires latch, the spawn rows.
+            // This column is on the `sessions` row, which a close updates
+            // rather than deletes, so the claim outlives it.
+            conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE sessions ADD COLUMN final_flush_at INTEGER;
+                 COMMIT;",
+            )?;
+        }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(Self { conn })
     }
@@ -462,6 +476,10 @@ impl Store {
                enable_tags = excluded.enable_tags,
                disable_tags = excluded.disable_tags,
                client = COALESCE(excluded.client, client),
+               -- Reopening a closed row starts a fresh session life: release
+               -- the flush-on-close claim its previous close took, or this
+               -- session could never flush again.
+               final_flush_at = CASE WHEN status = 'closed' THEN NULL ELSE final_flush_at END,
                status = 'open',
                last_activity = excluded.last_activity",
             params![
@@ -731,6 +749,28 @@ impl Store {
             params![session_id, offset as i64, prompt_tokens.map(|n| n as i64)],
         )?;
         Ok(())
+    }
+
+    /// Claim the session's one flush-on-close batch. Returns true for the
+    /// caller that won it — exactly one ever does, whether it is the daemon's
+    /// own close path or the client's `SessionEnd` hook coming through
+    /// `TakeFinalRuns`, and however far apart the two arrive.
+    ///
+    /// The claim cannot live in any of the tables selection reads, because
+    /// [`close_session`] deletes all of them: after a close, the roster
+    /// (`ran_at`), the fires latch and the spawn rows are gone, so a second
+    /// selection sees a clean slate and re-issues forks the first batch is
+    /// still working through — or forks that already ran and finished during
+    /// the session. The `sessions` row is updated by a close, not deleted, so
+    /// the claim survives there. [`upsert_session`](Self::upsert_session)
+    /// releases it if the session is ever reopened.
+    pub fn try_claim_final_flush(&self, session_id: &str, now: i64) -> rusqlite::Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE sessions SET final_flush_at = ?2
+             WHERE session_id = ?1 AND final_flush_at IS NULL",
+            params![session_id, now],
+        )?;
+        Ok(n > 0)
     }
 
     /// Close a session and clear its roster, latches, spawns and pending
@@ -1853,6 +1893,22 @@ mod tests {
         assert_eq!(s.list_pending_deps("a").unwrap().len(), 1);
         assert_eq!(s.clear_pending_deps("a").unwrap(), 1);
         assert!(s.list_pending_deps("a").unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_final_flush_is_claimed_once_and_survives_the_close() {
+        let s = store();
+        seed_session(&s, "a", "/p", 100);
+        // The daemon's close path and the SessionEnd hook both ask; one wins.
+        assert!(s.try_claim_final_flush("a", 110).unwrap());
+        assert!(!s.try_claim_final_flush("a", 111).unwrap());
+        // The close purges every in-session guard, so the claim has to outlive
+        // it: a hook arriving after the row is closed must still find it taken.
+        s.close_session("a", "gone", 120).unwrap();
+        assert!(!s.try_claim_final_flush("a", 130).unwrap());
+        // Reopening the session id starts a new life, and a new claim.
+        seed_session(&s, "a", "/p", 140);
+        assert!(s.try_claim_final_flush("a", 150).unwrap());
     }
 
     #[test]

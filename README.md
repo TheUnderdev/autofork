@@ -691,6 +691,12 @@ they can: Claude Code spools them under the conversation (delivered if you resum
 spools them the same way, opencode runs are work-only. `flush_on_close = false` opts out if
 close-time runs aren't wanted.
 
+Close-time runs are headless, so there is nobody to answer a permission prompt: each client's
+runner sets its own approvals (`--permission-mode` on Claude Code, sandbox flags on codex,
+`--auto` on opencode — which auto-approves only what is not explicitly denied, so the agent a
+fork's `mode:` picks keeps its own permission config). A session flushes exactly once, whether
+the `SessionEnd` hook or the daemon's own liveness check notices the close first.
+
 ### Session liveness
 
 A session is open for exactly as long as the process behind it is. Since v0.23 every hook forwards

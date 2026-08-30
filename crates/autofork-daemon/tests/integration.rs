@@ -3004,6 +3004,65 @@ fn a_close_the_client_never_reported_still_flushes_its_idle_forks() {
 }
 
 #[test]
+fn a_late_session_end_hook_cannot_re_issue_the_batch_the_close_already_ran() {
+    // Both close paths select through `build_final_runs`, and a close purges
+    // the roster, the fires latch and the spawn rows — every stamp a second
+    // selection would have consulted. So the daemon flushing first and the
+    // client's SessionEnd hook arriving after used to run the same forks
+    // twice, concurrently, over the same files.
+    let mut h = Harness::new("30m", "0").liveness_sweep_secs(1);
+    let record = h.recording_final_runner();
+    h.write_fork(
+        "handover.md",
+        "---\nfork: true\nrun_on:\n  - idle: 30m\n---\nHAND OVER",
+    );
+    h.write_fork(
+        "journal.md",
+        "---\nfork: true\nrun_on:\n  - idle: 30m\n---\nJOURNAL",
+    );
+    h.start_daemon();
+
+    let mut client = FakeClient::spawn();
+    let mut ev = h.event(EventKind::SessionStart, "s-double");
+    ev.harness = Some(client.harness());
+    assert_ack(h.send_event(ev));
+    let _rx = h.park_stop_wait({
+        let mut ev = h.event(EventKind::Stop, "s-double");
+        ev.harness = Some(client.harness());
+        ev
+    });
+    std::thread::sleep(Duration::from_millis(300));
+
+    // The daemon notices the dead client and flushes the batch itself.
+    client.kill();
+    let start = Instant::now();
+    loop {
+        if !std::fs::read_to_string(&record)
+            .unwrap_or_default()
+            .is_empty()
+        {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "the end-runner never ran"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // The hook the client fires on its way out lands after that close.
+    let ResponseBody::Due { forks } = h.request(RequestBody::TakeFinalRuns {
+        session_id: "s-double".into(),
+    }) else {
+        panic!("expected Due");
+    };
+    assert!(
+        forks.is_empty(),
+        "the batch was already claimed and is running: {forks:?}"
+    );
+}
+
+#[test]
 fn an_orphaned_stop_wait_cannot_resurrect_a_dead_session() {
     // A parked poll that outlived its client (headless mode re-parks after
     // every run) used to re-open the session on every re-park and hold it

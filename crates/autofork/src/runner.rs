@@ -553,6 +553,42 @@ pub fn run_final(
     }
 }
 
+/// The `opencode run` flags for one fork run (the prompt is appended by the
+/// caller, after these).
+///
+/// Two of them are what make the run able to do anything at all:
+///
+/// - `--auto`: a headless run cannot answer a permission prompt. Its stdin is
+///   null and the instance that would have shown the dialog is gone, so every
+///   tool call needing approval is refused and the run exits 0 having read a
+///   few files and written nothing. This is opencode's counterpart to the
+///   `--permission-mode` the Claude Code path passes and the sandbox flags the
+///   codex path passes. It auto-approves only what is not explicitly denied,
+///   so an agent's own permission config still governs the run.
+/// - `--agent`: a fork's `mode:` names the opencode AGENT to run as (permission
+///   mode on Claude Code, sandbox on codex, agent here). The live plugin path
+///   pins it on the forked session; without it here, `mode:` and config
+///   `[fork_modes]` were silently dropped on the close path — including the
+///   read-only agent someone would pick to keep a fork from writing.
+fn opencode_run_args(session_id: &str, model: Option<&str>, mode: Option<&str>) -> Vec<String> {
+    let mut args = vec![
+        "run".to_string(),
+        "-s".to_string(),
+        session_id.to_string(),
+        "--fork".to_string(),
+    ];
+    if let Some(m) = model {
+        args.push("-m".to_string());
+        args.push(m.to_string());
+    }
+    if let Some(agent) = mode {
+        args.push("--agent".to_string());
+        args.push(agent.to_string());
+    }
+    args.push("--auto".to_string());
+    args
+}
+
 /// One flush-on-close opencode run: `opencode run -s <id> --fork` continues a
 /// fork of the closed session headlessly (verified byte-identical request
 /// prefixes). The report has nowhere to go (no live instance, no queue), so
@@ -591,10 +627,11 @@ fn run_final_opencode(
     let mut report = String::new();
     for model in &candidates {
         let mut cmd = Command::new(&opencode_bin);
-        cmd.arg("run").arg("-s").arg(session_id).arg("--fork");
-        if let Some(m) = model {
-            cmd.arg("-m").arg(m);
-        }
+        cmd.args(opencode_run_args(
+            session_id,
+            model.as_deref(),
+            spec.mode.as_deref(),
+        ));
         cmd.arg(&prompt)
             .current_dir(cwd)
             .env("AUTOFORK_FORK", "1")
@@ -623,4 +660,39 @@ fn run_final_opencode(
         },
     );
     (status == "completed" && !report.is_empty()).then_some(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opencode_fork_runs_can_use_tools() {
+        // Without `--auto` the run is denied every tool call that needs
+        // approval — nobody is there to answer — and finishes having done
+        // nothing.
+        let args = opencode_run_args("ses_1", None, None);
+        assert_eq!(args, ["run", "-s", "ses_1", "--fork", "--auto"]);
+    }
+
+    #[test]
+    fn opencode_fork_runs_honor_model_and_mode() {
+        // `mode:` is the agent on opencode, and it reaches the close path's
+        // runs the same way it reaches the live plugin's.
+        let args = opencode_run_args("ses_1", Some("anthropic/claude-haiku-4-5"), Some("plan"));
+        assert_eq!(
+            args,
+            [
+                "run",
+                "-s",
+                "ses_1",
+                "--fork",
+                "-m",
+                "anthropic/claude-haiku-4-5",
+                "--agent",
+                "plan",
+                "--auto",
+            ]
+        );
+    }
 }
