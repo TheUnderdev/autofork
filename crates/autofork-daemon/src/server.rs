@@ -206,7 +206,10 @@ async fn dispatch(daemon: &Arc<Daemon>, body: RequestBody) -> ResponseBody {
             fork,
             text,
         } => daemon.handle_spool_report(&session_id, &fork, &text),
-        RequestBody::TakeReports { session_id } => daemon.handle_take_reports(&session_id),
+        RequestBody::TakeReports {
+            session_id,
+            wait_ms,
+        } => daemon.handle_take_reports(&session_id, wait_ms).await,
         RequestBody::TakeWakeBlocks { session_id } => daemon.handle_take_wake_blocks(&session_id),
         RequestBody::Emit {
             name,

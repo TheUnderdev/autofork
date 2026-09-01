@@ -2,8 +2,12 @@
 // Do not edit: `autofork opencode install` overwrites this file on update.
 //
 // Also delivers lifecycle *feeds* (a hook with `deliver:`): blocks of text a
-// command produced, injected as a no-reply message (quiet) or a real turn
-// (`deliver: wake`). No model runs for a feed — it is a command's stdout.
+// command produced. A quiet feed (`deliver: context`) is drained by the
+// `chat.message` hook below and rides inside the turn the user is starting —
+// opencode's equivalent of Claude Code's additionalContext — or, when it
+// fires while the session sits idle and there is no turn to ride, is injected
+// as a no-reply message. `deliver: wake` starts a real turn. No model runs
+// for a feed — it is a command's stdout.
 //
 // Bridges opencode sessions to the autofork daemon: when a session idles (or
 // crosses a context threshold), due forks run as *forked sessions* — full
@@ -113,6 +117,11 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
   // continuation, not user activity — a waking prompt-submit would bump the
   // pause epoch and re-fire every idle fork).
   const injectTurn = new Set();
+  // Sessions we are prompting ourselves right now (a fork report or a feed
+  // block on its way in). Those prompts run `chat.message` too, and the
+  // drain there must not fire for them: it would be a round trip to fetch
+  // blocks we are in the middle of delivering.
+  const selfPrompt = new Set();
   // Parked stop-wait subprocesses: sessionID -> proc.
   const parked = new Map();
   // Re-park backoff: sessionID -> {delay, lastParkAt}.
@@ -282,10 +291,27 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
     if (!parked.has(id)) await park(id);
   }
 
-  // A lifecycle feed's output, on its way into the session. opencode has no
-  // additionalContext lane, so a *quiet* feed rides the same zero-turn
-  // no-reply message a fork report does — the model sees it on its next
-  // exchange, nothing is spent, and the transcript shows one injected block.
+  // A part id is `prt_` + 12 hex digits (a timestamp times 4096, plus a
+  // per-millisecond counter) + 14 random base62 characters, and a message's
+  // parts are ordered by it. Bumping the counter of the last part already on
+  // the message mints exactly the id opencode would have minted next: unique,
+  // and sorted immediately after everything there.
+  const BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+  function nextPartID(prev) {
+    let rnd = "";
+    for (let i = 0; i < 14; i++) rnd += BASE62[Math.floor(Math.random() * BASE62.length)];
+    const m = /^[a-z]+_([0-9a-f]{12})/.exec(prev ?? "");
+    const time = m
+      ? BigInt("0x" + m[1]) + 1n
+      : BigInt(Date.now()) * 4096n; // no sibling to follow: mint from now
+    return `prt_${time.toString(16).padStart(12, "0").slice(-12)}${rnd}`;
+  }
+
+  // A lifecycle feed's output, on its way into the session. A *quiet* feed
+  // the daemon pushes mid-pause has no turn to ride (that is the
+  // `chat.message` drain's job), so it rides the same zero-turn no-reply
+  // message a fork report does — the model sees it on its next exchange,
+  // nothing is spent, and the transcript shows one injected block.
   // A `deliver: wake` feed is injected as a real turn instead, pinning the
   // parent's model/agent exactly as a chain report does, and the turn it
   // starts is flagged non-waking so it does not bump the pause epoch and
@@ -293,6 +319,7 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
   async function deliverFeed(parentID, feed) {
     if (forkRuns.has(parentID) || ignored.has(parentID)) return;
     const text = feed.blocks.join("\n\n");
+    selfPrompt.add(parentID);
     try {
       if (feed.wake) {
         const parent = sessionState(parentID);
@@ -315,6 +342,8 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
       // The parent may be gone. Never leave a stale non-waking flag behind
       // for a turn that will not happen.
       injectTurn.delete(parentID);
+    } finally {
+      selfPrompt.delete(parentID);
     }
   }
 
@@ -462,6 +491,7 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
         ? report || "(the fork finished without a report)"
         : `(the fork run ${status}${report ? `; its last message:\n${report}` : ""})`;
     const block = `---\nsource: autofork\nfork: ${run.fork} (trigger: ${run.trigger}) — ${status}\n---\n${body}`;
+    selfPrompt.add(run.parent);
     try {
       if (chainNext) {
         // The chain continues: inject the report as a REAL turn, so the
@@ -489,6 +519,8 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
       // The parent may be gone; the completion still counts below. Never
       // leave a stale non-waking flag behind for a turn that won't happen.
       injectTurn.delete(run.parent);
+    } finally {
+      selfPrompt.delete(run.parent);
     }
     // `continue` rides even if the injection failed: the daemon re-arms the
     // fork and the chain resumes from the parent's next idle poll.
@@ -598,6 +630,56 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
       }
       parked.clear();
       sessions.clear();
+    },
+    // The turn-start drain: opencode's `additionalContext`. A user message is
+    // assembled here, before it is sent, and the parts array we are handed is
+    // the one that gets saved and shipped to the model — so a quiet feed's
+    // blocks can ride INSIDE the turn the user just started instead of being
+    // injected behind its back as a separate message the model only reads one
+    // turn later. That lateness was the whole problem with a `session_start`
+    // feed under opencode: the session does not exist for autofork until the
+    // user's first message, so the feed its own arrival fires used to land
+    // after it.
+    //
+    // This is also where the session is registered (the busy transition below
+    // still registers late arrivals): it runs before the turn, so a
+    // `session_start` feed's command is already running when the drain asks
+    // the daemon to wait for it.
+    "chat.message": async (input, output) => {
+      // Whatever goes wrong in here, the user's message must still be sent:
+      // this runs inside opencode's own message assembly, so a throw would
+      // cost the turn. A feed that misses its ride lands the old way instead.
+      try {
+        const id = input?.sessionID;
+        if (!id || forkRuns.has(id) || ignored.has(id) || selfPrompt.has(id)) return;
+        if (!(await eligible(id))) return;
+        const s = sessionState(id);
+        if (input.model?.providerID && input.model?.modelID) s.model = input.model;
+        if (input.agent) s.agent = input.agent;
+        await ensureStarted(id);
+        const res = await call("message", {
+          session_id: id,
+          model: s.model?.modelID,
+          context_window: await contextWindow(s.model),
+        });
+        const blocks = res?.context?.blocks ?? [];
+        const parts = output?.parts;
+        if (!blocks.length || !Array.isArray(parts)) return;
+        const last = parts[parts.length - 1];
+        // `synthetic` is what makes this the additionalContext lane and not a
+        // second visible message: opencode filters synthetic text parts out of
+        // the rendered message but still sends them to the model.
+        parts.push({
+          id: nextPartID(last?.id),
+          sessionID: id,
+          messageID: output.message?.id ?? last?.messageID,
+          type: "text",
+          synthetic: true,
+          text: blocks.join("\n\n"),
+        });
+      } catch {
+        // best-effort, always
+      }
     },
     event: async ({ event }) => {
       const type = event?.type;

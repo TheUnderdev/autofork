@@ -258,8 +258,16 @@ pub fn execute(
     let session = ctx.session_id.clone();
     let ctx = ctx.clone();
     let daemon = Arc::clone(daemon);
+    // A context feed is counted as in flight from here until its block is
+    // spooled (or it fails), so a drain that fires the hook and then asks for
+    // its output — the opencode `chat.message` lane — can wait for it instead
+    // of racing it. Held by a guard so every exit path, panic included,
+    // releases the count.
+    let inflight =
+        (deliver == HookDeliver::Context).then(|| FeedInflight::new(&daemon, &ctx.spool_key()));
     tracing::info!(hook = %hook, event = %event_name, session = %session, "running lifecycle hook");
     tokio::spawn(async move {
+        let _inflight = inflight;
         let mut cmd = tokio::process::Command::new("/bin/sh");
         cmd.arg("-c")
             .arg(&command)
@@ -294,6 +302,29 @@ pub fn execute(
             }
         }
     });
+}
+
+/// Counts one running `deliver: context` hook against its spool key for as
+/// long as it lives. See [`Daemon::feed_hooks_inflight`].
+struct FeedInflight {
+    daemon: Arc<Daemon>,
+    key: String,
+}
+
+impl FeedInflight {
+    fn new(daemon: &Arc<Daemon>, key: &str) -> Self {
+        daemon.feed_hook_started(key);
+        Self {
+            daemon: Arc::clone(daemon),
+            key: key.to_string(),
+        }
+    }
+}
+
+impl Drop for FeedInflight {
+    fn drop(&mut self) {
+        self.daemon.feed_hook_finished(&self.key);
+    }
 }
 
 /// Put a feed's stdout into the session, or decide not to.
@@ -364,9 +395,12 @@ fn deliver_block(
             drop(store);
             tracing::info!(hook = %hook, session = %ctx.session_id, event = %event,
                 bytes = block.len(), "feed delivered (quiet)");
-            // opencode has no silent lane of its own (no additionalContext
-            // hook): its plugin takes spooled blocks off the parked poll and
-            // injects them as no-reply messages, so nudge that poll to look.
+            // opencode drains this spool at its next turn (the plugin's
+            // `chat.message` hook, the additionalContext equivalent). Nudge
+            // the parked poll as well: while the session sits idle there is
+            // no next turn in sight, and the plugin takes blocks off the poll
+            // and injects them as no-reply messages. Whichever lane arrives
+            // first clears the spool, so a block is delivered exactly once.
             if ctx.client.as_deref() == Some("opencode") {
                 daemon.nudge(&ctx.session_id);
             }

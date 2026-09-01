@@ -200,6 +200,7 @@ impl Harness {
         loop {
             if let ResponseBody::Reports { blocks } = self.request(RequestBody::TakeReports {
                 session_id: session.to_string(),
+                wait_ms: None,
             }) {
                 if !blocks.is_empty() {
                     return blocks;
@@ -2587,12 +2588,14 @@ fn spooled_reports_deliver_once_in_order() {
     }));
     let ResponseBody::Reports { blocks } = h.request(RequestBody::TakeReports {
         session_id: "cc-spool".into(),
+        wait_ms: None,
     }) else {
         panic!("expected Reports");
     };
     assert_eq!(blocks, vec!["first".to_string(), "second".to_string()]);
     let ResponseBody::Reports { blocks } = h.request(RequestBody::TakeReports {
         session_id: "cc-spool".into(),
+        wait_ms: None,
     }) else {
         panic!("expected Reports");
     };
@@ -3198,6 +3201,82 @@ fn a_feed_spools_its_stdout_as_a_context_block() {
 }
 
 #[test]
+fn a_drain_that_asks_waits_for_a_context_feed_still_running() {
+    // opencode's turn-start drain (the plugin's `chat.message` hook). Under
+    // opencode a `session_start` feed is fired by the very prompt that needs
+    // it — there is no event before the user's first message — so a drain
+    // that could not wait would always answer empty, and the block would land
+    // behind the turn as a message the model reads only after answering.
+    let mut h = Harness::new("30m", "0");
+    let path = h.project.join(".autofork/hooks/slow.md");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        "---\nhook: true\non: [session_start]\ndeliver: context\n\
+         command: |-\n  sleep 0.5; printf '%s' 'LATE'\n---\nfeed\n",
+    )
+    .unwrap();
+    h.start_daemon();
+
+    let mut ev = h.event(EventKind::SessionStart, "oc1");
+    ev.client = Some("opencode".into());
+    assert_ack(h.send_event(ev));
+
+    // Asking without a wait finds nothing — the hook is still running. This
+    // is exactly the race the wait exists for.
+    match h.request(RequestBody::TakeReports {
+        session_id: "oc1".into(),
+        wait_ms: None,
+    }) {
+        ResponseBody::Reports { blocks } => assert!(blocks.is_empty(), "{blocks:?}"),
+        other => panic!("unexpected {other:?}"),
+    }
+    let ResponseBody::Reports { blocks } = h.request(RequestBody::TakeReports {
+        session_id: "oc1".into(),
+        wait_ms: Some(5_000),
+    }) else {
+        panic!("expected Reports");
+    };
+    assert_eq!(blocks.len(), 1, "{blocks:?}");
+    assert!(blocks[0].contains("LATE"), "{}", blocks[0]);
+}
+
+#[test]
+fn a_drain_that_asks_gives_up_on_a_feed_that_outlasts_its_budget() {
+    // The budget is the promise that a wedged feed costs a pause, never the
+    // user's prompt: past it the drain answers, and the block falls back to
+    // the lane it always had (the next turn).
+    let mut h = Harness::new("30m", "0");
+    let path = h.project.join(".autofork/hooks/wedged.md");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        "---\nhook: true\non: [session_start]\ndeliver: context\n\
+         command: |-\n  sleep 30; printf '%s' 'NEVER'\n---\nfeed\n",
+    )
+    .unwrap();
+    h.start_daemon();
+
+    let mut ev = h.event(EventKind::SessionStart, "oc2");
+    ev.client = Some("opencode".into());
+    assert_ack(h.send_event(ev));
+
+    let started = Instant::now();
+    match h.request(RequestBody::TakeReports {
+        session_id: "oc2".into(),
+        wait_ms: Some(300),
+    }) {
+        ResponseBody::Reports { blocks } => assert!(blocks.is_empty(), "{blocks:?}"),
+        other => panic!("unexpected {other:?}"),
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the drain waited past its budget: {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
 fn a_feed_does_not_deliver_the_same_block_twice() {
     let mut h = Harness::new("30m", "0");
     h.write_feed("brief.md", "[activity]", "context", "UNCHANGED");
@@ -3214,6 +3293,7 @@ fn a_feed_does_not_deliver_the_same_block_twice() {
     std::thread::sleep(Duration::from_secs(2));
     match h.request(RequestBody::TakeReports {
         session_id: "s1".into(),
+        wait_ms: None,
     }) {
         ResponseBody::Reports { blocks } => {
             assert!(

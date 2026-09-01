@@ -130,6 +130,7 @@ fn run_hook_inner(kind: HookKind) -> Option<()> {
                 .unwrap_or_else(|| input.session_id.clone());
             if let Ok(ResponseBody::Reports { blocks }) = client.request(RequestBody::TakeReports {
                 session_id: spool_key,
+                wait_ms: None,
             }) {
                 if !blocks.is_empty() {
                     print_additional_context(&blocks);

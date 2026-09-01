@@ -105,6 +105,13 @@ pub struct Daemon {
     /// generation so any fresh event cancels the close regardless of the
     /// (whole-second) clock granularity.
     pub pending_close: Mutex<HashMap<String, u64>>,
+    /// `deliver: context` lifecycle hooks currently running, counted per
+    /// spool key. A hook's command runs detached (the event that fired it is
+    /// acked immediately), so a client draining the spool right after firing
+    /// one would find it empty — the opencode `chat.message` drain waits on
+    /// this counter for a bounded moment instead. Only the context lane is
+    /// counted: wake blocks leave by another door.
+    pub feed_hooks_inflight: Mutex<HashMap<String, usize>>,
     pub close_gen: AtomicU64,
     pub connections: AtomicUsize,
     pub last_busy: AtomicI64,
@@ -113,6 +120,13 @@ pub struct Daemon {
     pub started_at: i64,
     pub shutdown: tokio::sync::Notify,
 }
+
+/// The ceiling on how long a spool drain will wait for in-flight `deliver:
+/// context` hooks. A feed's own `timeout:` can be far longer, and a prompt
+/// the user already sent must never be held for it: past this, the blocks
+/// simply arrive at the next turn, which is where they used to arrive
+/// always.
+const MAX_FEED_WAIT_MS: u64 = 10_000;
 
 /// How long after issuing a wake an unattributable PromptSubmit — no prompt
 /// text, or a task notification the spawn registry can't match — is assumed to
@@ -203,6 +217,7 @@ impl Daemon {
             chain_continued_at: Mutex::new(HashMap::new()),
             parked: Mutex::new(HashMap::new()),
             pending_close: Mutex::new(HashMap::new()),
+            feed_hooks_inflight: Mutex::new(HashMap::new()),
             close_gen: AtomicU64::new(0),
             connections: AtomicUsize::new(0),
             last_busy: AtomicI64::new(now()),
@@ -1145,9 +1160,11 @@ impl Daemon {
     ///   (block-and-inject beats waking a session that is about to stop).
     /// - **quiet blocks** (`deliver: context`) ride the report spool, which
     ///   Claude Code and codex drain as `additionalContext` at the next
-    ///   prompt. opencode has no such lane, so its plugin takes them off the
-    ///   poll and injects them as no-reply messages — no turn spent either
-    ///   way.
+    ///   prompt, and opencode at its next turn (the plugin's `chat.message`
+    ///   hook). A session sitting idle has no next turn in sight, so opencode
+    ///   also takes them off the poll and injects them as no-reply messages —
+    ///   no turn spent either way, and the spool makes either lane deliver
+    ///   exactly once.
     fn take_feed_delivery(self: &Arc<Self>, session: &SessionRow) -> Option<ResponseBody> {
         let client = session.client.as_deref();
         let store = self.store.lock().unwrap();
@@ -1246,11 +1263,67 @@ impl Daemon {
         ResponseBody::Reports { blocks }
     }
 
-    pub fn handle_take_reports(self: &Arc<Self>, session_id: &str) -> ResponseBody {
+    pub async fn handle_take_reports(
+        self: &Arc<Self>,
+        session_id: &str,
+        wait_ms: Option<u64>,
+    ) -> ResponseBody {
         self.touch_busy();
+        if let Some(ms) = wait_ms {
+            self.await_feed_hooks(session_id, Duration::from_millis(ms.min(MAX_FEED_WAIT_MS)))
+                .await;
+        }
         let store = self.store.lock().unwrap();
         ResponseBody::Reports {
             blocks: store.take_reports(session_id).unwrap_or_default(),
+        }
+    }
+
+    /// Block until no `deliver: context` hook is running for this spool key,
+    /// or the budget runs out — whichever comes first. Polled rather than
+    /// signalled: in-flight feeds are rare (usually zero, and the loop exits
+    /// on its first look), and a poll has no lost-wakeup window to reason
+    /// about on a path that must never hang a user's prompt.
+    async fn await_feed_hooks(self: &Arc<Self>, key: &str, budget: Duration) {
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            let running = self
+                .feed_hooks_inflight
+                .lock()
+                .unwrap()
+                .get(key)
+                .copied()
+                .unwrap_or(0);
+            if running == 0 {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                tracing::debug!(session = %key, running,
+                    "feed hooks still running at the drain budget, answering without them");
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// A `deliver: context` hook started for this spool key.
+    pub fn feed_hook_started(&self, key: &str) {
+        *self
+            .feed_hooks_inflight
+            .lock()
+            .unwrap()
+            .entry(key.to_string())
+            .or_insert(0) += 1;
+    }
+
+    /// ...and finished (or died): drop the count, and the key with it.
+    pub fn feed_hook_finished(&self, key: &str) {
+        let mut map = self.feed_hooks_inflight.lock().unwrap();
+        if let Some(n) = map.get_mut(key) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                map.remove(key);
+            }
         }
     }
 

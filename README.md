@@ -494,11 +494,18 @@ External moments add `AUTOFORK_TRIGGER` and, per kind, `AUTOFORK_WATCH` + `AUTOF
 |---|---|---|
 | Claude Code | spooled, delivered as `additionalContext` at your next prompt | the parked Stop poll exits 2 with the block |
 | codex | spooled, delivered as `additionalContext` at your next prompt | the Stop hook blocks-and-injects it at the next turn end |
-| opencode | injected as a **no-reply message** (it has no additionalContext lane) — zero turns, and it can land mid-run | injected as a real turn, with your model/agent pinned |
+| opencode | spooled, delivered inside your next turn (a hidden part on your message, via the plugin's `chat.message` hook) — or, if it fires while the session is idle, injected as a **no-reply message** | injected as a real turn, with your model/agent pinned |
 
 One honest limit: on Claude Code and codex there is no channel into a *running* turn. A quiet feed
 therefore reaches the model at its next prompt, and a wake feed at the next turn boundary. opencode
 is the one client that can take an injection mid-run.
+
+A `session_start` feed is the case that makes the opencode lane matter. opencode gives autofork no
+event before your first message — the session is first seen when that message starts a turn — so
+the feed it fires is fired *by* the prompt that needs it. The `chat.message` drain is what makes
+that work: it registers the session before the turn is assembled, and waits (briefly, up to four
+seconds) for a `session_start` feed still running, so its block rides inside that first turn
+instead of landing behind it as a message the model only reads once it has finished answering.
 
 ## External moments: `changed:` and `event:`
 

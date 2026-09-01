@@ -22,6 +22,12 @@ const CLIENT: &str = "opencode";
 /// The plugin file name inside opencode's global config plugin dir.
 const PLUGIN_FILE: &str = "autofork.js";
 
+/// How long the `chat.message` drain gives a `session_start` feed that is
+/// still running. Long enough for a command that reads files or shells out,
+/// short enough that a wedged feed costs a noticeable pause and not a hung
+/// prompt — past it the blocks fall back to the old lane (the next turn).
+const FEED_DRAIN_WAIT_MS: u64 = 4000;
+
 /// The embedded opencode plugin. `{{VERSION}}` is replaced at install time so
 /// `doctor` can tell an out-of-date installed copy from the current one.
 const PLUGIN_SOURCE: &str = include_str!("../assets/opencode-plugin.js");
@@ -33,6 +39,10 @@ pub enum OcHookKind {
     /// A genuine user turn started: cancels any parked stop-wait, bumps the
     /// pause epoch.
     PromptSubmit,
+    /// A user message is being assembled, before it is sent: drain the
+    /// session's quiet feed blocks so they ride INSIDE this turn. Answers on
+    /// stdout: `{"context":{"blocks":[…]}}` or `{}`.
+    Message,
     /// The session went idle: long-poll for due forks. Answers on stdout:
     /// `{"wake":{"payload":…,"forks":[…],"feed":…}}` or `{"waited":true}`.
     /// `feed` (additive) carries lifecycle-feed blocks to inject instead of
@@ -103,8 +113,12 @@ struct OcInput {
 pub fn run_hook(kind: OcHookKind) {
     // Like the Claude Code hooks: never break the host, whatever happens.
     // stop-wait must still answer JSON so the plugin's read completes.
-    if run_hook_inner(kind).is_none() && kind == OcHookKind::StopWait {
-        println!("{{\"waited\":true}}");
+    if run_hook_inner(kind).is_none() {
+        match kind {
+            OcHookKind::StopWait => println!("{{\"waited\":true}}"),
+            OcHookKind::Message => println!("{{}}"),
+            _ => {}
+        }
     }
 }
 
@@ -161,6 +175,30 @@ fn run_hook_inner(kind: OcHookKind) -> Option<()> {
             ev.waking = Some(input.waking.unwrap_or(true));
             let _ = client.request(RequestBody::Event(ev));
         }
+        OcHookKind::Message => {
+            // opencode's stand-in for Claude Code's `additionalContext`: the
+            // plugin's `chat.message` hook can add parts to the user message
+            // before it is sent, so a quiet feed reaches the model in the
+            // turn the user is starting — not as a message injected behind
+            // its back, which the model would only read one turn later.
+            //
+            // Spawn-and-wait like SessionStart rather than the prompt hook's
+            // hard budget: the session's `session_start` feeds are fired by
+            // this very prompt (opencode has no event before it), so a
+            // daemon that isn't up yet is exactly the case where the blocks
+            // would otherwise be lost to the first turn of every session.
+            let client = Client::connect_or_spawn(&paths, Duration::from_secs(5)).ok()?;
+            let mut client = client.ensure_current_version(&paths).ok()?;
+            let blocks = match client.request(RequestBody::TakeReports {
+                session_id: input.session_id.clone(),
+                wait_ms: Some(FEED_DRAIN_WAIT_MS),
+            }) {
+                Ok(ResponseBody::Reports { blocks }) => blocks,
+                _ => Vec::new(),
+            };
+            let out = serde_json::json!({ "context": { "blocks": blocks } });
+            println!("{out}");
+        }
         OcHookKind::StopWait => {
             // Orphan watchdog: this subprocess is the session's liveness
             // heartbeat. The plugin that spawned it dies with the opencode
@@ -190,8 +228,10 @@ fn run_hook_inner(kind: OcHookKind) -> Option<()> {
                     // the plugin can branch on which key is present. `wake`
                     // says whether the blocks should start a turn the model
                     // reacts to (`deliver: wake`) or ride in silently as a
-                    // no-reply message (`deliver: context`, opencode's stand-in
-                    // for the additionalContext lane it does not have).
+                    // no-reply message (`deliver: context`, the lane for a
+                    // quiet feed that fires while the session is idle — a turn
+                    // that is already under way drains the spool itself, see
+                    // `OcHookKind::Message`).
                     let out = serde_json::json!({
                         "wake": {
                             "payload": payload,

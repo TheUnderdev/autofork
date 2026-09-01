@@ -74,7 +74,19 @@ pub enum RequestBody {
     /// Take (and clear) the spooled reports for a session — called by the
     /// UserPromptSubmit hook to deliver them as additionalContext. Additive
     /// frame; old daemons answer `Error`, treated as "none".
-    TakeReports { session_id: String },
+    ///
+    /// `wait_ms` (additive field): before answering, wait up to this long for
+    /// `deliver: context` lifecycle hooks still running for this session to
+    /// finish, so their blocks make THIS turn instead of the next one. Only
+    /// the opencode `chat.message` drain uses it: there, the session's
+    /// `session_start` feeds are fired by the very prompt that is asking for
+    /// them (opencode has no pre-prompt session event), so the spool is
+    /// reliably empty without a short wait. Old daemons ignore the field.
+    TakeReports {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wait_ms: Option<u64>,
+    },
     /// `flush_on_close`: the SessionEnd hook asks for every idle fork that
     /// has not yet fired this pause; the daemon selects (throttles, tags and
     /// the runaway breaker still apply), stamps, and returns them ALL — roots

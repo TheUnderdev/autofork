@@ -171,6 +171,7 @@ fn run_hook_inner(kind: CxHookKind) -> Option<()> {
             // the model sees them with this prompt, the transcript doesn't.
             if let Ok(ResponseBody::Reports { blocks }) = client.request(RequestBody::TakeReports {
                 session_id: input.session_id.clone(),
+                wait_ms: None,
             }) {
                 if !blocks.is_empty() {
                     print_additional_context(&blocks);
