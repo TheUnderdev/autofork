@@ -570,22 +570,21 @@ pub fn run_final(
 ///   pins it on the forked session; without it here, `mode:` and config
 ///   `[fork_modes]` were silently dropped on the close path — including the
 ///   read-only agent someone would pick to keep a fork from writing.
-fn opencode_run_args(
-    session_id: &str,
-    model: Option<&str>,
-    mode: Option<&str>,
-    title: &str,
-) -> Vec<String> {
-    // `--title` gives the fork copy our `autofork/<fork> (<trigger>)` title
-    // instead of opencode's "<parent title> (fork #N)", so the plugin's
-    // TITLE_PREFIX check and its startup sweep both apply to headless runs.
+// NOTE: there is deliberately no `--title` here. A headless fork run would
+// ideally carry our `autofork/<fork> (<trigger>)` title so the plugin's
+// TITLE_PREFIX check and its startup sweep apply to it — but opencode's
+// `run --fork` ignores `--title` outright (verified on 1.18.5): the flag
+// only names a NEW session, while the fork path calls `session.fork()`,
+// which always derives `<parent title> (fork #N)` from the parent. Passing
+// it would look like a fix and do nothing. The fork copy is instead made
+// harmless by the AUTOFORK_FORK env guard (its plugin instance and hook
+// bridge are both inert) and swept by title pattern.
+fn opencode_run_args(session_id: &str, model: Option<&str>, mode: Option<&str>) -> Vec<String> {
     let mut args = vec![
         "run".to_string(),
         "-s".to_string(),
         session_id.to_string(),
         "--fork".to_string(),
-        "--title".to_string(),
-        title.to_string(),
     ];
     if let Some(m) = model {
         args.push("-m".to_string());
@@ -603,10 +602,10 @@ fn opencode_run_args(
 /// fork of the closed session headlessly (verified byte-identical request
 /// prefixes). The report has nowhere to go (no live instance, no queue), so
 /// only the run's WORK matters; leftover fork sessions are cleaned by the
-/// plugin's startup sweep (they carry our `autofork/` title, see
-/// `opencode_run_args`). The child inherits AUTOFORK_FORK=1, which makes its
-/// own plugin instance and `autofork opencode hook` inert — a fork copy of a
-/// real session must never register as one.
+/// plugin's startup sweep, which matches opencode's own `(fork #N)` title
+/// plus the spawn-prompt fingerprint. The child inherits AUTOFORK_FORK=1,
+/// which makes its own plugin instance and `autofork opencode hook` inert —
+/// a fork copy of a real session must never register as one.
 fn run_final_opencode(
     paths: &Paths,
     session_id: &str,
@@ -644,7 +643,6 @@ fn run_final_opencode(
             session_id,
             model.as_deref(),
             spec.mode.as_deref(),
-            &format!("autofork/{} ({})", spec.name, spec.trigger),
         ));
         cmd.arg(&prompt)
             .current_dir(cwd)
@@ -685,31 +683,15 @@ mod tests {
         // Without `--auto` the run is denied every tool call that needs
         // approval — nobody is there to answer — and finishes having done
         // nothing.
-        let args = opencode_run_args("ses_1", None, None, "autofork/review (idle)");
-        assert_eq!(
-            args,
-            [
-                "run",
-                "-s",
-                "ses_1",
-                "--fork",
-                "--title",
-                "autofork/review (idle)",
-                "--auto"
-            ]
-        );
+        let args = opencode_run_args("ses_1", None, None);
+        assert_eq!(args, ["run", "-s", "ses_1", "--fork", "--auto"]);
     }
 
     #[test]
     fn opencode_fork_runs_honor_model_and_mode() {
         // `mode:` is the agent on opencode, and it reaches the close path's
         // runs the same way it reaches the live plugin's.
-        let args = opencode_run_args(
-            "ses_1",
-            Some("anthropic/claude-haiku-4-5"),
-            Some("plan"),
-            "autofork/review (idle)",
-        );
+        let args = opencode_run_args("ses_1", Some("anthropic/claude-haiku-4-5"), Some("plan"));
         assert_eq!(
             args,
             [
@@ -717,8 +699,6 @@ mod tests {
                 "-s",
                 "ses_1",
                 "--fork",
-                "--title",
-                "autofork/review (idle)",
                 "-m",
                 "anthropic/claude-haiku-4-5",
                 "--agent",

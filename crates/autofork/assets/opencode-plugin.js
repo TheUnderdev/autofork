@@ -596,11 +596,13 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
         }
         if (deleted === 0) break;
       }
-      // Second pass: flush-on-close runs from before v0.26.1 (the end-runner
-      // passed no --title) carry opencode's own auto-title — "Fork of …" on
-      // old opencode, "<title> (fork #N)" since at least 1.18 — not ours.
-      // Find them by the spawn-prompt fingerprint in any user message, aged
-      // like the rest.
+      // Second pass: flush-on-close runs (`opencode run -s <id> --fork`
+      // spawned by the end-runner after an instance died) always carry
+      // opencode's own auto-title, not ours — "Fork of …" on old opencode,
+      // "<parent title> (fork #N)" since at least 1.18. The end-runner
+      // cannot name them: `run --fork` ignores `--title` and derives the
+      // title from the parent. Find them by the spawn-prompt fingerprint in
+      // any user message, aged like the rest.
       for (const search of ["Fork of", "(fork #"]) {
         const page =
           (await client.session.list({ query: { search, limit: 200 } }))?.data ?? [];
