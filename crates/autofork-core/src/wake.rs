@@ -318,7 +318,12 @@ fn spawn_prompt(
          {SPAWN_CTX_PREFIX}{name}', trigger '{trigger}', parent session {session_id}, conversation \
          {conversation_id}, project root {project_root}. The conversation id is stable when \
          a session is resumed (a resumed session gets a fresh session id); key any \
-         per-conversation artifacts on it. Your final message is your report.{chain_line}",
+         per-conversation artifacts on it. You run as a separate process from the parent: \
+         its background tasks (a Monitor, a background command, a subagent) are not in your \
+         task table, so TaskOutput on one of its task ids fails with \"No task found\" — that \
+         is a visibility limit, not evidence the task stopped; never report it as gone or \
+         ask the parent to re-arm it on that basis. Your final message is your \
+         report.{chain_line}",
         path = fork.path,
         name = fork.name,
         trigger = fork.trigger,
@@ -678,6 +683,16 @@ mod tests {
             p.contains(&format!("{SPAWN_CTX_PREFIX}journal'")),
             "the spawn prompt must carry the transcript-watcher fingerprint"
         );
+    }
+
+    #[test]
+    fn spawn_prompt_warns_about_parent_task_visibility() {
+        // A fork is a separate `claude -p --fork-session` process: the
+        // parent's background tasks are not in its task table, and a fork
+        // that reads "No task found" as a teardown asks for duplicate re-arms.
+        let p = build_wake_payload("s", "conv-s", "/p", &[due("journal", &[], false)], &[]);
+        assert!(p.contains("not in your task table"));
+        assert!(p.contains("not evidence the task stopped"));
     }
 
     #[test]

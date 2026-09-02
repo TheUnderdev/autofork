@@ -658,6 +658,13 @@ run never ends, its report (sentinel included) is never captured, and the fork d
 the parent's work. Disabling hooks in the fork also keeps a throwaway reviewer from firing your
 lifecycle hooks; set `AUTOFORK_FORK_HOOKS=1` if a fork of yours depends on one.
 
+A fork is a separate process, so the parent's background tasks — a Monitor, a
+`run_in_background` command, a subagent — are not in its task table: `TaskOutput` on one of the
+parent's task ids fails with "No task found" no matter how alive the task is. The spawn prompt
+tells every fork so, because a fork that reads that error as a teardown asks the parent to
+re-arm a watch it still holds, once per pause, forever. A fork that must know whether such a
+task is alive checks the process or its output file, or leaves the question to the parent.
+
 One report never waits for your next prompt: a `chain: true` run that asks to continue. There the
 parent is the worker and the loop only advances once it has seen the report, so the parked hook
 delivers that block by **waking the session with it** (stderr + exit 2) instead of re-parking —
