@@ -43,6 +43,8 @@ pub struct SelectedFork {
     pub chain: bool,
     /// `gate: true`: holds the session's other idle forks while unsettled.
     pub gate: bool,
+    /// `background_hold:` frontmatter; `None` = the config default.
+    pub background_hold: Option<bool>,
     /// Raw `model:` frontmatter (client-scoped); resolved at wake build.
     pub model: autofork_core::frontmatter::ClientScoped,
     /// Raw `mode:` frontmatter (client-scoped); resolved at wake build.
@@ -301,6 +303,7 @@ pub fn select_forks(
             tags: parsed.def.tags.clone(),
             chain: parsed.def.chain,
             gate: parsed.def.gate,
+            background_hold: parsed.def.background_hold,
             model: parsed.def.model.clone(),
             mode: parsed.def.mode.clone(),
             latch_key,
@@ -310,8 +313,37 @@ pub fn select_forks(
     }
     if gate_hold == GateHold::Apply {
         apply_gate_filter(daemon, session, &mut selected);
+        apply_background_hold_filter(daemon, session, cfg, &mut selected);
     }
     selected
+}
+
+/// While the session waits on background work it started — a
+/// `run_in_background` command, a background subagent, a Monitor — hold every
+/// idle-triggered fork that waits for such work (`background_hold:` on the
+/// fork, else the config default): drop them from the selection *without*
+/// stamping their latches, so they fire intact once the work clears or the
+/// hold times out. Forks with `background_hold: false` treat the stop as
+/// idle and go through; `every:` and `context_*` triggers are never held.
+/// Close-time selection (`GateHold::Skip`) skips this: the session's
+/// background work died with it.
+fn apply_background_hold_filter(
+    daemon: &Arc<Daemon>,
+    session: &SessionRow,
+    cfg: &Config,
+    selected: &mut Vec<SelectedFork>,
+) {
+    if selected.is_empty() || !daemon.pending_background(&session.session_id, cfg, now()) {
+        return;
+    }
+    let before = selected.len();
+    selected.retain(|s| {
+        !is_idle_trigger(&s.trigger) || !s.background_hold.unwrap_or(cfg.background_hold)
+    });
+    if selected.len() < before {
+        tracing::info!(session = %session.session_id, held = before - selected.len(),
+            "background work still running: holding the idle forks that wait for it");
+    }
 }
 
 /// The detail of one queued external trigger, if it is still queued.

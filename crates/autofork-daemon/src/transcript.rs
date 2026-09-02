@@ -32,6 +32,10 @@ pub struct Delta {
     /// `run_in_background` Bash commands — every tool use whose work outlives
     /// the turn that started it.
     pub task_ids: Vec<(String, String)>,
+    /// Background tasks the session itself stopped (`TaskStop` tool uses,
+    /// by task id). A stop leaves no notification behind, so this is the
+    /// only way the daemon learns the work is over.
+    pub stopped_tasks: Vec<String>,
     /// Task-notification envelopes seen in user entries.
     pub notifications: Vec<TaskNotification>,
 }
@@ -95,9 +99,22 @@ fn scan_assistant(value: &serde_json::Value, delta: &mut Delta) {
         return;
     };
     for block in blocks {
-        if block.get("type").and_then(|t| t.as_str()) != Some("tool_use")
-            || block.get("name").and_then(|n| n.as_str()) != Some("Agent")
-        {
+        if block.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
+            continue;
+        }
+        let name = block.get("name").and_then(|n| n.as_str());
+        if name == Some("TaskStop") {
+            if let Some(task_id) = block
+                .get("input")
+                .and_then(|i| i.get("task_id"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                delta.stopped_tasks.push(task_id.to_string());
+            }
+            continue;
+        }
+        if name != Some("Agent") {
             continue;
         }
         let Some(id) = block.get("id").and_then(|i| i.as_str()) else {
@@ -188,11 +205,16 @@ fn fork_name_from_prompt(prompt: &str) -> Option<String> {
 
 /// The background task id a tool result announces, if any: `agentId: <id>`
 /// for an async Agent launch, `…running in background with ID: <id>` for a
-/// `run_in_background` Bash command. A synchronous tool use announces
-/// neither — which is exactly the discriminator: a result with an id here
-/// means work that outlives the turn.
+/// `run_in_background` Bash command, `Monitor started (task <id>` for a
+/// Monitor (timed or persistent). A synchronous tool use announces none of
+/// them — which is exactly the discriminator: a result with an id here means
+/// work that outlives the turn.
 fn background_task_id(text: &str) -> Option<&str> {
-    const PREFIXES: [&str; 2] = ["agentId: ", "running in background with ID: "];
+    const PREFIXES: [&str; 3] = [
+        "agentId: ",
+        "running in background with ID: ",
+        "Monitor started (task ",
+    ];
     let (start, _) = PREFIXES
         .iter()
         .filter_map(|p| text.find(p).map(|i| (i + p.len(), i)))
@@ -252,6 +274,36 @@ mod tests {
         write!(f, "{{\"type\":\"assistant\"").unwrap();
         let d = read_delta(tmp.path(), 0).unwrap();
         assert_eq!(d.new_offset, 0);
+    }
+
+    #[test]
+    fn monitor_launches_and_task_stops_are_background_work() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut f = std::fs::File::create(tmp.path()).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"toolu_mon","content":[{{"type":"text","text":"Monitor started (task bmvywwknn, persistent — runs until TaskStop or session end). You will be notified on each event."}}]}}]}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"toolu_mon2","content":[{{"type":"text","text":"Monitor started (task bq6g522gh, timeout 2400000ms). You will be notified on each event."}}]}}]}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"toolu_stop","name":"TaskStop","input":{{"task_id":"bmvywwknn"}}}}]}}}}"#
+        )
+        .unwrap();
+        let d = read_delta(tmp.path(), 0).unwrap();
+        assert_eq!(
+            d.task_ids,
+            vec![
+                ("toolu_mon".to_string(), "bmvywwknn".to_string()),
+                ("toolu_mon2".to_string(), "bq6g522gh".to_string()),
+            ]
+        );
+        assert_eq!(d.stopped_tasks, vec!["bmvywwknn".to_string()]);
     }
 
     #[test]

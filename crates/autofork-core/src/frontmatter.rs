@@ -8,7 +8,7 @@
 //!
 //! Supported top-level keys: `fork`, `description`, `run_on`, `throttle`,
 //! `after`, `priority`, `overlap`, `tags`, `chain`, `chain_limit`, `gate`,
-//! `model`, `mode`. Unknown keys are ignored for
+//! `background_hold`, `model`, `mode`. Unknown keys are ignored for
 //! forward compatibility; invalid values warn and fall back rather than
 //! dropping the fork. `model` and `mode` (which client runs use for the fork,
 //! since v0.17) take either one scalar or a map keyed by client name
@@ -172,6 +172,14 @@ pub struct ForkDef {
     /// the held forks' idle deadlines measure from that moment. The "goal
     /// fork" key: goal work first, consolidation forks after.
     pub gate: bool,
+    /// What "idle" means for this fork's `idle` triggers while the session
+    /// still has background work in flight (a `run_in_background` command, a
+    /// background subagent, a Monitor). `Some(true)`: wait for that work to
+    /// finish (or the hold to time out) before the idle clock counts.
+    /// `Some(false)`: the model stopping is idle enough, whatever is still
+    /// running — a supervisor that watches over a persistent Monitor wants
+    /// this. `None` = the config default (`background_hold`, on).
+    pub background_hold: Option<bool>,
     /// Model for this fork's runs (scalar or client-keyed map). Unset =
     /// config `[fork_models]` default for the client, else inherit the
     /// session's model. Native-execution clients honor it; the Claude Code
@@ -198,6 +206,7 @@ impl Default for ForkDef {
             chain: false,
             chain_limit: None,
             gate: false,
+            background_hold: None,
             model: ClientScoped::Unset,
             mode: ClientScoped::Unset,
         }
@@ -519,6 +528,8 @@ struct RawFork {
     chain_limit: Option<serde_yaml::Value>,
     #[serde(default)]
     gate: Option<serde_yaml::Value>,
+    #[serde(default)]
+    background_hold: Option<serde_yaml::Value>,
     // Live again since v0.17 (scalar or client-keyed map).
     #[serde(default)]
     model: Option<serde_yaml::Value>,
@@ -557,6 +568,7 @@ impl RawFork {
             || self.chain.is_some()
             || self.chain_limit.is_some()
             || self.gate.is_some()
+            || self.background_hold.is_some()
             || self.model.is_some()
             || self.mode.is_some()
             || self.delivery.is_some()
@@ -787,6 +799,17 @@ pub fn parse_fork_file(name: &str, content: &str) -> ForkParse {
         }
     };
 
+    let background_hold = match &raw.background_hold {
+        None => None,
+        Some(serde_yaml::Value::Bool(b)) => Some(*b),
+        Some(_) => {
+            warnings.push(format!(
+                "fork '{name}': background_hold must be true or false; using the config default"
+            ));
+            None
+        }
+    };
+
     let tags = raw
         .tags
         .as_ref()
@@ -820,6 +843,7 @@ pub fn parse_fork_file(name: &str, content: &str) -> ForkParse {
             chain,
             chain_limit,
             gate,
+            background_hold,
             model,
             mode,
         },
@@ -1140,6 +1164,21 @@ mod tests {
             parse_fork_file("x", "---\nchain: true\n---\n"),
             ForkParse::NotFork { fork_like: true }
         ));
+    }
+
+    #[test]
+    fn background_hold_parsing() {
+        assert_eq!(parse("---\nfork: true\n---\n").def.background_hold, None);
+        let p = parse("---\nfork: true\nbackground_hold: false\n---\n");
+        assert_eq!(p.def.background_hold, Some(false));
+        let p = parse("---\nfork: true\nbackground_hold: true\n---\n");
+        assert_eq!(p.def.background_hold, Some(true));
+        let p = parse("---\nfork: true\nbackground_hold: soon\n---\n");
+        assert_eq!(p.def.background_hold, None);
+        assert!(p
+            .warnings
+            .iter()
+            .any(|w| w.contains("background_hold must be")));
     }
 
     #[test]

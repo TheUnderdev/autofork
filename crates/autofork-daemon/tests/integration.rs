@@ -406,6 +406,35 @@ impl Harness {
         self.append_transcript_line(&line.to_string());
     }
 
+    /// Append the tool_result of a Monitor launch (persistent: it ends only
+    /// on TaskStop or session end).
+    fn append_monitor_launch(&self, tool_use_id: &str, task_id: &str) {
+        let line = serde_json::json!({
+            "type": "user",
+            "message": { "content": [
+                { "type": "tool_result", "tool_use_id": tool_use_id, "content": [
+                    { "type": "text", "text": format!(
+                        "Monitor started (task {task_id}, persistent — runs until TaskStop \
+                         or session end). You will be notified on each event.") },
+                ] },
+            ] }
+        });
+        self.append_transcript_line(&line.to_string());
+    }
+
+    /// Append a `TaskStop` tool use: the session ended a background task
+    /// itself, which leaves no notification behind.
+    fn append_task_stop(&self, task_id: &str) {
+        let line = serde_json::json!({
+            "type": "assistant",
+            "message": { "content": [
+                { "type": "tool_use", "id": format!("toolu_stop_{task_id}"), "name": "TaskStop",
+                  "input": { "task_id": task_id } },
+            ] }
+        });
+        self.append_transcript_line(&line.to_string());
+    }
+
     /// Append a background-task completion notification to the transcript, as
     /// the relay turn's user entry would contain.
     fn append_completion_notification(&self, tool_use_id: &str, status: &str) {
@@ -2850,7 +2879,7 @@ fn background_work_holds_the_idle_clock_until_it_finishes() {
 #[test]
 fn background_hold_expires_so_unfinished_work_cannot_silence_forks() {
     let mut h = Harness::new("1s", "0").wake_grace_secs(0);
-    h.append_config("background_hold_timeout = \"1s\"");
+    h.append_config("background_hold_timeout = \"2s\"");
     h.write_fork(
         "journal.md",
         "---\nfork: true\nrun_on:\n  - idle: 0s\n---\nJOURNAL",
@@ -2864,8 +2893,71 @@ fn background_hold_expires_so_unfinished_work_cannot_silence_forks() {
     let rx = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
     assert!(rx.recv_timeout(Duration::from_millis(1200)).is_err());
 
-    // Past the hold timeout the task stops counting and idle forks resume.
-    std::thread::sleep(Duration::from_millis(1200));
+    // Past the hold timeout the task stops counting and the parked poll
+    // itself releases the held fork — no further stop needed (the poll
+    // schedules an evaluation at each pending task's hold expiry).
+    let payload = wake_payload(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert!(payload.contains("due: journal"), "{payload}");
+}
+
+#[test]
+fn a_fork_can_opt_out_of_the_background_hold() {
+    // A persistent Monitor keeps the session "waiting" for as long as it
+    // lives. A supervisor with `background_hold: false` still fires at every
+    // stop (the model stopping is idle enough for it); the default-holding
+    // journal is held — and released by the session's own TaskStop, which
+    // leaves no notification behind.
+    let mut h = Harness::new("1s", "0").wake_grace_secs(0);
+    h.write_fork(
+        "goal.md",
+        "---\nfork: true\nrun_on:\n  - idle: 0s\nbackground_hold: false\n---\nGOAL",
+    );
+    h.write_fork(
+        "journal.md",
+        "---\nfork: true\nrun_on:\n  - idle: 0s\n---\nJOURNAL",
+    );
+    h.start_daemon();
+    h.write_transcript(100);
+    assert_ack(h.send_event(h.event_t(EventKind::SessionStart, "s1")));
+
+    h.append_monitor_launch("toolu_mon", "mon1");
+    let rx = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
+    let payload = wake_payload(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert!(payload.contains("due: goal"), "{payload}");
+    assert!(
+        !payload.contains("due: journal"),
+        "a holding fork fired while a Monitor was still running: {payload}"
+    );
+
+    // The session stops the Monitor itself. The wake turn's Stop keeps the
+    // pause (goal stays latched) and finds nothing pending: journal fires.
+    h.append_task_stop("mon1");
+    let rx = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
+    let payload = wake_payload(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert!(payload.contains("due: journal"), "{payload}");
+    assert!(!payload.contains("due: goal"), "{payload}");
+}
+
+#[test]
+fn a_fork_can_opt_in_to_the_hold_when_the_config_default_is_off() {
+    let mut h = Harness::new("1s", "0").wake_grace_secs(0);
+    h.append_config("background_hold = false");
+    h.write_fork(
+        "journal.md",
+        "---\nfork: true\nrun_on:\n  - idle: 0s\nbackground_hold: true\n---\nJOURNAL",
+    );
+    h.start_daemon();
+    h.write_transcript(100);
+    assert_ack(h.send_event(h.event_t(EventKind::SessionStart, "s1")));
+
+    h.append_background_launch("toolu_bg", "bg1");
+    let rx = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
+    assert!(
+        rx.recv_timeout(Duration::from_millis(2500)).is_err(),
+        "a fork with background_hold: true fired while background work was running"
+    );
+
+    h.append_completion_notification("toolu_bg", "completed");
     assert_ack(h.send_event(h.prompt_submit("s1", false)));
     let rx = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
     let payload = wake_payload(rx.recv_timeout(Duration::from_secs(10)).unwrap());

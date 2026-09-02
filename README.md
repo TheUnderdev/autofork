@@ -162,6 +162,7 @@ a missing marker can't silently disable a real fork. `fork: false` is an explici
 | `chain` | `true` — a run may request another by ending its report with `<<autofork:continue>>` | `false` |
 | `chain_limit` | max chain runs within one pause | config `chain_limit` (25) |
 | `gate` | `true` — hold the other idle forks while this fork's run/chain is unsettled | `false` |
+| `background_hold` | what idle means to this fork while the session has background work running: `true` waits for it, `false` fires at the stop regardless | config `background_hold` (`true`) |
 | `model` | model for this fork's runs: a value or a fallback list (`[sonnet, haiku]` — a failed run retries on the next), scalar or keyed by client (`claude-code:` / `opencode:` / `codex:`) | config `[fork_models]`, else inherit the session's |
 | `mode` | operation mode for the runs (permission mode / codex sandbox / opencode agent), scalar or client map | config `[fork_modes]`, else the client default |
 
@@ -348,7 +349,9 @@ parent reacts to right away (Claude Code wakes the session with it from the Stop
 blocks-and-injects, opencode injects a real turn), the parent does the work, and the fork
 re-evaluates at the stop that follows. It starts counting only when the session is genuinely idle,
 so a goal fork never evaluates while a background command it asked for is still running (see
-[What counts as idle](#what-counts-as-idle)).
+[What counts as idle](#what-counts-as-idle)). A goal whose work *is* a long-lived background task
+— the parent arms a persistent Monitor and the fork supervises around it — would be held for as
+long as that task lives; give that fork `background_hold: false` so every stop is its cue.
 
 `gate: true` holds **every other idle-triggered fork** while this fork's run/chain is unsettled —
 they are dropped at selection without consuming their once-per-pause latches, and `after`-held
@@ -682,21 +685,31 @@ than a quiet conversation.
 ### What counts as idle
 
 A turn can end while the session is still *waiting*: a `run_in_background` Bash command polling a
-deploy, a background subagent researching something. The harness calls that a stop, but nothing
-about it is idle — and firing a goal fork there evaluates a goal against work that hasn't landed.
+deploy, a background subagent researching something, a Monitor watching a log. The harness calls
+that a stop, but nothing about it is idle — and firing a goal fork there evaluates a goal against
+work that hasn't landed.
 
-So `background_hold` (on by default) holds the idle clock while the session has unfinished
-background work: those stops arm no idle deadlines and start no pause, and the clock starts at the
-first stop after the last such task reports completion. An `idle: 4m` handover then measures its
-4 minutes from *that* moment, and an `idle: 0s` goal fork fires exactly then. `every:` and
-`context_*` triggers are not held (a periodic backstop and a filling context window still matter
-while you wait).
+So `background_hold` (on by default) holds idle forks while the session has unfinished background
+work: they are dropped at selection without consuming their once-per-pause latches, and fire once
+the last such task reports completion (or the session `TaskStop`s it — a stop leaves no
+notification, so the tool use itself is what the daemon reads). The completion starts a new pause,
+so an `idle: 4m` handover measures its 4 minutes from *that* moment, and an `idle: 0s` goal fork
+fires exactly then. `every:` and `context_*` triggers are not held (a periodic backstop and a
+filling context window still matter while you wait).
+
+What idle means is decided **per fork**: `background_hold:` in the frontmatter overrides the
+config default. `background_hold: false` says the model stopping is idle enough for this fork,
+whatever is still running — the key for a supervisor that watches over a persistent Monitor (which
+would otherwise hold it for as long as the Monitor lives), or a journal that wants every stop.
+Such forks fire from the waiting stop like any other; the held ones wait.
 
 autofork's own fork spawns never count — a session isn't busy because autofork is forking it; fork
 ordering is what `after`, `overlap` and `gate` are for. And because a completion can go unseen (a
 server left running, a notification lost to a resume), one task stops holding after
-`background_hold_timeout` (default 30m; `0` holds for as long as the work runs). Set
-`background_hold = false` for the pre-v0.22 behavior, where every stop is idle.
+`background_hold_timeout` (default 30m; `0` holds for as long as the work runs) — the parked poll
+re-evaluates at that instant, so the held forks fire without waiting for another stop. Set
+`background_hold = false` in the config for the pre-v0.22 default, where every stop is idle
+(forks can still opt in with `background_hold: true`).
 
 ### Flush on close
 

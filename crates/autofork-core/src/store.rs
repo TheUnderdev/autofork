@@ -1334,6 +1334,23 @@ impl Store {
         )
     }
 
+    /// The start instants of the background tasks still holding the session
+    /// (same window as `pending_bg_tasks`), ascending — the moments at which
+    /// each one's hold will time out are what a parked poll schedules.
+    pub fn pending_bg_task_starts(
+        &self,
+        session_id: &str,
+        not_before: i64,
+    ) -> rusqlite::Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT started_at FROM bg_tasks
+             WHERE session_id = ?1 AND terminal_at IS NULL AND started_at >= ?2
+             ORDER BY started_at",
+        )?;
+        let rows = stmt.query_map(params![session_id, not_before], |r| r.get::<_, i64>(0))?;
+        rows.collect()
+    }
+
     /// Release a chaining fork's once-per-pause idle latch so it can fire
     /// again within the same pause. Returns whether a latch row was cleared.
     pub fn rearm_idle_latch(
