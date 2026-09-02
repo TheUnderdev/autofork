@@ -100,6 +100,16 @@ function stripContinue(text) {
 }
 
 export const AutoforkPlugin = async ({ client, directory, worktree }) => {
+  // A fork-run process is not a client. Flush-on-close children are fresh
+  // `opencode run -s <parent> --fork` processes with AUTOFORK_FORK=1 in the
+  // env (the mirror of Claude Code's `--settings '{"disableAllHooks":true}'`).
+  // Their session is a copy of a REAL session — no parentID, opencode's own
+  // "(fork #N)" title, the parent's last user message — so nothing below can
+  // tell it apart, and registering it makes the daemon roster every fork on
+  // the fork run and spawn N more when it closes: an unbounded cascade. Do
+  // nothing at all in such a process (the CLI hook bridge has the same guard).
+  if (process.env.AUTOFORK_FORK || process.env.AUTOFORK_SESSION_ID) return {};
+
   // Per-session tracking (parent sessions only).
   // sessionID -> { started, lastStatus, tokens, model: {providerID, modelID} | null, agent }
   const sessions = new Map();
@@ -191,6 +201,24 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
     return s;
   }
 
+  // Whether ANY user message in the session is a daemon-built fork prompt.
+  // Every fork run carries one, and so does every copy of a fork run (a
+  // `--fork` copy keeps the whole message list). Scanning only the LAST user
+  // message is not enough: feed and report injections (`session.prompt`
+  // with noReply) append new user messages after the fork prompt, so a fork
+  // run that received a feed ends with "---\nsource: autofork ..." instead.
+  function hasSpawnCtx(msgs) {
+    for (const m of msgs) {
+      if (m?.info?.role !== "user") continue;
+      const text = (m.parts ?? [])
+        .filter((p) => p.type === "text")
+        .map((p) => p.text)
+        .join("\n");
+      if (text.includes(SPAWN_CTX)) return true;
+    }
+    return false;
+  }
+
   // Is this a session autofork should schedule forks for? Subagent children
   // and our own fork-run sessions are not.
   async function eligible(id) {
@@ -208,23 +236,16 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
     } catch {
       return false;
     }
-    // Second marker, independent of the title: a fork run's last user message
-    // is the daemon-built fork prompt. Fail open on fetch errors — the
-    // title/parentID checks passed, and the daemon refuses fork-run session
-    // ids anyway (its spawn registry outlives plugin instances).
+    // Second marker, independent of the title: a fork run (or a copy of one)
+    // carries the daemon-built fork prompt among its user messages. Fail
+    // open on fetch errors — the title/parentID checks passed, and the
+    // daemon refuses fork-run session ids anyway (its spawn registry
+    // outlives plugin instances).
     try {
       const msgs = (await client.session.messages({ path: { id } }))?.data ?? [];
-      for (let i = msgs.length - 1; i >= 0; i--) {
-        if (msgs[i]?.info?.role !== "user") continue;
-        const text = (msgs[i].parts ?? [])
-          .filter((p) => p.type === "text")
-          .map((p) => p.text)
-          .join("\n");
-        if (text.includes(SPAWN_CTX)) {
-          ignored.add(id);
-          return false;
-        }
-        break;
+      if (hasSpawnCtx(msgs)) {
+        ignored.add(id);
+        return false;
       }
     } catch {
       // fall through as eligible
@@ -575,31 +596,24 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
         }
         if (deleted === 0) break;
       }
-      // Second pass: flush-on-close runs (`opencode run --fork` spawned by
-      // the end-runner after an instance died) carry opencode's own "Fork
-      // of …" auto-title, not ours — find them by the spawn-prompt
-      // fingerprint in their last user message, aged like the rest.
-      const page =
-        (await client.session.list({ query: { search: "Fork of", limit: 200 } }))?.data ?? [];
-      for (const info of page) {
-        if (info?.parentID) continue;
-        if ((info.time?.updated ?? Infinity) > cutoff) continue;
-        if (forkRuns.has(info.id)) continue;
-        try {
-          const msgs = (await client.session.messages({ path: { id: info.id } }))?.data ?? [];
-          let isOurs = false;
-          for (let i = msgs.length - 1; i >= 0; i--) {
-            if (msgs[i]?.info?.role !== "user") continue;
-            const text = (msgs[i].parts ?? [])
-              .filter((p) => p.type === "text")
-              .map((p) => p.text)
-              .join("\n");
-            isOurs = text.includes(SPAWN_CTX);
-            break;
+      // Second pass: flush-on-close runs from before v0.26.1 (the end-runner
+      // passed no --title) carry opencode's own auto-title — "Fork of …" on
+      // old opencode, "<title> (fork #N)" since at least 1.18 — not ours.
+      // Find them by the spawn-prompt fingerprint in any user message, aged
+      // like the rest.
+      for (const search of ["Fork of", "(fork #"]) {
+        const page =
+          (await client.session.list({ query: { search, limit: 200 } }))?.data ?? [];
+        for (const info of page) {
+          if (info?.parentID) continue;
+          if ((info.time?.updated ?? Infinity) > cutoff) continue;
+          if (forkRuns.has(info.id)) continue;
+          try {
+            const msgs = (await client.session.messages({ path: { id: info.id } }))?.data ?? [];
+            if (hasSpawnCtx(msgs)) await client.session.delete({ path: { id: info.id } });
+          } catch {
+            // best-effort per session
           }
-          if (isOurs) await client.session.delete({ path: { id: info.id } });
-        } catch {
-          // best-effort per session
         }
       }
     })().catch(() => {});

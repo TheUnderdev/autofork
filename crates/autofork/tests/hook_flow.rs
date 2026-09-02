@@ -333,6 +333,60 @@ fn fork_env_guard_short_circuits_hook() {
 }
 
 #[test]
+fn fork_env_guard_short_circuits_opencode_hook() {
+    // The opencode bridge (`autofork opencode hook <kind>`) inherits a
+    // flush-on-close child's env via Bun.spawn. It must be as inert there as
+    // the Claude Code hook: no registration, no daemon, no output.
+    let env = Env::new("1h");
+    std::fs::write(
+        env.project.join(".autofork/forks/journal.md"),
+        "---\nfork: true\nrun_on: [idle]\n---\nBODY",
+    )
+    .unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_autofork"))
+        .args(["opencode", "hook", "session-start"])
+        .env("AUTOFORK_HOME", &env.home)
+        .env("AUTOFORK_SOCKET", &env.socket)
+        .env("AUTOFORK_FORK", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let input = serde_json::json!({
+        "session_id": "ses_fork_copy",
+        "directory": env.project,
+        "worktree": env.project,
+    });
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.to_string().as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "guarded opencode hook must exit 0"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "guarded opencode hook produced stdout"
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "guarded opencode hook produced stderr"
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !env.socket.exists(),
+        "a daemon was spawned despite the fork guard"
+    );
+}
+
+#[test]
 fn concurrent_session_starts_race_to_one_daemon() {
     let env = Env::new("1h");
     let mut children = Vec::new();

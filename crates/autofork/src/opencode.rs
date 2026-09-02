@@ -123,6 +123,19 @@ pub fn run_hook(kind: OcHookKind) {
 }
 
 fn run_hook_inner(kind: OcHookKind) -> Option<()> {
+    // Recursion guard, same as the Claude Code and codex hooks. A
+    // flush-on-close child is a fresh `opencode run -s <parent> --fork`
+    // process with AUTOFORK_FORK=1 in its env, and Bun.spawn hands that env
+    // to us. Without this, the child's plugin registers the fork copy as a
+    // real session (it has no parentID, opencode's own "(fork #N)" title,
+    // and the parent's last user message), the daemon rosters every fork on
+    // it, and its close spawns N more children: an unbounded fork-of-fork
+    // cascade (288 sessions, 10 levels deep, load 155 on 2026-09-02).
+    if std::env::var_os("AUTOFORK_FORK").is_some()
+        || std::env::var_os("AUTOFORK_SESSION_ID").is_some()
+    {
+        return None;
+    }
     let mut raw = String::new();
     use std::io::Read;
     std::io::stdin().read_to_string(&mut raw).ok()?;
