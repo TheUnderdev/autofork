@@ -295,16 +295,7 @@ fn run_attempt(
     // Detach from the controlling terminal: closing the parent's terminal
     // window SIGHUPs the process group, and a fork's WORK should survive the
     // session closing even when its report cannot.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
-    }
+    autofork_core::sys::detach(&mut cmd);
 
     match cmd.spawn() {
         Ok(mut child) => {
@@ -494,16 +485,7 @@ pub fn spawn_final_runner(
     if let Some(b) = harness_bin {
         cmd.arg("--bin").arg(b);
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
-    }
+    autofork_core::sys::detach(&mut cmd);
     let _ = cmd.spawn();
 }
 

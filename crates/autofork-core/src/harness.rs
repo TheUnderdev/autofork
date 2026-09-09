@@ -15,6 +15,7 @@
 //! and without the client's cooperation, whether the session's process still
 //! exists.
 
+use crate::sys;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -70,7 +71,7 @@ pub fn client_process() -> Option<Harness> {
     {
         return Some(h);
     }
-    let mut pid = std::os::unix::process::parent_id();
+    let mut pid = sys::parent_pid();
     for _ in 0..MAX_ANCESTOR_HOPS {
         if pid <= 1 {
             return None;
@@ -90,35 +91,20 @@ const MAX_ANCESTOR_HOPS: usize = 4;
 /// Whether an executable is a shell (or a shell-shaped exec wrapper) — a
 /// process that stands between us and the client rather than being it.
 fn is_shell(bin: Option<&std::path::Path>) -> bool {
-    let Some(name) = bin.and_then(|p| p.file_name()).and_then(|n| n.to_str()) else {
+    let Some(path) = bin.and_then(|p| p.to_str()) else {
         // Unknown binary: treat it as a real process, not a wrapper. Stopping
         // early anchors on something at least as long-lived as the client.
         return false;
     };
-    matches!(
-        name,
-        "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish" | "env" | "login" | "script"
-    )
+    // Split on both separators: the harness identity may have been recorded
+    // on one platform's spelling and read back on another's.
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    sys::is_shell_name(name)
 }
 
 /// A process's parent pid.
 pub fn parent_of(pid: u32) -> Option<u32> {
-    #[cfg(target_os = "macos")]
-    {
-        bsdinfo(pid).map(|info| info.pbi_ppid)
-    }
-    #[cfg(target_os = "linux")]
-    {
-        // /proc/<pid>/stat field 4, after the parenthesized comm.
-        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-        let rest = &stat[stat.rfind(')')? + 1..];
-        rest.split_whitespace().nth(1)?.parse::<u32>().ok()
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let _ = pid;
-        None
-    }
+    sys::parent_of(pid)
 }
 
 /// The identity of a pid we already know (the codex waiter's `--codex-pid`).
@@ -134,100 +120,19 @@ pub fn of_pid(pid: u32) -> Option<Harness> {
     })
 }
 
-/// Whether a pid names a live process (EPERM counts: it exists, we just
-/// don't own it).
+/// Whether a pid names a live process (a process we may not own counts).
 pub fn pid_exists(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    unsafe {
-        if libc::kill(pid as libc::pid_t, 0) == 0 {
-            return true;
-        }
-    }
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    sys::pid_exists(pid)
 }
 
 /// The executable path of a running process, when the platform exposes it.
 pub fn exe_path(pid: u32) -> Option<PathBuf> {
-    #[cfg(target_os = "linux")]
-    {
-        std::fs::read_link(format!("/proc/{pid}/exe")).ok()
-    }
-    #[cfg(target_os = "macos")]
-    {
-        // proc_pidpath from libproc (part of libSystem — no extra linking).
-        extern "C" {
-            fn proc_pidpath(
-                pid: libc::c_int,
-                buffer: *mut libc::c_void,
-                buffersize: u32,
-            ) -> libc::c_int;
-        }
-        let mut buf = [0u8; 4096];
-        let n = unsafe {
-            proc_pidpath(
-                pid as libc::c_int,
-                buf.as_mut_ptr() as *mut libc::c_void,
-                buf.len() as u32,
-            )
-        };
-        if n <= 0 {
-            return None;
-        }
-        let path = std::str::from_utf8(&buf[..n as usize]).ok()?;
-        Some(PathBuf::from(path))
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let _ = pid;
-        None
-    }
+    sys::exe_path(pid)
 }
 
-/// A process's start time as an opaque token. Only ever compared against
-/// another token for the same pid taken on the same machine.
-///
-/// macOS: absolute wall-clock microseconds (survives a reboot as an identity,
-/// since it is not boot-relative). Linux: `starttime` in clock ticks since
-/// boot, so it is only unique within a boot — `Harness::bin` is the belt
-/// there.
+/// A process's start time as an opaque token — see [`sys::start_token`].
 pub fn start_token(pid: u32) -> Option<i64> {
-    #[cfg(target_os = "macos")]
-    {
-        let info = bsdinfo(pid)?;
-        Some(info.pbi_start_tvsec as i64 * 1_000_000 + info.pbi_start_tvusec as i64)
-    }
-    #[cfg(target_os = "linux")]
-    {
-        // /proc/<pid>/stat field 22, counting from 1. The comm field (2) can
-        // contain spaces and parentheses, so split after the LAST ')'.
-        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-        let rest = &stat[stat.rfind(')')? + 1..];
-        rest.split_whitespace().nth(19)?.parse::<i64>().ok()
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let _ = pid;
-        None
-    }
-}
-
-/// One `proc_pidinfo(PROC_PIDTBSDINFO)` read — libproc, part of libSystem.
-#[cfg(target_os = "macos")]
-fn bsdinfo(pid: u32) -> Option<libc::proc_bsdinfo> {
-    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-    let n = unsafe {
-        libc::proc_pidinfo(
-            pid as libc::c_int,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            &mut info as *mut _ as *mut libc::c_void,
-            size,
-        )
-    };
-    (n == size).then_some(info)
+    sys::start_token(pid)
 }
 
 #[cfg(test)]
@@ -264,15 +169,33 @@ mod tests {
         assert!(!h.alive());
     }
 
+    /// A child that exits immediately, on every platform.
+    fn short_lived_child() -> std::process::Child {
+        #[cfg(windows)]
+        {
+            std::process::Command::new("cmd")
+                .args(["/C", "exit", "0"])
+                .spawn()
+                .unwrap()
+        }
+        #[cfg(not(windows))]
+        {
+            std::process::Command::new("true").spawn().unwrap()
+        }
+    }
+
     #[test]
     fn a_dead_pid_is_not_alive() {
-        // Reap a real child so its pid is certainly gone.
-        let mut child = std::process::Command::new("true").spawn().unwrap();
+        // Reap a real child so its pid is certainly gone. Its start token is
+        // recorded while it lives: Windows reuses pids eagerly, and the token
+        // is what tells the reaped child from a newcomer wearing its pid.
+        let mut child = short_lived_child();
         let pid = child.id();
+        let start = start_token(pid);
         child.wait().unwrap();
         let h = Harness {
             pid,
-            start: None,
+            start,
             bin: None,
         };
         assert!(!h.alive());
@@ -295,14 +218,19 @@ mod tests {
         let h = client_process().unwrap();
         assert_eq!(h.pid, me, "an exported live CLAUDE_PID is the anchor");
 
-        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let mut child = short_lived_child();
         let dead = child.id();
         child.wait().unwrap();
         std::env::set_var("CLAUDE_PID", dead.to_string());
         let h = client_process();
         std::env::remove_var("CLAUDE_PID");
         let h = h.expect("the ancestor walk still finds something");
-        assert_ne!(h.pid, dead, "a dead CLAUDE_PID must not be trusted");
+        // (A reused pid would make this a live newcomer; the token check is
+        // what `alive()` tests, and `of_pid` never resurrects a dead pid.)
+        assert!(
+            h.pid != dead || pid_exists(dead),
+            "a dead CLAUDE_PID must not be trusted"
+        );
         assert!(h.alive());
     }
 
@@ -311,6 +239,9 @@ mod tests {
         assert!(is_shell(Some(std::path::Path::new("/bin/sh"))));
         assert!(is_shell(Some(std::path::Path::new(
             "/opt/homebrew/bin/zsh"
+        ))));
+        assert!(is_shell(Some(std::path::Path::new(
+            r"C:\Program Files\Git\bin\bash.exe"
         ))));
         assert!(!is_shell(Some(std::path::Path::new(
             "/Users/x/.local/bin/claude"
@@ -324,8 +255,8 @@ mod tests {
         let me = std::process::id();
         assert_eq!(
             parent_of(me),
-            Some(std::os::unix::process::parent_id()),
-            "parent_of must agree with the libc parent id"
+            Some(sys::parent_pid()),
+            "parent_of must agree with the platform parent id"
         );
     }
 }

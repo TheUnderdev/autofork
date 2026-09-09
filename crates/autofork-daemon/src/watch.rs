@@ -29,7 +29,7 @@ use autofork_core::hooks::HookOn;
 use autofork_core::moments::ExternalKind;
 use autofork_core::store::SessionRow;
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -208,7 +208,7 @@ fn build_registry(daemon: &Arc<Daemon>) -> HashMap<String, Vec<Subscriber>> {
         let store = daemon.store.lock().unwrap();
         store.list_open_sessions().unwrap_or_default()
     };
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = autofork_core::sys::home_dir();
     let mut out: HashMap<String, Vec<Subscriber>> = HashMap::new();
     for session in sessions {
         // Patterns are written relative to the project the definition serves,
@@ -262,7 +262,7 @@ fn scan(pattern: &str, cap: usize) -> (Snapshot, bool) {
     if !glob::has_wildcard(pattern) {
         // A literal path: one stat, no walk.
         if let Some(id) = file_id(&root) {
-            snap.insert(root.to_string_lossy().into_owned(), id);
+            snap.insert(glob::slashes(&root.to_string_lossy()), id);
         }
         return (snap, false);
     }
@@ -303,10 +303,10 @@ fn walk(
             walk(&path, depth + 1, pattern, cap, snap, truncated);
             continue;
         }
-        let s = path.to_string_lossy();
+        let s = glob::slashes(&path.to_string_lossy());
         if glob::matches(pattern, &s) {
             if let Some(id) = file_id(&path) {
-                snap.insert(s.into_owned(), id);
+                snap.insert(s, id);
             }
         }
     }

@@ -20,7 +20,11 @@ serde.workspace = true
 serde_json.workspace = true
 clap.workspace = true
 tracing.workspace = true
-libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# The daemon endpoint is a named pipe on Windows; tokio is the one client
+# for those with timeouts (a blocking std::fs::File on a pipe has none).
+tokio.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -75,20 +75,20 @@ dependencies = [
 
 [[package]]
 name = "autofork"
-version = "0.26.2"
+version = "0.27.0"
 dependencies = [
  "autofork-core",
  "clap",
- "libc",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
  "tracing",
 ]
 
 [[package]]
 name = "autofork-core"
-version = "0.26.2"
+version = "0.27.0"
 dependencies = [
  "libc",
  "rusqlite",
@@ -98,14 +98,14 @@ dependencies = [
  "tempfile",
  "toml",
  "tracing",
+ "windows-sys",
 ]
 
 [[package]]
 name = "autofork-daemon"
-version = "0.26.2"
+version = "0.27.0"
 dependencies = [
  "autofork-core",
- "libc",
  "serde",
  "serde_json",
  "tempfile",

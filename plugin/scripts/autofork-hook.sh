@@ -13,6 +13,8 @@ if [ -n "${AUTOFORK_FORK}" ] || [ -n "${AUTOFORK_SESSION_ID}" ]; then
 fi
 
 BIN="${CLAUDE_PLUGIN_DATA}/bin/autofork"
+# Windows (Git Bash runs this shim there): the binary carries an .exe suffix.
+[ -x "$BIN" ] || [ ! -x "$BIN.exe" ] || BIN="$BIN.exe"
 if [ -x "$BIN" ]; then
     exec "$BIN" hook "$1"
 fi

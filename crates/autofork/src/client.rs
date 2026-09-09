@@ -1,18 +1,17 @@
-//! Daemon client: connect over the unix socket, auto-spawning the daemon
-//! when needed (flock-serialized against racing siblings), with per-call
-//! timeouts so hook paths never blow their budgets.
+//! Daemon client: connect over the daemon endpoint (a Unix socket, or a named
+//! pipe on Windows), auto-spawning the daemon when needed (lock-serialized
+//! against racing siblings), with per-call timeouts so hook paths never blow
+//! their budgets.
 
 use autofork_core::config::Paths;
 use autofork_core::protocol::{encode, Event, Request, RequestBody, Response, ResponseBody};
+use autofork_core::sys;
 use autofork_core::PROTO_VERSION;
-use std::io::{BufRead, BufReader, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 pub struct Client {
-    stream: UnixStream,
+    conn: Conn,
     next_id: u64,
 }
 
@@ -42,11 +41,8 @@ impl From<std::io::Error> for ClientError {
 impl Client {
     /// Connect without spawning.
     pub fn connect(paths: &Paths, timeout: Duration) -> Result<Self, ClientError> {
-        let socket = paths.socket();
-        let stream = UnixStream::connect(&socket).map_err(|_| ClientError::NotRunning)?;
-        stream.set_read_timeout(Some(timeout))?;
-        stream.set_write_timeout(Some(timeout))?;
-        Ok(Self { stream, next_id: 1 })
+        let conn = Conn::connect(paths, timeout).map_err(|_| ClientError::NotRunning)?;
+        Ok(Self { conn, next_id: 1 })
     }
 
     /// Connect, auto-spawning the daemon when it's down. `budget` bounds the
@@ -70,12 +66,11 @@ impl Client {
 
     /// The asyncRewake Stop hook's long poll: the daemon may hold the response
     /// for a long time (until forks are due or the wait is cancelled), so the
-    /// read timeout is widened to the hook's own 4h budget. A closed socket
-    /// (daemon retiring mid-poll) surfaces as an error the caller treats as a
-    /// silent exit-0.
+    /// read timeout is widened to the hook's own 4h budget. A closed
+    /// connection (daemon retiring mid-poll) surfaces as an error the caller
+    /// treats as a silent exit-0.
     pub fn stop_wait(&mut self, ev: Event) -> Result<ResponseBody, ClientError> {
-        self.stream
-            .set_read_timeout(Some(Duration::from_secs(4 * 3600)))?;
+        self.conn.set_read_timeout(Duration::from_secs(4 * 3600))?;
         self.request(RequestBody::StopWait(ev))
     }
 
@@ -88,10 +83,8 @@ impl Client {
             body,
         };
         let line = encode(&req).map_err(|e| ClientError::Protocol(e.to_string()))?;
-        self.stream.write_all(line.as_bytes())?;
-        let mut reader = BufReader::new(self.stream.try_clone()?);
-        let mut resp_line = String::new();
-        reader.read_line(&mut resp_line)?;
+        self.conn.write_all(line.as_bytes())?;
+        let resp_line = self.conn.read_line()?;
         if resp_line.is_empty() {
             return Err(ClientError::Protocol("connection closed".into()));
         }
@@ -147,23 +140,13 @@ fn semver_lt(a: &str, b: &str) -> bool {
     parse(a) < parse(b)
 }
 
-/// Acquire (and immediately hold) a non-blocking exclusive flock; None when
+/// Acquire (and immediately hold) a non-blocking exclusive lock; None when
 /// another process holds it. Dropping the file releases it.
 pub(crate) fn try_flock(path: &Path) -> Option<std::fs::File> {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(path)
-        .ok()?;
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    (rc == 0).then_some(file)
+    sys::try_lock_file(path)
 }
 
-/// Blocking flock with a deadline (poll-based, since flock has no timeout).
+/// Blocking lock with a deadline (poll-based, since the lock has no timeout).
 fn flock_until(path: &Path, deadline: Instant) -> Option<std::fs::File> {
     loop {
         if let Some(f) = try_flock(path) {
@@ -179,12 +162,14 @@ fn flock_until(path: &Path, deadline: Instant) -> Option<std::fs::File> {
 /// The daemon binary: `autofork-daemon` next to the current executable.
 fn daemon_binary() -> Option<std::path::PathBuf> {
     let exe = std::env::current_exe().ok()?;
-    let candidate = exe.parent()?.join("autofork-daemon");
+    let candidate = exe
+        .parent()?
+        .join(format!("autofork-daemon{}", sys::EXE_SUFFIX));
     candidate.is_file().then_some(candidate)
 }
 
 /// Spawn the daemon, serialized against racing CLIs via the spawn lock.
-/// Fire-and-forget variant: does not wait for the socket.
+/// Fire-and-forget variant: does not wait for the endpoint.
 pub fn spawn_daemon_detached(paths: &Paths) {
     let deadline = Instant::now() + Duration::from_millis(500);
     let _ = spawn_daemon_locked(paths, deadline);
@@ -193,21 +178,22 @@ pub fn spawn_daemon_detached(paths: &Paths) {
 fn spawn_daemon_locked(paths: &Paths, deadline: Instant) -> Result<(), ClientError> {
     let Some(_spawn_lock) = flock_until(&paths.spawn_lock(), deadline) else {
         // Someone else is spawning; treat as success and let the caller's
-        // reconnect loop find the socket.
+        // reconnect loop find the endpoint.
         return Ok(());
     };
     // Re-check: the race winner may have brought the daemon up while we
     // waited on the lock.
-    if UnixStream::connect(paths.socket()).is_ok() {
+    if Conn::probe(paths) {
         return Ok(());
     }
     // Staleness: the daemon holds its lock for life; acquirable = dead.
     {
         let Some(_daemon_lock) = try_flock(&paths.daemon_lock()) else {
-            // A daemon lives but its socket didn't answer — maybe still
+            // A daemon lives but its endpoint didn't answer — maybe still
             // booting. Nothing to do but let the caller retry.
             return Ok(());
         };
+        #[cfg(unix)]
         let _ = std::fs::remove_file(paths.socket());
         // Lock released here so the spawned daemon can take it.
     }
@@ -231,17 +217,8 @@ fn spawn_daemon_locked(paths: &Paths, deadline: Instant) -> Result<(), ClientErr
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(log))
         .stderr(std::process::Stdio::from(log2));
-    // Detach into its own session so it outlives the hook process.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
-    }
+    // Detach so it outlives the hook process.
+    sys::detach(&mut cmd);
     cmd.spawn()?;
     Ok(())
 }
@@ -253,38 +230,142 @@ fn spawn_daemon_locked(paths: &Paths, deadline: Instant) -> Result<(), ClientErr
 /// PATH lookup resolve a different program than the parent. `None` when the
 /// platform lookup fails — callers fall back to the PATH name.
 pub(crate) fn parent_exe() -> Option<std::path::PathBuf> {
-    let ppid = std::os::unix::process::parent_id();
-    #[cfg(target_os = "linux")]
-    {
-        std::fs::read_link(format!("/proc/{ppid}/exe")).ok()
+    sys::exe_path(sys::parent_pid())
+}
+
+// ---------------------------------------------------------------------------
+// The connection itself
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+use unix::Conn;
+#[cfg(windows)]
+use windows::Conn;
+
+#[cfg(unix)]
+mod unix {
+    use super::Paths;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    /// A Unix-socket connection with kernel read/write timeouts.
+    pub struct Conn {
+        stream: UnixStream,
+        // Reads go through a buffered clone of the same socket; SO_RCVTIMEO
+        // is a property of the socket, so the timeout set on `stream` holds
+        // for the clone too.
+        reader: BufReader<UnixStream>,
     }
-    #[cfg(target_os = "macos")]
-    {
-        // proc_pidpath from libproc (part of libSystem — no extra linking).
-        extern "C" {
-            fn proc_pidpath(
-                pid: libc::c_int,
-                buffer: *mut libc::c_void,
-                buffersize: u32,
-            ) -> libc::c_int;
+
+    impl Conn {
+        pub fn connect(paths: &Paths, timeout: Duration) -> std::io::Result<Self> {
+            let stream = UnixStream::connect(paths.socket())?;
+            stream.set_read_timeout(Some(timeout))?;
+            stream.set_write_timeout(Some(timeout))?;
+            let reader = BufReader::new(stream.try_clone()?);
+            Ok(Self { stream, reader })
         }
-        let mut buf = [0u8; 4096];
-        let n = unsafe {
-            proc_pidpath(
-                ppid as libc::c_int,
-                buf.as_mut_ptr() as *mut libc::c_void,
-                buf.len() as u32,
-            )
-        };
-        if n <= 0 {
-            return None;
+
+        /// Whether anything answers at the endpoint right now.
+        pub fn probe(paths: &Paths) -> bool {
+            UnixStream::connect(paths.socket()).is_ok()
         }
-        let path = std::str::from_utf8(&buf[..n as usize]).ok()?;
-        Some(std::path::PathBuf::from(path))
+
+        pub fn set_read_timeout(&mut self, d: Duration) -> std::io::Result<()> {
+            self.stream.set_read_timeout(Some(d))
+        }
+
+        pub fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+            self.stream.write_all(bytes)
+        }
+
+        /// One response line (empty on EOF).
+        pub fn read_line(&mut self) -> std::io::Result<String> {
+            let mut line = String::new();
+            self.reader.read_line(&mut line)?;
+            Ok(line)
+        }
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        None
+}
+
+#[cfg(windows)]
+mod windows {
+    use super::Paths;
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
+
+    /// `ERROR_PIPE_BUSY`: every server instance is taken this instant. The
+    /// daemon creates the next instance the moment one is claimed, so the
+    /// window is short; a client retries rather than failing.
+    const PIPE_BUSY: i32 = 231;
+
+    /// A named-pipe connection. A blocking `std::fs::File` on a pipe has no
+    /// read timeout, and the hook paths live on their timeouts — so the
+    /// client drives tokio's pipe client on a private single-thread runtime
+    /// and wraps every operation in `tokio::time::timeout`.
+    pub struct Conn {
+        rt: tokio::runtime::Runtime,
+        io: BufReader<NamedPipeClient>,
+        timeout: Duration,
+    }
+
+    impl Conn {
+        pub fn connect(paths: &Paths, timeout: Duration) -> std::io::Result<Self> {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let name = paths.pipe_name();
+            let deadline = Instant::now() + timeout;
+            let pipe = rt.block_on(async {
+                loop {
+                    match ClientOptions::new().open(&name) {
+                        Ok(c) => break Ok(c),
+                        Err(e)
+                            if e.raw_os_error() == Some(PIPE_BUSY) && Instant::now() < deadline =>
+                        {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                        Err(e) => break Err(e),
+                    }
+                }
+            })?;
+            Ok(Self {
+                rt,
+                io: BufReader::new(pipe),
+                timeout,
+            })
+        }
+
+        pub fn probe(paths: &Paths) -> bool {
+            Self::connect(paths, Duration::from_millis(500)).is_ok()
+        }
+
+        pub fn set_read_timeout(&mut self, d: Duration) -> std::io::Result<()> {
+            self.timeout = d;
+            Ok(())
+        }
+
+        pub fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+            let Self { rt, io, timeout } = self;
+            rt.block_on(async {
+                tokio::time::timeout(*timeout, io.write_all(bytes))
+                    .await
+                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "write"))?
+            })
+        }
+
+        pub fn read_line(&mut self) -> std::io::Result<String> {
+            let Self { rt, io, timeout } = self;
+            let mut line = String::new();
+            rt.block_on(async {
+                tokio::time::timeout(*timeout, io.read_line(&mut line))
+                    .await
+                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "read"))?
+            })?;
+            Ok(line)
+        }
     }
 }
 

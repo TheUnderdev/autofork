@@ -408,7 +408,7 @@ fn spawn_waiter(paths: &Paths, input: &CxInput, cwd: &Path) {
     // The hook's parent is the codex process itself (codex spawns hook
     // commands directly, no shell) — the waiter's liveness anchor AND the
     // exact binary fork children must run.
-    let codex_pid = std::os::unix::process::parent_id();
+    let codex_pid = autofork_core::sys::parent_pid();
     let codex_exe = crate::client::parent_exe();
 
     let mut cmd = Command::new(exe);
@@ -434,16 +434,7 @@ fn spawn_waiter(paths: &Paths, input: &CxInput, cwd: &Path) {
     if let Some(b) = &codex_exe {
         cmd.arg("--codex-bin").arg(b);
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
-    }
+    autofork_core::sys::detach(&mut cmd);
     let _ = cmd.spawn();
 }
 
@@ -613,9 +604,7 @@ pub fn run_waiter(args: WaiterArgs) {
 }
 
 fn codex_alive(pid: u32) -> bool {
-    // kill(pid, 0): 0 or EPERM = alive.
-    let r = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    autofork_core::sys::pid_exists(pid)
 }
 
 fn waiter_loop(paths: &Paths, args: &WaiterArgs) {
@@ -1050,16 +1039,7 @@ fn attempt_run(
         .stderr(Stdio::null());
     // Detach from the controlling terminal (see the claude runner): the
     // run's work survives a closed terminal even when its report cannot.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
-    }
+    autofork_core::sys::detach(&mut cmd);
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -1231,8 +1211,7 @@ fn prepare_cache_copy(paths: &Paths, session: &str, rollout: &Path) -> Option<Pa
     let dst = home.join(&rel);
     std::fs::create_dir_all(dst.parent()?).ok()?;
     std::fs::copy(rollout, &dst).ok()?;
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(real_home.join("auth.json"), home.join("auth.json")).ok()?;
+    autofork_core::sys::link_or_copy(&real_home.join("auth.json"), &home.join("auth.json")).ok()?;
     let _ = std::fs::copy(real_home.join("config.toml"), home.join("config.toml"));
     Some(home)
 }
@@ -1505,7 +1484,7 @@ pub fn codex_home() -> Option<PathBuf> {
     if let Some(h) = std::env::var_os("CODEX_HOME").filter(|v| !v.is_empty()) {
         return Some(PathBuf::from(h));
     }
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".codex"))
+    autofork_core::sys::home_dir().map(|h| h.join(".codex"))
 }
 
 fn hooks_json_path() -> Option<PathBuf> {

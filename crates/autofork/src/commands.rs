@@ -451,10 +451,10 @@ pub fn run_fork(paths: &Paths, name: Option<String>, tag: Option<String>) -> Res
     let user_forks = paths.base.join("forks");
     let claude_dir = std::env::var_os("AUTOFORK_CLAUDE_DIR")
         .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".claude")));
+        .or_else(|| autofork_core::sys::home_dir().map(|h| h.join(".claude")));
     let agents_dir = std::env::var_os("AUTOFORK_AGENTS_DIR")
         .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".agents")));
+        .or_else(|| autofork_core::sys::home_dir().map(|h| h.join(".agents")));
     let (entries, _) = autofork_core::discovery::discover_forks(
         &cwd,
         Some(&user_forks),
@@ -566,7 +566,9 @@ pub fn doctor(paths: &Paths) -> Result<(), String> {
                 exe.display(),
                 env!("CARGO_PKG_VERSION")
             ));
-            let daemon_bin = exe.parent().map(|p| p.join("autofork-daemon"));
+            let daemon_bin = exe
+                .parent()
+                .map(|p| p.join(format!("autofork-daemon{}", autofork_core::sys::EXE_SUFFIX)));
             match daemon_bin {
                 Some(p) if p.is_file() => ok(&format!("daemon binary: {}", p.display())),
                 _ => {
@@ -599,6 +601,22 @@ pub fn doctor(paths: &Paths) -> Result<(), String> {
         },
         Err(_) => {
             println!("  note: daemon not running (it auto-starts on the next hook event)");
+        }
+    }
+
+    // The shell lifecycle hooks run through. On Windows that is Git for
+    // Windows' bash — the same shell Claude Code runs hook commands with —
+    // and without it hook commands fall back to cmd.exe, which no `.md`
+    // hook written for `sh -c` will survive.
+    if cfg!(windows) {
+        let (shell, _) = autofork_core::sys::shell();
+        if autofork_core::sys::shell_is_posix() {
+            ok(&format!("hook shell: {}", shell.display()));
+        } else {
+            println!(
+                "  WARN: no bash.exe found — install Git for Windows (or set \
+                 CLAUDE_CODE_GIT_BASH_PATH); lifecycle hooks will run through cmd.exe"
+            );
         }
     }
 
@@ -665,7 +683,7 @@ pub fn doctor(paths: &Paths) -> Result<(), String> {
 
     // Impostor `fork` agent definitions (a context-less shadow of the built-in
     // type — see the wake payload's own prohibition against creating one).
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let home = autofork_core::sys::home_dir();
     let proot = std::env::current_dir()
         .ok()
         .map(|c| project_root(&c))

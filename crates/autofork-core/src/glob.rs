@@ -28,29 +28,63 @@ use std::path::{Path, PathBuf};
 /// reading a path in the body would get. An already-absolute pattern is left
 /// alone. Only textual normalization happens here: a pattern names files that
 /// do not exist yet, so it can never be canonicalized.
+///
+/// The result is always slash-separated, whatever the platform: a Windows
+/// pattern may be written `C:\\Users\\x\\notes\\**` and is matched against
+/// paths spelled the same way ([`slashes`]).
 pub fn absolutize(pattern: &str, base: &Path, home: Option<&Path>) -> String {
-    let p = pattern.trim();
+    let p = slashes(pattern.trim());
     if let Some(rest) = p.strip_prefix("~/") {
         if let Some(h) = home {
-            return normalize_dots(&h.join(rest).to_string_lossy());
+            return normalize_dots(&slashes(&h.join(rest).to_string_lossy()));
         }
     }
     if p == "~" {
         if let Some(h) = home {
-            return h.to_string_lossy().into_owned();
+            return slashes(&h.to_string_lossy());
         }
     }
-    if p.starts_with('/') {
-        return normalize_dots(p);
+    if is_absolute(&p) {
+        return normalize_dots(&p);
     }
-    normalize_dots(&base.join(p).to_string_lossy())
+    normalize_dots(&slashes(&base.join(&p).to_string_lossy()))
+}
+
+/// A path or pattern with every backslash turned into a slash — the one
+/// spelling the matcher works in. A no-op on Unix, where a backslash in a
+/// file name is legal (and rare enough that a `changed:` pattern will not
+/// carry one).
+pub fn slashes(s: &str) -> String {
+    if cfg!(windows) {
+        s.replace('\\', "/")
+    } else {
+        s.to_string()
+    }
+}
+
+/// Whether a slash-normalized pattern is absolute: a leading `/`, or a
+/// Windows drive (`C:/…`) or UNC (`//server/share`) prefix.
+fn is_absolute(p: &str) -> bool {
+    p.starts_with('/') || drive_prefix(p).is_some()
+}
+
+/// `C:` when `p` starts with a drive letter and a colon.
+fn drive_prefix(p: &str) -> Option<&str> {
+    let b = p.as_bytes();
+    (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':').then(|| &p[..2])
 }
 
 /// Collapse `.` and `..` segments textually (no filesystem access — the
-/// pattern's tail is wildcards, which cannot be canonicalized).
+/// pattern's tail is wildcards, which cannot be canonicalized). A drive
+/// prefix is kept as the first segment (`C:/a/b`), so the result is a path
+/// the platform can open as well as a key the matcher can split.
 fn normalize_dots(path: &str) -> String {
+    let (head, rest) = match drive_prefix(path) {
+        Some(d) => (d.to_string(), &path[2..]),
+        None => (String::new(), path),
+    };
     let mut out: Vec<&str> = Vec::new();
-    for seg in path.split('/') {
+    for seg in rest.split('/') {
         match seg {
             "" | "." => {}
             ".." => {
@@ -65,15 +99,19 @@ fn normalize_dots(path: &str) -> String {
             s => out.push(s),
         }
     }
-    format!("/{}", out.join("/"))
+    format!("{head}/{}", out.join("/"))
 }
 
 /// The deepest directory of `pattern` that contains no wildcard — where a
 /// scan for it should start. A pattern with a wildcard in its first segment
 /// yields `/`.
 pub fn literal_prefix(pattern: &str) -> PathBuf {
+    let (head, rest) = match drive_prefix(pattern) {
+        Some(d) => (d, &pattern[2..]),
+        None => ("", pattern),
+    };
     let mut out: Vec<&str> = Vec::new();
-    for seg in pattern.split('/') {
+    for seg in rest.split('/') {
         if seg.is_empty() {
             continue;
         }
@@ -85,7 +123,7 @@ pub fn literal_prefix(pattern: &str) -> PathBuf {
     // The last literal segment may be the file itself rather than a
     // directory; the caller scans a directory either way, and a scan root
     // that is a file is handled by the scanner (it stats it directly).
-    PathBuf::from(format!("/{}", out.join("/")))
+    PathBuf::from(format!("{head}/{}", out.join("/")))
 }
 
 /// Whether the pattern contains any wildcard at all (a literal pattern is a
@@ -95,11 +133,24 @@ pub fn has_wildcard(s: &str) -> bool {
 }
 
 /// Whether `path` matches `pattern`. Both are treated as absolute,
-/// slash-separated paths.
+/// slash-separated paths; a drive prefix is compared case-insensitively
+/// (Windows spells the same drive `c:` and `C:` depending on who asks).
 pub fn matches(pattern: &str, path: &str) -> bool {
+    let (pd, pattern) = split_drive(pattern);
+    let (sd, path) = split_drive(path);
+    if !pd.eq_ignore_ascii_case(sd) {
+        return false;
+    }
     let pat: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();
     let seg: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     match_segments(&pat, &seg)
+}
+
+fn split_drive(p: &str) -> (&str, &str) {
+    match drive_prefix(p) {
+        Some(d) => (d, &p[2..]),
+        None => ("", p),
+    }
 }
 
 fn match_segments(pat: &[&str], seg: &[&str]) -> bool {
@@ -208,6 +259,31 @@ mod tests {
             absolutize("./a/../b/*.md", Path::new("/proj"), Some(&home)),
             "/proj/b/*.md"
         );
+    }
+
+    #[test]
+    fn windows_spellings_normalize_to_slashes() {
+        // Drive-prefixed patterns are absolute on every platform (the
+        // matcher is pure text), and backslashes only fold on Windows.
+        assert!(is_absolute("C:/Users/x"));
+        assert!(is_absolute("//server/share/x"));
+        assert!(!is_absolute("docs/*.md"));
+        assert_eq!(normalize_dots("C:/Users/x/./a/../b"), "C:/Users/x/b");
+        assert_eq!(
+            literal_prefix("C:/Users/x/**/*.md"),
+            PathBuf::from("C:/Users/x")
+        );
+        assert!(matches("C:/Users/x/**/*.md", "c:/Users/x/a/b.md"));
+        assert!(!matches("C:/Users/x/**/*.md", "D:/Users/x/a/b.md"));
+        if cfg!(windows) {
+            assert_eq!(slashes(r"C:\a\b"), "C:/a/b");
+            assert_eq!(
+                absolutize(r"C:\Users\x\notes\**", Path::new("C:/proj"), None),
+                "C:/Users/x/notes/**"
+            );
+        } else {
+            assert_eq!(slashes(r"a\b"), r"a\b");
+        }
     }
 
     #[test]

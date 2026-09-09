@@ -121,16 +121,7 @@ pub fn spawn_end_runner(daemon: &Arc<Daemon>, row: &SessionRow, specs: &[WakeFor
     if let Some(bin) = row.harness.as_ref().and_then(|h| h.bin.as_deref()) {
         cmd.arg("--bin").arg(bin);
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
-    }
+    autofork_core::sys::detach(&mut cmd);
     match cmd.spawn() {
         Ok(child) => tracing::info!(
             session = %row.session_id,
@@ -151,10 +142,10 @@ fn cli_binary() -> Option<PathBuf> {
     if let Some(over) = std::env::var_os("AUTOFORK_FINAL_RUNNER_BIN") {
         return Some(PathBuf::from(over));
     }
-    if let Some(sibling) = std::env::current_exe()
-        .ok()
-        .and_then(|e| e.parent().map(|p| p.join("autofork")))
-    {
+    if let Some(sibling) = std::env::current_exe().ok().and_then(|e| {
+        e.parent()
+            .map(|p| p.join(format!("autofork{}", autofork_core::sys::EXE_SUFFIX)))
+    }) {
         if sibling.is_file() {
             return Some(sibling);
         }

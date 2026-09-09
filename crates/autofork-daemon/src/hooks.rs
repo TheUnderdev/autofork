@@ -178,7 +178,8 @@ pub fn idle_hook_deadlines(entries: &[HookEntry], default_secs: u64) -> Vec<(Hoo
     out
 }
 
-/// Run one hook command: `sh -c <command>` in the session's cwd, context in
+/// Run one hook command: `sh -c <command>` (the platform shell — see
+/// `autofork_core::sys::shell`) in the session's cwd, context in
 /// `AUTOFORK_*` env vars, killed after the hook's timeout. A hook with no
 /// `deliver:` is fire-and-forget — output goes to the daemon log, a failure
 /// is logged and otherwise inert, and hooks can never break scheduling.
@@ -234,7 +235,7 @@ pub fn execute(
     } else if ctx.project_root.is_dir() {
         ctx.project_root.clone()
     } else {
-        PathBuf::from("/")
+        autofork_core::sys::root_fallback_dir()
     };
     let mut env: Vec<(String, String)> = vec![
         ("AUTOFORK_HOOK_NAME".into(), hook.clone()),
@@ -268,8 +269,9 @@ pub fn execute(
     tracing::info!(hook = %hook, event = %event_name, session = %session, "running lifecycle hook");
     tokio::spawn(async move {
         let _inflight = inflight;
-        let mut cmd = tokio::process::Command::new("/bin/sh");
-        cmd.arg("-c")
+        let (shell, shell_args) = autofork_core::sys::shell();
+        let mut cmd = tokio::process::Command::new(shell);
+        cmd.args(shell_args)
             .arg(&command)
             .current_dir(&cwd)
             .envs(env)

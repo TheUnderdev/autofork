@@ -221,10 +221,10 @@ fn run_hook_inner(kind: OcHookKind) -> Option<()> {
             // reparented; exit then, dropping the poll so the daemon's
             // poll-loss grace-close fires. Covers crashes and exits that
             // never reach the plugin's dispose hook.
-            let ppid0 = std::os::unix::process::parent_id();
+            let ppid0 = autofork_core::sys::parent_pid();
             std::thread::spawn(move || loop {
                 std::thread::sleep(Duration::from_secs(5));
-                if std::os::unix::process::parent_id() != ppid0 {
+                if autofork_core::sys::parent_pid() != ppid0 {
                     std::process::exit(0);
                 }
             });
@@ -342,7 +342,7 @@ pub fn opencode_config_dir() -> Option<PathBuf> {
 }
 
 fn dirs_home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    autofork_core::sys::home_dir()
 }
 
 /// Where the plugin gets installed.

@@ -247,7 +247,7 @@ impl Daemon {
         if let Some(dir) = std::env::var_os("AUTOFORK_CLAUDE_DIR") {
             return Some(PathBuf::from(dir));
         }
-        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude"))
+        autofork_core::sys::home_dir().map(|h| h.join(".claude"))
     }
 
     /// The user-level `.agents` dir (codex's native skills location; often a
@@ -256,7 +256,7 @@ impl Daemon {
         if let Some(dir) = std::env::var_os("AUTOFORK_AGENTS_DIR") {
             return Some(PathBuf::from(dir));
         }
-        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".agents"))
+        autofork_core::sys::home_dir().map(|h| h.join(".agents"))
     }
 
     /// Effective config for a project.

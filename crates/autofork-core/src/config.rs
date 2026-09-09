@@ -453,7 +453,7 @@ pub fn autofork_home_from_env() -> Option<PathBuf> {
             return Some(dir);
         }
     }
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".autofork"))
+    crate::sys::home_dir().map(|h| h.join(".autofork"))
 }
 
 /// The daemon's home base: `~/.autofork`.
@@ -462,6 +462,7 @@ pub fn autofork_home(home: &Path) -> PathBuf {
 }
 
 /// Paths under the autofork base dir (`~/.autofork` or `$AUTOFORK_HOME`).
+#[derive(Debug, Clone)]
 pub struct Paths {
     pub base: PathBuf,
 }
@@ -479,6 +480,9 @@ impl Paths {
     /// The daemon socket path: `$AUTOFORK_SOCKET` override, else
     /// `$XDG_RUNTIME_DIR/autofork.sock` when set (kept short — the platform
     /// caps `sun_path` around 100 bytes), else `<base>/run/daemon.sock`.
+    ///
+    /// On Windows there is no socket file: this path is only the *identity*
+    /// the named pipe's name is derived from — see [`Paths::pipe_name`].
     pub fn socket(&self) -> PathBuf {
         if let Some(p) = std::env::var_os("AUTOFORK_SOCKET") {
             let p = PathBuf::from(p);
@@ -495,7 +499,16 @@ impl Paths {
         self.base.join("run/daemon.sock")
     }
 
-    /// Held (flocked) by the daemon for its whole life; acquirable = dead.
+    /// The daemon's named-pipe endpoint on Windows: `\\.\pipe\autofork-<hash>`,
+    /// keyed on the socket path so two bases (a test's `AUTOFORK_HOME`, the
+    /// real one) never share a pipe, and so the same base always yields the
+    /// same name for the CLI to open.
+    pub fn pipe_name(&self) -> String {
+        let key = self.socket().to_string_lossy().to_lowercase();
+        format!(r"\\.\pipe\autofork-{:016x}", crate::sys::fnv1a64(&key))
+    }
+
+    /// Held (locked) by the daemon for its whole life; acquirable = dead.
     pub fn daemon_lock(&self) -> PathBuf {
         self.base.join("run/daemon.lock")
     }

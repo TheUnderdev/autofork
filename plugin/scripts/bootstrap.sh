@@ -22,22 +22,31 @@ if [ -z "$WANT" ]; then
     exit 0
 fi
 
+OS=$(uname -s)
+ARCH=$(uname -m)
+# Windows (Git Bash / MSYS): binaries carry .exe, and `uname -s` reads
+# MINGW64_NT-10.0-… or MSYS_NT-…
+case "$OS" in
+    MINGW* | MSYS* | CYGWIN*) EXE=".exe" ;;
+    *) EXE="" ;;
+esac
+
 HAVE=""
-if [ -x "$DATA/bin/autofork" ]; then
-    HAVE=$("$DATA/bin/autofork" --version 2>/dev/null | awk '{print $2}')
+if [ -x "$DATA/bin/autofork$EXE" ]; then
+    HAVE=$("$DATA/bin/autofork$EXE" --version 2>/dev/null | awk '{print $2}')
 fi
 if [ "$HAVE" = "$WANT" ]; then
     exit 0
 fi
 echo "autofork bootstrap: want v$WANT, have '${HAVE:-none}'"
 
-OS=$(uname -s)
-ARCH=$(uname -m)
 case "$OS-$ARCH" in
     Darwin-arm64) TARGET="aarch64-apple-darwin" ;;
     Darwin-x86_64) TARGET="x86_64-apple-darwin" ;;
     Linux-x86_64) TARGET="x86_64-unknown-linux-musl" ;;
     Linux-aarch64 | Linux-arm64) TARGET="aarch64-unknown-linux-musl" ;;
+    MINGW*-x86_64 | MSYS*-x86_64 | CYGWIN*-x86_64) TARGET="x86_64-pc-windows-gnu" ;;
+    MINGW*-aarch64 | MSYS*-aarch64 | MINGW*-arm64 | MSYS*-arm64) TARGET="aarch64-pc-windows-gnullvm" ;;
     *) TARGET="" ;;
 esac
 
@@ -48,8 +57,8 @@ mkdir -p "$TMP"
 install_bins() {
     # $1 = dir holding new autofork + autofork-daemon
     mkdir -p "$DATA/bin.new"
-    cp "$1/autofork" "$1/autofork-daemon" "$DATA/bin.new/" || return 1
-    chmod +x "$DATA/bin.new/autofork" "$DATA/bin.new/autofork-daemon"
+    cp "$1/autofork$EXE" "$1/autofork-daemon$EXE" "$DATA/bin.new/" || return 1
+    chmod +x "$DATA/bin.new/autofork$EXE" "$DATA/bin.new/autofork-daemon$EXE"
     rm -rf "$DATA/bin.old"
     if [ -d "$DATA/bin" ]; then
         mv "$DATA/bin" "$DATA/bin.old"

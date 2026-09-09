@@ -1,8 +1,10 @@
-//! Unix-socket JSONL server: one request line in, one response line out.
+//! JSONL server over the daemon endpoint (a Unix socket, or a named pipe on
+//! Windows — see `ipc`): one request line in, one response line out.
 //! A `StopWait` request may block for a long time (the asyncRewake Stop hook's
 //! long poll) before its single response is written.
 
 use crate::daemon::Daemon;
+use crate::ipc::{Listener, Stream};
 use autofork_core::protocol::{
     encode, CloseInfo, ErrorCode, ForkInfo, Request, RequestBody, Response, ResponseBody, RunInfo,
     SessionInfo, StatusInfo,
@@ -10,15 +12,14 @@ use autofork_core::protocol::{
 use autofork_core::PROTO_VERSION;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
-pub async fn serve(daemon: Arc<Daemon>, listener: UnixListener) {
+pub async fn serve(daemon: Arc<Daemon>, mut listener: Listener) {
     loop {
         tokio::select! {
             _ = daemon.shutdown.notified() => return,
             accepted = listener.accept() => {
-                let Ok((stream, _)) = accepted else { continue };
+                let Ok(stream) = accepted else { continue };
                 let daemon = daemon.clone();
                 tokio::spawn(async move {
                     daemon.connections.fetch_add(1, Ordering::SeqCst);
@@ -32,8 +33,8 @@ pub async fn serve(daemon: Arc<Daemon>, listener: UnixListener) {
     }
 }
 
-async fn handle_conn(daemon: &Arc<Daemon>, stream: UnixStream) {
-    let (read, mut write) = stream.into_split();
+async fn handle_conn<S: Stream>(daemon: &Arc<Daemon>, stream: S) {
+    let (read, mut write) = tokio::io::split(stream);
     let mut lines = BufReader::new(read).lines();
     loop {
         let line = match lines.next_line().await {
@@ -117,8 +118,8 @@ async fn handle_conn(daemon: &Arc<Daemon>, stream: UnixStream) {
     }
 }
 
-async fn write_body(
-    write: &mut tokio::net::unix::OwnedWriteHalf,
+async fn write_body<W: AsyncWrite + Unpin>(
+    write: &mut W,
     id: u64,
     body: ResponseBody,
 ) -> std::io::Result<()> {

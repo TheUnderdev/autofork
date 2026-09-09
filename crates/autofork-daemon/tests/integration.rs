@@ -1,3 +1,8 @@
+//! Unix-only: these drive the binaries with `/bin/sh` stub scripts and
+//! mock the daemon on a Unix socket. The cross-platform end-to-end check is
+//! `roundtrip.rs`.
+#![cfg(unix)]
+
 //! End-to-end daemon tests: spawn the real daemon binary and drive it over the
 //! unix socket with protocol frames. v0.5 forks are never subprocesses — the
 //! daemon answers a parked `StopWait` long poll with a wake payload — so these

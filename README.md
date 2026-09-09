@@ -56,6 +56,13 @@ interactive sessions:
 
 `autofork doctor` checks your `claude --version` against these thresholds.
 
+autofork runs on **macOS, Linux and native Windows** (since v0.27). On Windows it needs
+[Git for Windows](https://gitforwindows.org/): Claude Code runs hook commands through its `bash.exe`
+when it is installed, the plugin's hook shims are shell scripts, and lifecycle hooks / feeds run
+through the same shell. Without it the plugin never fires and hook commands would fall back to
+`cmd.exe`. `autofork doctor` reports which shell it found. WSL is not needed — a WSL session is
+a Linux machine as far as autofork is concerned, and works as such.
+
 ### If wakes report the fork type unavailable
 
 Even on a fully current version a wake can report **`Agent type 'fork' not found`** — the fork
@@ -91,7 +98,12 @@ From the plugin marketplace:
 
 On first use a bootstrap step downloads the prebuilt binary for your platform from GitHub
 Releases into the plugin's persistent data directory (or builds it with `cargo` if no artifact
-matches). macOS (arm64/x64) and Linux (x64/arm64) are covered.
+matches). macOS (arm64/x64), Linux (x64/arm64) and Windows (x64/arm64) are covered.
+
+On Windows the daemon listens on a named pipe (`\\.\pipe\autofork-…`) instead of a Unix socket,
+its state lives under `%USERPROFILE%\.autofork`, and everything else — fork definitions, hooks,
+feeds, the CLI — is the same. The one thing to keep in mind when writing hook commands there is
+that they run under Git Bash, so write them as you would for `sh -c`.
 
 For local development: `claude --plugin-dir ./plugin` inside this repo.
 

@@ -1,3 +1,8 @@
+//! Unix-only: these drive the binaries with `/bin/sh` stub scripts and
+//! mock the daemon on a Unix socket. The cross-platform end-to-end check is
+//! `roundtrip.rs`.
+#![cfg(unix)]
+
 //! CLI hook-path tests for `autofork hook <event>`.
 //!
 //! The stop-wait long poll is exercised against a *mock* daemon socket (so we

@@ -1,0 +1,61 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt + clippy + shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: shellcheck plugin/scripts/*.sh
+      - run: make version-check
+
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Windows: clippy runs here too — the platform layer has bodies only
+      # this target compiles, and the Linux job never sees them.
+      - if: runner.os == 'Windows'
+        run: rustup component add clippy && cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      # The plugin's shell shims must run under Git Bash on Windows: that is
+      # the shell Claude Code invokes hook commands through there.
+      - if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -eu
+          export CLAUDE_PLUGIN_ROOT="$PWD/plugin"
+          export CLAUDE_PLUGIN_DATA="$RUNNER_TEMP/autofork-data"
+          mkdir -p "$CLAUDE_PLUGIN_DATA/bin"
+          cp target/debug/autofork.exe target/debug/autofork-daemon.exe "$CLAUDE_PLUGIN_DATA/bin/"
+          export AUTOFORK_HOME="$RUNNER_TEMP/autofork-home"
+          export AUTOFORK_CLAUDE_DIR="$AUTOFORK_HOME/claude"
+          export AUTOFORK_AGENTS_DIR="$AUTOFORK_HOME/agents"
+          mkdir -p "$AUTOFORK_HOME"
+          printf '{"session_id":"cishim01","cwd":"%s","hook_event_name":"SessionStart","source":"startup"}' "$(cygpath -w "$PWD" | sed 's/\\/\\\\/g')" \
+            | sh plugin/scripts/autofork-hook.sh session-start
+          "$CLAUDE_PLUGIN_DATA/bin/autofork.exe" status | tee status.txt
+          grep -q cishim01 status.txt
+          "$CLAUDE_PLUGIN_DATA/bin/autofork.exe" doctor || true
+          "$CLAUDE_PLUGIN_DATA/bin/autofork.exe" stop-daemon
