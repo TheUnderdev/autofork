@@ -413,13 +413,20 @@ pub struct HookEntry {
 /// (including `dir` itself), nearest first, then `user_hooks_root`
 /// (`~/.autofork/hooks`) if not already among them.
 pub fn hook_roots(dir: &Path, user_hooks_root: Option<&Path>) -> Vec<PathBuf> {
-    let mut roots = Vec::new();
+    let mut roots: Vec<PathBuf> = Vec::new();
     let start = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     let mut cur = Some(start.as_path());
+    // Roots are deduped by canonical path — `d` is canonical, but the
+    // `hooks` dir itself may be a symlink (or a Windows junction) to a tree
+    // that is also the user root, and the same directory reached two ways
+    // must count once or every hook in it is discovered twice.
     while let Some(d) = cur {
         let candidate = d.join(".autofork").join("hooks");
         if candidate.is_dir() {
-            roots.push(candidate);
+            let c = candidate.canonicalize().unwrap_or(candidate);
+            if !roots.contains(&c) {
+                roots.push(c);
+            }
         }
         cur = d.parent();
     }
@@ -528,6 +535,32 @@ fn scan_hooks_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A user hooks dir that is a symlink to a project's `.autofork/hooks`
+    /// (or the reverse) is one root, not two: the same file must never be
+    /// discovered twice under one name.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_hooks_dir_is_one_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let real = base.join("cfg").join("hooks");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(
+            real.join("lease.md"),
+            "---\nhook: true\non: [session_start]\ncommand: true\n---\n",
+        )
+        .unwrap();
+        // The project reaches the same directory through a symlink.
+        let proj = base.join("proj");
+        std::fs::create_dir_all(proj.join(".autofork")).unwrap();
+        std::os::unix::fs::symlink(&real, proj.join(".autofork/hooks")).unwrap();
+        let roots = hook_roots(&proj, Some(&real));
+        assert_eq!(roots, vec![real.clone()], "one root: {roots:?}");
+        let (entries, warnings) = discover_hooks(&proj, Some(&real));
+        assert_eq!(entries.len(), 1, "one hook: {entries:?}");
+        assert!(warnings.is_empty(), "no shadow warning: {warnings:?}");
+    }
     use std::fs;
 
     fn parse(content: &str) -> ParsedHook {

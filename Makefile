@@ -4,15 +4,24 @@ LINUX_TARGETS := x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 WIN_TARGETS   := x86_64-pc-windows-gnu aarch64-pc-windows-gnullvm
 DIST          := dist
 
-.PHONY: check fmt clippy test shellcheck version-check build dist release clean
+.PHONY: check fmt clippy clippy-windows test shellcheck version-check build dist release clean
 
-check: fmt clippy test shellcheck version-check
+check: fmt clippy clippy-windows test shellcheck version-check
 
 fmt:
 	cargo fmt --check
 
 clippy:
 	cargo clippy --workspace --all-targets -- -D warnings
+
+# The platform layer has Windows-only bodies a host clippy never sees; lint
+# them through zig's cross C toolchain (skipped when cargo-zigbuild is absent
+# — CI's windows job is the backstop).
+clippy-windows:
+	@if command -v cargo-zigbuild >/dev/null; then \
+		rustup target add x86_64-pc-windows-gnu >/dev/null 2>&1; \
+		cargo-zigbuild clippy --target x86_64-pc-windows-gnu --workspace --all-targets -- -D warnings; \
+	else echo "clippy-windows: cargo-zigbuild not found, skipping"; fi
 
 test:
 	cargo test --workspace

@@ -425,7 +425,7 @@ mod win {
         let mut user: FILETIME = unsafe { std::mem::zeroed() };
         let ok =
             unsafe { GetProcessTimes(p.0, &mut created, &mut exited, &mut kernel, &mut user) != 0 };
-        ok.then(|| ((created.dwHighDateTime as i64) << 32) | created.dwLowDateTime as i64)
+        ok.then_some(((created.dwHighDateTime as i64) << 32) | created.dwLowDateTime as i64)
     }
 
     pub fn exe_path(pid: u32) -> Option<PathBuf> {
@@ -499,7 +499,7 @@ mod win {
         }
         let roots = ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"]
             .iter()
-            .filter_map(|v| std::env::var_os(v))
+            .filter_map(std::env::var_os)
             .map(|v| PathBuf::from(v).join("Git"))
             .chain(
                 std::env::var_os("LOCALAPPDATA")
