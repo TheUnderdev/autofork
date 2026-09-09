@@ -421,10 +421,7 @@ fn spawn_waiter(paths: &Paths, input: &CxInput, cwd: &Path) {
         .arg("--codex-pid")
         .arg(codex_pid.to_string())
         .arg("--cwd")
-        .arg(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(log2));
+        .arg(cwd);
     if let Some(m) = &input.model {
         cmd.arg("--model").arg(m);
     }
@@ -434,8 +431,7 @@ fn spawn_waiter(paths: &Paths, input: &CxInput, cwd: &Path) {
     if let Some(b) = &codex_exe {
         cmd.arg("--codex-bin").arg(b);
     }
-    autofork_core::sys::detach(&mut cmd);
-    let _ = cmd.spawn();
+    let _ = autofork_core::sys::spawn_detached(&mut cmd, log, log2);
 }
 
 // ---------------------------------------------------------------------------

@@ -267,6 +267,38 @@ pub fn detach(cmd: &mut Command) {
     }
 }
 
+/// Spawn `cmd` as a detached process whose stdin is null and whose stdout
+/// and stderr are `stdout`/`stderr` — and, on Windows, whose handle table
+/// holds exactly those three handles and nothing the spawner inherited.
+///
+/// [`detach`] covers the spawner's *own* stdio, but Windows inherits every
+/// inheritable handle, including ones the spawner itself inherited: the pipes
+/// of the Claude Code (or ssh, or desktop-app) session several ancestors up
+/// leak into a daemon that lives for hours, and whoever waits on those pipes
+/// waits for the daemon. `CreateProcessW` with a `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`
+/// is the one way to say "these three, no others". The `Command` is used for
+/// its program, arguments, working directory and environment overrides.
+///
+/// Returns the child's pid.
+pub fn spawn_detached(
+    cmd: &mut Command,
+    stdout: std::fs::File,
+    stderr: std::fs::File,
+) -> std::io::Result<u32> {
+    #[cfg(unix)]
+    {
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::from(stdout))
+            .stderr(std::process::Stdio::from(stderr));
+        detach(cmd);
+        Ok(cmd.spawn()?.id())
+    }
+    #[cfg(windows)]
+    {
+        win::spawn_with_handle_list(cmd, stdout, stderr)
+    }
+}
+
 /// The program and leading arguments that run a shell command string:
 /// `/bin/sh -c` on Unix; on Windows the Git for Windows `bash.exe` (the
 /// shell Claude Code itself runs hook commands through there), and
@@ -437,8 +469,11 @@ mod win {
         TH32CS_SNAPPROCESS,
     };
     use windows_sys::Win32::System::Threading::{
-        GetExitCodeProcess, GetProcessTimes, OpenProcess, QueryFullProcessImageNameW,
-        PROCESS_QUERY_LIMITED_INFORMATION,
+        CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess, GetProcessTimes,
+        InitializeProcThreadAttributeList, OpenProcess, QueryFullProcessImageNameW,
+        UpdateProcThreadAttribute, EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST,
+        PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+        STARTF_USESTDHANDLES, STARTUPINFOEXW,
     };
     use windows_sys::Win32::System::IO::OVERLAPPED;
 
@@ -531,6 +566,185 @@ mod win {
                 SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
             }
         }
+    }
+
+    /// `CreateProcessW` with an explicit handle list — see
+    /// [`super::spawn_detached`].
+    pub fn spawn_with_handle_list(
+        cmd: &mut std::process::Command,
+        stdout: std::fs::File,
+        stderr: std::fs::File,
+    ) -> std::io::Result<u32> {
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::CloseHandle;
+
+        let stdin = std::fs::File::open("NUL")?;
+        let handles: [HANDLE; 3] = [
+            stdin.as_raw_handle() as HANDLE,
+            stdout.as_raw_handle() as HANDLE,
+            stderr.as_raw_handle() as HANDLE,
+        ];
+        for h in handles {
+            unsafe {
+                SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+            }
+        }
+
+        // The command line, quoted the way CommandLineToArgvW unquotes.
+        let program = cmd.get_program().to_os_string();
+        let mut line = String::new();
+        quote_arg(&mut line, &program);
+        for a in cmd.get_args() {
+            line.push(' ');
+            quote_arg(&mut line, a);
+        }
+        let mut line_w: Vec<u16> = OsStr::new(&line).encode_wide().chain([0]).collect();
+        let program_w: Vec<u16> = program.encode_wide().chain([0]).collect();
+
+        // Environment: inherit ours plus the Command's overrides, as one
+        // NUL-separated UTF-16 block — or NULL when there is nothing to add.
+        let env_block: Option<Vec<u16>> = {
+            let overrides: Vec<_> = cmd.get_envs().collect();
+            if overrides.is_empty() {
+                None
+            } else {
+                let mut vars: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> =
+                    std::env::vars_os().collect();
+                for (k, v) in overrides {
+                    match v {
+                        Some(v) => {
+                            vars.insert(k.to_os_string(), v.to_os_string());
+                        }
+                        None => {
+                            vars.remove(k);
+                        }
+                    }
+                }
+                let mut block: Vec<u16> = Vec::new();
+                for (k, v) in vars {
+                    block.extend(k.encode_wide());
+                    block.push('=' as u16);
+                    block.extend(v.encode_wide());
+                    block.push(0);
+                }
+                block.push(0);
+                Some(block)
+            }
+        };
+        let cwd_w: Option<Vec<u16>> = cmd
+            .get_current_dir()
+            .map(|d| d.as_os_str().encode_wide().chain([0]).collect());
+
+        // The attribute list that names the inheritable handles.
+        let mut size: usize = 0;
+        unsafe {
+            InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut size);
+        }
+        let mut attr_buf = vec![0u8; size.max(1)];
+        let attrs: LPPROC_THREAD_ATTRIBUTE_LIST = attr_buf.as_mut_ptr() as *mut _;
+        if unsafe { InitializeProcThreadAttributeList(attrs, 1, 0, &mut size) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        struct Attrs(LPPROC_THREAD_ATTRIBUTE_LIST);
+        impl Drop for Attrs {
+            fn drop(&mut self) {
+                unsafe { DeleteProcThreadAttributeList(self.0) }
+            }
+        }
+        let attrs = Attrs(attrs);
+        if unsafe {
+            UpdateProcThreadAttribute(
+                attrs.0,
+                0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                handles.as_ptr() as *const std::ffi::c_void,
+                std::mem::size_of_val(&handles),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let mut si: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
+        si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+        si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        si.StartupInfo.hStdInput = handles[0];
+        si.StartupInfo.hStdOutput = handles[1];
+        si.StartupInfo.hStdError = handles[2];
+        si.lpAttributeList = attrs.0;
+        let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+        let flags = EXTENDED_STARTUPINFO_PRESENT
+            | DETACHED_PROCESS
+            | CREATE_NEW_PROCESS_GROUP
+            | windows_sys::Win32::System::Threading::CREATE_UNICODE_ENVIRONMENT;
+        let ok = unsafe {
+            CreateProcessW(
+                program_w.as_ptr(),
+                line_w.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                1,
+                flags,
+                env_block
+                    .as_ref()
+                    .map(|b| b.as_ptr() as *const std::ffi::c_void)
+                    .unwrap_or(std::ptr::null()),
+                cwd_w
+                    .as_ref()
+                    .map(|c| c.as_ptr())
+                    .unwrap_or(std::ptr::null()),
+                &si.StartupInfo,
+                &mut pi,
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        unsafe {
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+        }
+        Ok(pi.dwProcessId)
+    }
+
+    /// Append one argument to a Windows command line, quoted per the
+    /// `CommandLineToArgvW` rules (the same ones std uses).
+    fn quote_arg(line: &mut String, arg: &std::ffi::OsStr) {
+        let s = arg.to_string_lossy();
+        let needs_quotes = s.is_empty() || s.chars().any(|c| c == ' ' || c == '\t' || c == '"');
+        if !needs_quotes {
+            line.push_str(&s);
+            return;
+        }
+        line.push('"');
+        let mut backslashes = 0;
+        for c in s.chars() {
+            match c {
+                '\\' => backslashes += 1,
+                '"' => {
+                    // Backslashes before a quote are doubled, then the quote
+                    // itself is escaped.
+                    line.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+                    line.push('"');
+                    backslashes = 0;
+                    continue;
+                }
+                _ => {
+                    line.extend(std::iter::repeat_n('\\', backslashes));
+                    backslashes = 0;
+                }
+            }
+            if c != '\\' {
+                line.push(c);
+            }
+        }
+        // Trailing backslashes before the closing quote are doubled.
+        line.extend(std::iter::repeat_n('\\', backslashes * 2));
+        line.push('"');
     }
 
     pub fn try_lock(file: &std::fs::File) -> bool {
@@ -694,6 +908,37 @@ mod tests {
             try_lock_file(&path).is_some(),
             "released when the holder exits"
         );
+    }
+
+    #[test]
+    fn spawn_detached_runs_a_child_with_only_its_own_stdio() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out_path = tmp.path().join("out.log");
+        let out = std::fs::File::create(&out_path).unwrap();
+        let err = out.try_clone().unwrap();
+        let mut cmd = if cfg!(windows) {
+            let mut c = Command::new("cmd");
+            c.args(["/C", "echo detached hello"]);
+            c
+        } else {
+            let mut c = Command::new("sh");
+            c.args(["-c", "echo detached hello"]);
+            c
+        };
+        let pid = spawn_detached(&mut cmd, out, err).expect("spawn");
+        assert!(pid > 0);
+        let start = std::time::Instant::now();
+        loop {
+            let s = std::fs::read_to_string(&out_path).unwrap_or_default();
+            if s.contains("detached hello") {
+                break;
+            }
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(10),
+                "child never wrote to its stdout: {s:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 
     #[test]

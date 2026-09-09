@@ -472,10 +472,7 @@ pub fn spawn_final_runner(
         .arg("--cwd")
         .arg(cwd)
         .arg("--specs")
-        .arg(&specs_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(log2));
+        .arg(&specs_path);
     if let Some(m) = parent_model {
         cmd.arg("--model").arg(m);
     }
@@ -485,8 +482,7 @@ pub fn spawn_final_runner(
     if let Some(b) = harness_bin {
         cmd.arg("--bin").arg(b);
     }
-    autofork_core::sys::detach(&mut cmd);
-    let _ = cmd.spawn();
+    let _ = autofork_core::sys::spawn_detached(&mut cmd, log, log2);
 }
 
 /// `autofork final-run`: execute a flush-on-close batch after the parent

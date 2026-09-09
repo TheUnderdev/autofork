@@ -103,6 +103,56 @@ fn daemon_binary_present() -> bool {
         .unwrap_or(false)
 }
 
+/// The daemon is spawned by a hook that is itself several processes below
+/// the session (Claude Code → shell → hook). On Windows every inheritable
+/// handle travels down that chain, so a daemon spawned naively would hold
+/// the session's pipes for its whole life. Run `status` through a shell
+/// wrapper with a piped stdout: if the daemon inherits that pipe, this
+/// `wait_with_output` never returns.
+#[test]
+fn daemon_spawned_through_a_wrapper_does_not_hold_its_pipes() {
+    if !daemon_binary_present() {
+        eprintln!("skipping: autofork-daemon binary not built next to the CLI");
+        return;
+    }
+    let env = Env::new();
+    let cli = env!("CARGO_BIN_EXE_autofork");
+    let mut wrapper = if cfg!(windows) {
+        let mut c = Command::new("cmd");
+        c.args(["/C", &format!("\"{cli}\" status")]);
+        c
+    } else {
+        let mut c = Command::new("sh");
+        c.args(["-c", &format!("'{cli}' status")]);
+        c
+    };
+    wrapper
+        .env("AUTOFORK_HOME", &env.home)
+        .env("AUTOFORK_SOCKET", &env.socket)
+        .env("AUTOFORK_CLAUDE_DIR", env.home.join("claude"))
+        .env("AUTOFORK_AGENTS_DIR", env.home.join("agents"))
+        .current_dir(&env.project)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = wrapper.spawn().unwrap();
+    // A watchdog turns a leak into a failure instead of a hung test run.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    let out = rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the wrapper's stdout never closed: the daemon inherited the pipe")
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("autofork daemon v"));
+}
+
 #[test]
 fn cli_spawns_daemon_registers_a_session_and_retires_it() {
     if !daemon_binary_present() {

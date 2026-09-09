@@ -20,7 +20,7 @@ use crate::daemon::Daemon;
 use autofork_core::protocol::WakeFork;
 use autofork_core::store::SessionRow;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::Arc;
 
 /// Whether a close of this kind should flush. Everything the client itself
@@ -109,10 +109,7 @@ pub fn spawn_end_runner(daemon: &Arc<Daemon>, row: &SessionRow, specs: &[WakeFor
         .arg("--cwd")
         .arg(&row.cwd)
         .arg("--specs")
-        .arg(&specs_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(log2));
+        .arg(&specs_path);
     if let Some(model) = row.model.as_deref() {
         cmd.arg("--model").arg(model);
     }
@@ -121,11 +118,10 @@ pub fn spawn_end_runner(daemon: &Arc<Daemon>, row: &SessionRow, specs: &[WakeFor
     if let Some(bin) = row.harness.as_ref().and_then(|h| h.bin.as_deref()) {
         cmd.arg("--bin").arg(bin);
     }
-    autofork_core::sys::detach(&mut cmd);
-    match cmd.spawn() {
-        Ok(child) => tracing::info!(
+    match autofork_core::sys::spawn_detached(&mut cmd, log, log2) {
+        Ok(pid) => tracing::info!(
             session = %row.session_id,
-            pid = child.id(),
+            pid,
             forks = ?specs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
             "flush-on-close: daemon spawned the end-runner"
         ),

@@ -213,13 +213,10 @@ fn spawn_daemon_locked(paths: &Paths, deadline: Instant) -> Result<(), ClientErr
         .open(&log_path)?;
     let log2 = log.try_clone()?;
 
+    // Detached, with nothing of ours inherited, so it outlives the hook
+    // process without holding the session's pipes open.
     let mut cmd = std::process::Command::new(bin);
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::from(log))
-        .stderr(std::process::Stdio::from(log2));
-    // Detach so it outlives the hook process.
-    sys::detach(&mut cmd);
-    cmd.spawn()?;
+    sys::spawn_detached(&mut cmd, log, log2)?;
     Ok(())
 }
 
