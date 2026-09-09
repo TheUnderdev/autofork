@@ -117,11 +117,16 @@ fn daemon_spawned_through_a_wrapper_does_not_hold_its_pipes() {
     }
     let env = Env::new();
     let cli = env!("CARGO_BIN_EXE_autofork");
-    let mut wrapper = if cfg!(windows) {
+    #[cfg(windows)]
+    let mut wrapper = {
+        use std::os::windows::process::CommandExt;
         let mut c = Command::new("cmd");
-        c.args(["/C", &format!("\"{cli}\" status")]);
+        // cmd wants the payload verbatim; Rust's quoting would wrap it again.
+        c.arg("/C").raw_arg(format!("\"{cli}\" status"));
         c
-    } else {
+    };
+    #[cfg(not(windows))]
+    let mut wrapper = {
         let mut c = Command::new("sh");
         c.args(["-c", &format!("'{cli}' status")]);
         c
