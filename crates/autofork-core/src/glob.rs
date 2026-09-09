@@ -51,15 +51,31 @@ pub fn absolutize(pattern: &str, base: &Path, home: Option<&Path>) -> String {
 }
 
 /// A path or pattern with every backslash turned into a slash — the one
-/// spelling the matcher works in. A no-op on Unix, where a backslash in a
-/// file name is legal (and rare enough that a `changed:` pattern will not
-/// carry one).
+/// spelling the matcher works in — and Windows' verbatim prefix folded away
+/// (`std::fs::canonicalize` returns `\\?\C:\…`, which is the same place as
+/// `C:\…` and must match the same patterns). A no-op on Unix, where a
+/// backslash in a file name is legal (and rare enough that a `changed:`
+/// pattern will not carry one).
 pub fn slashes(s: &str) -> String {
     if cfg!(windows) {
-        s.replace('\\', "/")
+        fold_windows(s)
     } else {
         s.to_string()
     }
+}
+
+/// The Windows spelling rules, applied unconditionally (so they can be
+/// tested on every platform): backslashes become slashes; `//?/C:/…`
+/// becomes `C:/…`; `//?/UNC/server/share` becomes `//server/share`.
+fn fold_windows(s: &str) -> String {
+    let s = s.replace('\\', "/");
+    if let Some(rest) = s.strip_prefix("//?/UNC/") {
+        return format!("//{rest}");
+    }
+    if let Some(rest) = s.strip_prefix("//?/") {
+        return rest.to_string();
+    }
+    s
 }
 
 /// Whether a slash-normalized pattern is absolute: a leading `/`, or a
@@ -275,6 +291,9 @@ mod tests {
         );
         assert!(matches("C:/Users/x/**/*.md", "c:/Users/x/a/b.md"));
         assert!(!matches("C:/Users/x/**/*.md", "D:/Users/x/a/b.md"));
+        assert_eq!(fold_windows(r"C:\a\b"), "C:/a/b");
+        assert_eq!(fold_windows(r"\\?\C:\Users\x"), "C:/Users/x");
+        assert_eq!(fold_windows(r"\\?\UNC\srv\share\x"), "//srv/share/x");
         if cfg!(windows) {
             assert_eq!(slashes(r"C:\a\b"), "C:/a/b");
             assert_eq!(
