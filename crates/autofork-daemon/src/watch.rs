@@ -257,6 +257,9 @@ fn build_registry(daemon: &Arc<Daemon>) -> HashMap<String, Vec<Subscriber>> {
 /// Stat every file matching `pattern`, up to `cap`. Returns the snapshot and
 /// whether the cap truncated it.
 fn scan(pattern: &str, cap: usize) -> (Snapshot, bool) {
+    // Registry patterns are already slash-normalized; a raw path spelled
+    // with backslashes (Windows) is folded here so every caller agrees.
+    let pattern = &glob::slashes(pattern);
     let mut snap = Snapshot::new();
     let root = glob::literal_prefix(pattern);
     if !glob::has_wildcard(pattern) {

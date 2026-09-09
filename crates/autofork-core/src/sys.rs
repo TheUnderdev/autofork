@@ -604,13 +604,54 @@ mod tests {
     }
 
     #[test]
-    fn lock_is_exclusive_within_a_process_and_released_on_drop() {
+    fn lock_is_exclusive() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("run").join("x.lock");
-        let held = try_lock_file(&path).expect("first lock");
+        let _held = try_lock_file(&path).expect("first lock");
         assert!(try_lock_file(&path).is_none(), "second lock must fail");
-        drop(held);
-        assert!(try_lock_file(&path).is_some(), "released on drop");
+    }
+
+    /// The re-invoked test binary's role in `lock_is_released_when_the_holder_exits`:
+    /// hold the named lock for a moment, then exit. Inert unless the env var
+    /// names a path.
+    #[test]
+    fn lock_holder_child() {
+        let Ok(path) = std::env::var("AUTOFORK_TEST_HOLD_LOCK") else {
+            return;
+        };
+        let _held = try_lock_file(Path::new(&path)).expect("child lock");
+        std::thread::sleep(std::time::Duration::from_millis(700));
+    }
+
+    /// The property the daemon lock rests on: a lock is released by its
+    /// holder's exit, so "acquirable" means "that process is gone" — on
+    /// every platform, whatever the same-process semantics of the OS lock.
+    #[test]
+    fn lock_is_released_when_the_holder_exits() {
+        use std::time::{Duration, Instant};
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("run").join("held.lock");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "sys::tests::lock_holder_child", "--nocapture"])
+            .env("AUTOFORK_TEST_HOLD_LOCK", &path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        // Wait until the child holds it.
+        let start = Instant::now();
+        while try_lock_file(&path).is_some() {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "the child never took the lock"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        child.wait().unwrap();
+        assert!(
+            try_lock_file(&path).is_some(),
+            "released when the holder exits"
+        );
     }
 
     #[test]
