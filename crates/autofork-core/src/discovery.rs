@@ -321,10 +321,10 @@ mod tests {
         assert!(warnings.is_empty(), "warnings: {warnings:?}");
         let journal = entries.iter().find(|e| e.name == "journal").unwrap();
         assert_eq!(journal.parsed.def.description.as_deref(), Some("j"));
-        // Roots are canonicalized (macOS /var vs /private/var).
+        // Roots are canonicalized (macOS /var vs /private/var, Windows' \\?\ folded).
         assert_eq!(
             journal.root,
-            root.canonicalize().unwrap().join(".autofork/forks")
+            crate::sys::canonical(&root).join(".autofork/forks")
         );
     }
 
