@@ -12,6 +12,14 @@ if [ -z "$DATA" ] || [ -z "$ROOT" ]; then
     echo "autofork bootstrap: CLAUDE_PLUGIN_DATA/CLAUDE_PLUGIN_ROOT unset" >&2
     exit 0
 fi
+# Windows: Claude Code passes both as `C:\Users\…`. Git Bash opens such
+# paths, but GNU tar unescapes the backslashes in a `-C` directory and fails
+# ("C\:\\Users…: Cannot open"). `C:/Users/…` is the spelling every tool here
+# accepts, so both are normalized once, up front.
+if command -v cygpath >/dev/null 2>&1; then
+    DATA=$(cygpath -m "$DATA")
+    ROOT=$(cygpath -m "$ROOT")
+fi
 mkdir -p "$DATA" 2>/dev/null
 
 # Wanted version = the plugin's own version.

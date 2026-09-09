@@ -12,6 +12,13 @@ if [ -n "${AUTOFORK_FORK}" ] || [ -n "${AUTOFORK_SESSION_ID}" ]; then
     exit 0
 fi
 
+# Windows: the data dir arrives as `C:\Users\…`; forward slashes are the
+# spelling every tool in Git Bash accepts (see bootstrap.sh).
+if command -v cygpath >/dev/null 2>&1; then
+    CLAUDE_PLUGIN_DATA=$(cygpath -m "$CLAUDE_PLUGIN_DATA")
+    CLAUDE_PLUGIN_ROOT=$(cygpath -m "$CLAUDE_PLUGIN_ROOT")
+    export CLAUDE_PLUGIN_DATA CLAUDE_PLUGIN_ROOT
+fi
 BIN="${CLAUDE_PLUGIN_DATA}/bin/autofork"
 # Windows (Git Bash runs this shim there): the binary carries an .exe suffix.
 [ -x "$BIN" ] || [ ! -x "$BIN.exe" ] || BIN="$BIN.exe"
