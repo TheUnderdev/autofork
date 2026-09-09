@@ -90,6 +90,7 @@ dependencies = [
 name = "autofork-core"
 version = "0.27.0"
 dependencies = [
+ "getrandom",
  "libc",
  "rusqlite",
  "serde",

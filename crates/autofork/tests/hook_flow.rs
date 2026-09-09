@@ -320,12 +320,13 @@ fn fork_env_guard_short_circuits_hook() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child
+    // The guard exits before reading stdin, so this write can lose the race
+    // and hit a closed pipe — that is the behavior under test, not a failure.
+    let _ = child
         .stdin
         .take()
         .unwrap()
-        .write_all(env.hook_input("s1").to_string().as_bytes())
-        .unwrap();
+        .write_all(env.hook_input("s1").to_string().as_bytes());
     let out = child.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(0), "guarded hook must exit 0");
     assert!(out.stdout.is_empty(), "guarded hook produced stdout");

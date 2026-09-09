@@ -298,6 +298,26 @@ pub fn link_or_copy(target: &Path, path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Fill `buf` from the OS random source (`/dev/urandom`, `getrandom(2)`,
+/// `BCryptGenRandom` — whatever the platform has), for run ids and temp
+/// file names. The OS source is never unavailable in practice; a failure
+/// here is a broken machine, not a condition to handle.
+pub fn random_bytes(buf: &mut [u8]) {
+    getrandom::fill(buf).expect("OS random source");
+}
+
+/// A random v4 UUID.
+pub fn uuid_v4() -> String {
+    let mut b = [0u8; 16];
+    random_bytes(&mut b);
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]
+    )
+}
+
 /// A 64-bit FNV-1a hash — for deriving short, stable names from paths.
 pub fn fnv1a64(s: &str) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -576,6 +596,15 @@ mod tests {
             .output()
             .expect("the platform shell runs");
         assert!(String::from_utf8_lossy(&out.stdout).contains("autofork"));
+    }
+
+    #[test]
+    fn uuids_are_v4_and_distinct() {
+        let a = uuid_v4();
+        let b = uuid_v4();
+        assert_eq!(a.len(), 36);
+        assert_eq!(a.as_bytes()[14], b'4');
+        assert_ne!(a, b);
     }
 
     #[test]

@@ -21,6 +21,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "process", "sync", "time", "signal", "fs"] }
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
+getrandom = "0.4"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
