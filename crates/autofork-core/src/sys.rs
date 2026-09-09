@@ -600,8 +600,10 @@ mod win {
             line.push(' ');
             quote_arg(&mut line, a);
         }
+        // No lpApplicationName: CreateProcessW then takes the program from the
+        // command line's first token, appending `.exe` and searching PATH the
+        // way a shell would — a bare `cmd` works, and so does a full path.
         let mut line_w: Vec<u16> = OsStr::new(&line).encode_wide().chain([0]).collect();
-        let program_w: Vec<u16> = program.encode_wide().chain([0]).collect();
 
         // Environment: inherit ours plus the Command's overrides, as one
         // NUL-separated UTF-16 block — or NULL when there is nothing to add.
@@ -683,7 +685,7 @@ mod win {
             | windows_sys::Win32::System::Threading::CREATE_UNICODE_ENVIRONMENT;
         let ok = unsafe {
             CreateProcessW(
-                program_w.as_ptr(),
+                std::ptr::null(),
                 line_w.as_mut_ptr(),
                 std::ptr::null(),
                 std::ptr::null(),
