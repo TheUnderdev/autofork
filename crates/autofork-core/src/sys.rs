@@ -211,6 +211,13 @@ pub fn is_shell_name(name: &str) -> bool {
 /// closing even when its report cannot. Windows: a new process group with no
 /// inherited console — the same two properties (no console close event, no
 /// Ctrl+C from the parent's group).
+///
+/// Windows also inherits every inheritable handle into a child, and the
+/// stdio pipes a hook received from Claude Code are inheritable. A detached
+/// daemon holding the hook's stdout would keep that pipe open for its whole
+/// life — Claude Code would never see the hook finish. So on Windows this
+/// also marks the calling process's own std handles non-inheritable before
+/// the spawn; the child gets exactly the stdio the `Command` names.
 pub fn detach(cmd: &mut Command) {
     #[cfg(unix)]
     {
@@ -225,6 +232,7 @@ pub fn detach(cmd: &mut Command) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
+        win::stdio_not_inheritable();
         cmd.creation_flags(win::CREATE_NEW_PROCESS_GROUP | win::DETACHED_PROCESS);
     }
 }
@@ -385,11 +393,14 @@ mod mac {
 mod win {
     use std::path::{Path, PathBuf};
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, ERROR_ACCESS_DENIED, FILETIME, HANDLE, INVALID_HANDLE_VALUE,
-        STILL_ACTIVE,
+        CloseHandle, GetLastError, SetHandleInformation, ERROR_ACCESS_DENIED, FILETIME, HANDLE,
+        HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, STILL_ACTIVE,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+    };
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
     };
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
@@ -473,6 +484,21 @@ mod win {
             }
             if unsafe { Process32NextW(snap.0, &mut entry) } == 0 {
                 return None;
+            }
+        }
+    }
+
+    /// Clear the inherit flag on this process's std handles, so a child
+    /// spawned with `bInheritHandles` (every `std::process::Command`) does
+    /// not silently hold them open — see [`super::detach`].
+    pub fn stdio_not_inheritable() {
+        for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            let h = unsafe { GetStdHandle(id) };
+            if h.is_null() || h == INVALID_HANDLE_VALUE {
+                continue;
+            }
+            unsafe {
+                SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
             }
         }
     }
