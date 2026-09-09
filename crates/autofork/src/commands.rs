@@ -664,6 +664,26 @@ pub fn doctor(paths: &Paths) -> Result<(), String> {
         _ => println!("  note: could not run 'claude --version' to check fork subagent support"),
     }
 
+    // The credential env forks will run with. What matters here is not that
+    // a token exists — a keychain login needs none — but that whatever THIS
+    // shell authenticates with is what the daemon will spawn its children
+    // with, instead of the environment of whichever harness happened to
+    // start it (see `autofork_core::runenv`).
+    match autofork_core::runenv::capture() {
+        Some(snap) if !snap.is_empty() => ok(&format!(
+            "fork credentials: carrying {} to daemon-spawned runs",
+            snap.set_names().join(", ")
+        )),
+        Some(_) => println!(
+            "  note: fork credentials: nothing in this environment — forks use the \
+             harness's own stored login"
+        ),
+        None => println!(
+            "  WARN: fork credentials: AUTOFORK_NO_CARRY_ENV is set — daemon-spawned runs \
+             (flush-on-close) inherit the daemon's environment instead of this session's"
+        ),
+    }
+
     // opencode integration (only reported when opencode or the plugin is
     // present — a Claude-Code-only install stays quiet).
     for line in crate::opencode::doctor_lines() {

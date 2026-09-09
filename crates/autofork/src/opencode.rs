@@ -143,6 +143,8 @@ fn run_hook_inner(kind: OcHookKind) -> Option<()> {
     let paths = Paths::from_env()?;
 
     let root = project_root_for(input.worktree.as_deref(), &input.directory);
+    // See `hook.rs`: the daemon's own env is not this session's.
+    let run_env = autofork_core::runenv::capture();
 
     let event = |ev: EventKind| Event {
         event: ev,
@@ -165,6 +167,7 @@ fn run_hook_inner(kind: OcHookKind) -> Option<()> {
         client: Some(CLIENT.to_string()),
         busy: input.busy,
         harness: None,
+        env: run_env.clone(),
     };
 
     match kind {

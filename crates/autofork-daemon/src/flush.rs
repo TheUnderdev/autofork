@@ -118,6 +118,23 @@ pub fn spawn_end_runner(daemon: &Arc<Daemon>, row: &SessionRow, specs: &[WakeFor
     if let Some(bin) = row.harness.as_ref().and_then(|h| h.bin.as_deref()) {
         cmd.arg("--bin").arg(bin);
     }
+    // Authenticate as the session did, not as the daemon happens to. Without
+    // this the end-runner inherits OUR env — and the daemon was started by
+    // whichever client first needed it, which on a machine with several
+    // harnesses (or a rotated token) is a different account, or none at all:
+    // every consolidation fork of every closing session then fails to
+    // authenticate. `None` (a daemon that restarted mid-session and never saw
+    // an event from this one) keeps the old inherit-ours behavior.
+    let env = daemon.session_env(&row.session_id);
+    match env.as_ref() {
+        Some(env) => {
+            env.apply(&mut cmd);
+            tracing::debug!(session = %row.session_id, carried = ?env.set_names(),
+                "flush-on-close: end-runner runs with the session's own credential env");
+        }
+        None => tracing::debug!(session = %row.session_id,
+            "flush-on-close: no credential env recorded for this session, inheriting the daemon's"),
+    }
     match autofork_core::sys::spawn_detached(&mut cmd, log, log2) {
         Ok(pid) => tracing::info!(
             session = %row.session_id,

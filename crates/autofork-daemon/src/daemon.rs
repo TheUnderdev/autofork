@@ -112,6 +112,17 @@ pub struct Daemon {
     /// this counter for a bounded moment instead. Only the context lane is
     /// counted: wake blocks leave by another door.
     pub feed_hooks_inflight: Mutex<HashMap<String, usize>>,
+    /// The latest credential env each open session reported (its
+    /// `CLAUDE_CODE_OAUTH_TOKEN` and friends — see
+    /// [`autofork_core::runenv`]). Applied to everything the daemon spawns
+    /// for that session: the flush-on-close end-runner, which then runs
+    /// `claude -p` as the session's own account, and the session's lifecycle
+    /// hooks.
+    ///
+    /// In memory only, never in `state.db`: these are secrets, and a daemon
+    /// that restarted can safely fall back to inheriting its own env (the
+    /// pre-v0.28 behavior). Dropped when the session closes.
+    pub session_env: Mutex<HashMap<String, autofork_core::runenv::Snapshot>>,
     pub close_gen: AtomicU64,
     pub connections: AtomicUsize,
     pub last_busy: AtomicI64,
@@ -218,6 +229,7 @@ impl Daemon {
             parked: Mutex::new(HashMap::new()),
             pending_close: Mutex::new(HashMap::new()),
             feed_hooks_inflight: Mutex::new(HashMap::new()),
+            session_env: Mutex::new(HashMap::new()),
             close_gen: AtomicU64::new(0),
             connections: AtomicUsize::new(0),
             last_busy: AtomicI64::new(now()),
@@ -228,6 +240,34 @@ impl Daemon {
 
     pub fn touch_busy(&self) {
         self.last_busy.store(now(), Ordering::SeqCst);
+    }
+
+    /// Record what a session's own environment authenticates with, from any
+    /// event that carried it. Later events overwrite: a `/login` mid-session,
+    /// or a rotated token, is reflected on the session's next hook.
+    pub fn note_session_env(
+        &self,
+        session_id: &str,
+        env: Option<&autofork_core::runenv::Snapshot>,
+    ) {
+        let Some(env) = env else { return };
+        self.session_env
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string(), env.clone());
+    }
+
+    /// The credential env to spawn this session's children with, if the
+    /// session ever reported one. `None` = inherit ours, which is all a
+    /// daemon that restarted mid-session can do.
+    pub fn session_env(&self, session_id: &str) -> Option<autofork_core::runenv::Snapshot> {
+        self.session_env.lock().unwrap().get(session_id).cloned()
+    }
+
+    /// Drop a closed session's credential env. Called after the close path
+    /// has spawned whatever it needed (the end-runner takes its copy first).
+    pub fn forget_session_env(&self, session_id: &str) {
+        self.session_env.lock().unwrap().remove(session_id);
     }
 
     /// The user-level forks root (`<base>/forks`).
@@ -435,8 +475,12 @@ impl Daemon {
         if !transitioned {
             return false;
         }
-        let Some(row) = row else { return true };
+        let Some(row) = row else {
+            self.forget_session_env(session_id);
+            return true;
+        };
         if self.is_fork_run_session(session_id) {
+            self.forget_session_env(session_id);
             return true;
         }
         crate::hooks::fire_matching(
@@ -444,6 +488,10 @@ impl Daemon {
             &crate::hooks::HookCtx::from_row(&row),
             crate::hooks::HookEvent::SessionEnd { reason },
         );
+        // The end-runner and the `session_end` hooks have taken their copies
+        // (both build their command env synchronously, above); the session is
+        // over, so the credentials go.
+        self.forget_session_env(session_id);
         true
     }
 
@@ -499,6 +547,11 @@ impl Daemon {
         // A fresh event proves the session is alive: cancel any pending
         // lost-poll close.
         self.clear_pending_close(&ev.session_id);
+        // Whatever this session authenticates with is what the children we
+        // spawn for it must authenticate with — our own env is some other
+        // shell's (see `runenv`). Recorded before anything below can close
+        // the session and flush its final runs.
+        self.note_session_env(&ev.session_id, ev.env.as_ref());
         let t = now();
         let enable_tags = ev.enable_tags.as_ref().map(|v| v.join(","));
         let disable_tags = ev.disable_tags.as_ref().map(|v| v.join(","));
@@ -733,6 +786,7 @@ impl Daemon {
         }
         // A new poll parking proves the session is alive.
         self.clear_pending_close(&ev.session_id);
+        self.note_session_env(&ev.session_id, ev.env.as_ref());
         let t = now();
         let enable_tags = ev.enable_tags.as_ref().map(|v| v.join(","));
         let disable_tags = ev.disable_tags.as_ref().map(|v| v.join(","));

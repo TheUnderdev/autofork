@@ -33,6 +33,9 @@ struct Harness {
     liveness_sweep_secs: Option<u64>,
     session_sweep_secs: Option<u64>,
     final_runner_bin: Option<PathBuf>,
+    /// Extra env for the daemon process — how a test stands the daemon up
+    /// with somebody ELSE's credentials (the multi-harness reality).
+    daemon_env: Vec<(String, String)>,
 }
 
 impl Harness {
@@ -63,7 +66,15 @@ impl Harness {
             liveness_sweep_secs: None,
             session_sweep_secs: None,
             final_runner_bin: None,
+            daemon_env: Vec::new(),
         }
+    }
+
+    /// Start the daemon with this var set, as a daemon spawned by another
+    /// harness (or an older shell) would have it.
+    fn daemon_env(mut self, key: &str, value: &str) -> Self {
+        self.daemon_env.push((key.to_string(), value.to_string()));
+        self
     }
 
     fn poll_grace_ms(mut self, ms: u64) -> Self {
@@ -109,6 +120,29 @@ impl Harness {
             &script,
             format!(
                 "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\n",
+                record.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        self.final_runner_bin = Some(script);
+        record
+    }
+
+    /// Stand in for the end-runner, recording the credential env it was
+    /// spawned with instead of its argv: `<CLAUDE_CODE_OAUTH_TOKEN>|<ANTHROPIC_API_KEY>`,
+    /// with `-` for an unset var.
+    fn env_recording_final_runner(&mut self) -> PathBuf {
+        let record = self.project.join("final-run.env");
+        let script = self.project.join("fake-final-run-env.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s|%s\\n' \"${{CLAUDE_CODE_OAUTH_TOKEN:--}}\" \"${{ANTHROPIC_API_KEY:--}}\" >> \"{}\"\n",
                 record.display()
             ),
         )
@@ -281,6 +315,9 @@ impl Harness {
         if let Some(bin) = &self.final_runner_bin {
             cmd.env("AUTOFORK_FINAL_RUNNER_BIN", bin);
         }
+        for (k, v) in &self.daemon_env {
+            cmd.env(k, v);
+        }
         let child = cmd.spawn().unwrap();
         self.daemon = Some(child);
         let start = Instant::now();
@@ -325,6 +362,7 @@ impl Harness {
             client: None,
             busy: None,
             harness: None,
+            env: None,
         }
     }
 
@@ -3145,6 +3183,92 @@ fn a_close_the_client_never_reported_still_flushes_its_idle_forks() {
         .expect("the runner is handed a specs file");
     let specs = std::fs::read_to_string(specs_path).unwrap();
     assert!(specs.contains("handover"), "{specs}");
+}
+
+#[test]
+fn the_end_runner_authenticates_as_the_session_not_as_the_daemon() {
+    // The daemon is spawned once, by whichever client's hook first found no
+    // daemon running — on a machine with several harnesses that is somebody
+    // else's environment entirely. Here it holds a stale OAuth token and an
+    // API key the session does not have; the closing session authenticates
+    // with its own token and nothing else. The end-runner must run `claude
+    // -p` the way the SESSION would: the session's token, and no inherited
+    // key (which would otherwise silently outrank it).
+    let mut h = Harness::new("30m", "0")
+        .liveness_sweep_secs(1)
+        .daemon_env("CLAUDE_CODE_OAUTH_TOKEN", "daemon-stale-token")
+        .daemon_env("ANTHROPIC_API_KEY", "daemon-key");
+    let record = h.env_recording_final_runner();
+    h.write_fork(
+        "handover.md",
+        "---\nfork: true\nrun_on:\n  - idle: 30m\n---\nHAND OVER",
+    );
+    h.start_daemon();
+
+    let session_env = autofork_core::runenv::Snapshot {
+        names: vec!["CLAUDE_CODE_OAUTH_TOKEN".into(), "ANTHROPIC_API_KEY".into()],
+        vars: vec![("CLAUDE_CODE_OAUTH_TOKEN".into(), "session-token".into())],
+    };
+
+    let mut client = FakeClient::spawn();
+    let mut ev = h.event(EventKind::SessionStart, "s-env");
+    ev.harness = Some(client.harness());
+    ev.env = Some(session_env.clone());
+    assert_ack(h.send_event(ev));
+    let _rx = h.park_stop_wait({
+        let mut ev = h.event(EventKind::Stop, "s-env");
+        ev.harness = Some(client.harness());
+        ev.env = Some(session_env);
+        ev
+    });
+    std::thread::sleep(Duration::from_millis(300));
+
+    client.kill();
+
+    let start = Instant::now();
+    let recorded = loop {
+        let line = std::fs::read_to_string(&record).unwrap_or_default();
+        if !line.is_empty() {
+            break line.trim().to_string();
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "the end-runner never ran"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(recorded, "session-token|-", "end-runner credential env");
+}
+
+#[test]
+fn a_lifecycle_hook_runs_with_the_session_credential_env() {
+    // Same reasoning for the daemon's other child: a feed that shells out to
+    // a model provider must do it as the session's user.
+    let mut h =
+        Harness::new("30m", "0").daemon_env("CLAUDE_CODE_OAUTH_TOKEN", "daemon-stale-token");
+    let log = h.project.join("cred.log");
+    let hook = h.project.join(".autofork/hooks/cred.md");
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    std::fs::write(
+        &hook,
+        format!(
+            "---\nhook: true\non: session_start\n\
+             command: printf '%s\\n' \"${{CLAUDE_CODE_OAUTH_TOKEN:--}}\" >> \"{}\"\n---\nx\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    h.start_daemon();
+
+    let mut ev = h.event(EventKind::SessionStart, "s-hookenv");
+    ev.env = Some(autofork_core::runenv::Snapshot {
+        names: vec!["CLAUDE_CODE_OAUTH_TOKEN".into()],
+        vars: vec![("CLAUDE_CODE_OAUTH_TOKEN".into(), "session-token".into())],
+    });
+    assert_ack(h.send_event(ev));
+
+    let lines = h.wait_for_hook_lines(&log, 1, Duration::from_secs(10));
+    assert_eq!(lines[0], "session-token");
 }
 
 #[test]

@@ -80,6 +80,13 @@ fn run_hook_inner(kind: HookKind) -> Option<()> {
     // remember who that parent WAS).
     let harness = autofork_core::harness::client_process();
 
+    // The session's credential env, captured here where we are still a
+    // child of the user's Claude Code: the daemon cannot read it from its
+    // own environment (it may have been started by another harness, or by
+    // a shell whose token has since been rotated) and needs it to spawn
+    // flush-on-close runs that authenticate as THIS session does.
+    let run_env = autofork_core::runenv::capture();
+
     let event = |ev: EventKind| Event {
         event: ev,
         session_id: input.session_id.clone(),
@@ -101,6 +108,7 @@ fn run_hook_inner(kind: HookKind) -> Option<()> {
         client: None,
         busy: None,
         harness: harness.clone(),
+        env: run_env.clone(),
     };
 
     match kind {

@@ -16,6 +16,7 @@ pub mod moments;
 pub mod notification;
 pub mod project;
 pub mod protocol;
+pub mod runenv;
 pub mod schedule;
 pub mod store;
 pub mod sys;

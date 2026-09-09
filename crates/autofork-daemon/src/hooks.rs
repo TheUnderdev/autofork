@@ -256,6 +256,15 @@ pub fn execute(
         ("AUTOFORK_DELIVER".into(), deliver.label().into()),
     ];
     env.extend(extra_env);
+    // A lifecycle hook is a child of the DAEMON, whose env belongs to
+    // whichever client happened to start it. Anything the hook does that
+    // talks to a model provider — a feed that asks `claude -p` a question, a
+    // script that curls an API — must do it as this session's user, so the
+    // session's own credential env wins over ours (see `runenv`).
+    let (clear_env, session_env) = match daemon.session_env(&ctx.session_id) {
+        Some(snap) => snap.plan(),
+        None => (Vec::new(), Vec::new()),
+    };
     let session = ctx.session_id.clone();
     let ctx = ctx.clone();
     let daemon = Arc::clone(daemon);
@@ -271,9 +280,13 @@ pub fn execute(
         let _inflight = inflight;
         let (shell, shell_args) = autofork_core::sys::shell();
         let mut cmd = tokio::process::Command::new(shell);
+        for name in &clear_env {
+            cmd.env_remove(name);
+        }
         cmd.args(shell_args)
             .arg(&command)
             .current_dir(&cwd)
+            .envs(session_env)
             .envs(env)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())

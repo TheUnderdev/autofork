@@ -128,6 +128,8 @@ fn run_hook_inner(kind: CxHookKind) -> Option<()> {
 
     let cwd = input.cwd.clone().or_else(|| std::env::current_dir().ok())?;
     let root = autofork_core::project::project_root(&cwd);
+    // See `hook.rs`: the daemon's own env is not this session's.
+    let run_env = autofork_core::runenv::capture();
 
     let event = |ev: EventKind| Event {
         event: ev,
@@ -150,6 +152,7 @@ fn run_hook_inner(kind: CxHookKind) -> Option<()> {
         client: Some(CLIENT.to_string()),
         busy: None,
         harness: autofork_core::harness::client_process(),
+        env: run_env.clone(),
     };
 
     match kind {
@@ -656,6 +659,10 @@ fn waiter_loop(paths: &Paths, args: &WaiterArgs) {
         client: Some(CLIENT.to_string()),
         busy: busy.then_some(true),
         harness: autofork_core::harness::of_pid(args.codex_pid),
+        // The waiter is a child of the codex hook, so our env is still the
+        // session's: keep reporting it, so a long-lived daemon's copy stays
+        // current (see `runenv`).
+        env: autofork_core::runenv::capture(),
     };
 
     loop {

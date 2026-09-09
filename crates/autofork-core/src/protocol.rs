@@ -199,6 +199,16 @@ pub struct Event {
     /// keeps the pre-v0.23 poll-and-hook behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness: Option<crate::harness::Harness>,
+    /// The session's credential environment (`CLAUDE_CODE_OAUTH_TOKEN` and
+    /// friends), captured in the hook — a child of the client process, so
+    /// this IS what the session itself authenticates with. The daemon keeps
+    /// the latest snapshot per session in memory and applies it to everything
+    /// it spawns on that session's behalf, because its OWN env is whatever
+    /// shell happened to start it (possibly another harness entirely). See
+    /// [`crate::runenv`]. Additive field (no proto bump); old daemons ignore
+    /// it and children keep inheriting the daemon's env.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<crate::runenv::Snapshot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -467,6 +477,7 @@ mod tests {
                 client: None,
                 busy: None,
                 harness: None,
+                env: None,
             }),
         };
         let line = encode(&req).unwrap();

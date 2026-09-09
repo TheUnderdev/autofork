@@ -741,6 +741,37 @@ runner sets its own approvals (`--permission-mode` on Claude Code, sandbox flags
 fork's `mode:` picks keeps its own permission config). A session flushes exactly once, whether
 the `SessionEnd` hook or the daemon's own liveness check notices the close first.
 
+### Which account a fork runs as (v0.28)
+
+A fork run authenticates the way the session that asked for it does. For the in-session paths that
+is free — the Stop hook is a child of your Claude Code, so `CLAUDE_CODE_OAUTH_TOKEN`,
+`ANTHROPIC_BASE_URL`, a corporate `HTTPS_PROXY` and friends are already in its environment. The
+daemon is the exception, and it was the bug: it is spawned **once**, by whichever client's hook
+first found no daemon running, and then serves every session on the machine for hours. On a
+machine running several harnesses (or several logins) its environment is an arbitrary other
+session's — a daemon started from opencode has no Claude token at all, so every `flush_on_close`
+run it spawned failed to authenticate, and a daemon holding a token that has since been rotated
+authenticated as the wrong identity, which no fallback can detect.
+
+So every hook now sends its own credential environment with its events, the daemon keeps the
+latest snapshot per session **in memory only** (never in `state.db` — a token belongs in your
+keychain or your rc file, not in autofork's state), and everything it spawns for that session —
+the flush-on-close end-runner, the session's lifecycle hooks — gets it applied *authoritatively*:
+each carried name is cleared and then re-set from the snapshot, so a variable the session does
+**not** have can never survive by inheritance from the daemon's own environment. A daemon that
+restarted mid-session and never saw an event from the session it is flushing has no snapshot and
+falls back to inheriting, as before.
+
+Carried: the Anthropic/Claude Code credentials and endpoint (`ANTHROPIC_API_KEY`,
+`ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS`,
+`CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CONFIG_DIR`), the Bedrock/Vertex switches and their AWS/GCP
+credentials, the codex/OpenAI and opencode keys, and the network path to the API (`HTTPS_PROXY`
+and siblings, `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`/`SSL_CERT_DIR`). Nothing else: the daemon
+must not hand a child a stale copy of an unrelated shell's `PATH`. Add to the list with
+`AUTOFORK_CARRY_ENV=NAME1,NAME2` (read from the client's environment, so it travels with the
+snapshot); `AUTOFORK_NO_CARRY_ENV=1` turns the carry off entirely. `autofork doctor` prints what
+the current environment will carry.
+
 ### Session liveness
 
 A session is open for exactly as long as the process behind it is. Since v0.23 every hook forwards
