@@ -49,6 +49,36 @@ pub fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// `path` canonicalized (symlinks resolved, macOS `/var` → `/private/var`)
+/// with Windows' verbatim prefix folded away: `std::fs::canonicalize` there
+/// answers `\\?\C:\…`, a spelling that is correct for the Win32 API and
+/// wrong for everything else — a hook's `$AUTOFORK_PROJECT_ROOT`, a status
+/// line, a path baked into a report. Falls back to `path` as given when it
+/// cannot be canonicalized (it may not exist yet).
+pub fn canonical(path: &Path) -> PathBuf {
+    let c = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    simplify(c)
+}
+
+/// Strip Windows' `\\?\` verbatim prefix; identity elsewhere.
+pub fn simplify(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let s = path.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+        path
+    }
+    #[cfg(not(windows))]
+    {
+        path
+    }
+}
+
 /// A directory that always exists, for a process whose real working
 /// directory is gone (a session launched from a since-deleted temp dir).
 pub fn root_fallback_dir() -> PathBuf {
@@ -575,6 +605,18 @@ mod win {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_paths_are_plain_and_absolute() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = canonical(tmp.path());
+        assert!(c.is_absolute());
+        assert!(!c.to_string_lossy().starts_with(r"\\?\"), "{c:?}");
+        assert!(c.is_dir(), "a simplified canonical path still opens: {c:?}");
+        // A path that does not exist comes back as given.
+        let missing = tmp.path().join("nope");
+        assert_eq!(canonical(&missing), missing);
+    }
 
     #[test]
     fn home_is_resolved() {

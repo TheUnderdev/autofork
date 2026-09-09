@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 /// Resolve the project root for `cwd`.
 pub fn project_root(cwd: &Path) -> PathBuf {
-    let start = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let start = crate::sys::canonical(cwd);
     let mut cur = Some(start.as_path());
     while let Some(d) = cur {
         if d.join(".autofork").is_dir() {
@@ -35,7 +35,7 @@ mod tests {
     #[test]
     fn autofork_wins_over_git_and_falls_back() {
         let tmp = tempfile::tempdir().unwrap();
-        let base = tmp.path().canonicalize().unwrap();
+        let base = crate::sys::canonical(tmp.path());
         let repo = base.join("repo");
         let sub = repo.join("a/b");
         fs::create_dir_all(&sub).unwrap();

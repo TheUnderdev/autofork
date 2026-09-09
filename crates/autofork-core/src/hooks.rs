@@ -414,7 +414,7 @@ pub struct HookEntry {
 /// (`~/.autofork/hooks`) if not already among them.
 pub fn hook_roots(dir: &Path, user_hooks_root: Option<&Path>) -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
-    let start = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let start = crate::sys::canonical(dir);
     let mut cur = Some(start.as_path());
     // Roots are deduped by canonical path — `d` is canonical, but the
     // `hooks` dir itself may be a symlink (or a Windows junction) to a tree
@@ -423,7 +423,7 @@ pub fn hook_roots(dir: &Path, user_hooks_root: Option<&Path>) -> Vec<PathBuf> {
     while let Some(d) = cur {
         let candidate = d.join(".autofork").join("hooks");
         if candidate.is_dir() {
-            let c = candidate.canonicalize().unwrap_or(candidate);
+            let c = crate::sys::canonical(&candidate);
             if !roots.contains(&c) {
                 roots.push(c);
             }
@@ -431,7 +431,7 @@ pub fn hook_roots(dir: &Path, user_hooks_root: Option<&Path>) -> Vec<PathBuf> {
         cur = d.parent();
     }
     if let Some(user) = user_hooks_root {
-        let c = user.canonicalize().unwrap_or_else(|_| user.to_path_buf());
+        let c = crate::sys::canonical(user);
         if c.is_dir() && !roots.contains(&c) {
             roots.push(c);
         }

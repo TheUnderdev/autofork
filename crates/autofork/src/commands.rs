@@ -589,10 +589,12 @@ pub fn doctor(paths: &Paths) -> Result<(), String> {
             version: env!("CARGO_PKG_VERSION").to_string(),
         }) {
             Ok(ResponseBody::HelloInfo { version }) => {
-                ok(&format!(
-                    "daemon answering at {} (v{version})",
-                    paths.socket().display()
-                ));
+                let endpoint = if cfg!(windows) {
+                    paths.pipe_name()
+                } else {
+                    paths.socket().display().to_string()
+                };
+                ok(&format!("daemon answering at {endpoint} (v{version})"));
             }
             other => {
                 problems += 1;

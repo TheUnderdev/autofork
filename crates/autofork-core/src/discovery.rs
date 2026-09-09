@@ -46,24 +46,27 @@ pub fn fork_roots(
     user_forks_root: Option<&Path>,
     claude_dir: Option<&Path>,
 ) -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    let start = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let start = crate::sys::canonical(dir);
     let mut cur = Some(start.as_path());
+    // Every root is canonical, and the same directory reached two ways
+    // (a symlinked or junctioned `forks` dir) counts once.
     while let Some(d) = cur {
         for candidate in [
             d.join(".autofork").join("forks"),
             d.join(".claude").join("forks"),
         ] {
             if candidate.is_dir() {
-                roots.push(candidate);
+                let c = crate::sys::canonical(&candidate);
+                if !roots.contains(&c) {
+                    roots.push(c);
+                }
             }
         }
         cur = d.parent();
     }
     let mut push_user = |candidate: PathBuf| {
-        let c = candidate
-            .canonicalize()
-            .unwrap_or_else(|_| candidate.clone());
+        let c = crate::sys::canonical(&candidate);
         if c.is_dir() && !roots.contains(&c) {
             roots.push(c);
         }
@@ -87,14 +90,12 @@ fn skill_roots(dir: &Path, claude_dir: Option<&Path>, agents_dir: Option<&Path>)
     // Claude Code share one skills tree) and a fork must never be discovered
     // twice through two spellings of the same directory.
     let mut push = |candidate: PathBuf| {
-        let c = candidate
-            .canonicalize()
-            .unwrap_or_else(|_| candidate.clone());
+        let c = crate::sys::canonical(&candidate);
         if c.is_dir() && !roots.contains(&c) {
             roots.push(c);
         }
     };
-    let start = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let start = crate::sys::canonical(dir);
     let mut cur = Some(start.as_path());
     while let Some(d) = cur {
         push(d.join(".claude").join("skills"));
