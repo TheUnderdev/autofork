@@ -26,9 +26,12 @@ OS=$(uname -s)
 ARCH=$(uname -m)
 # Windows (Git Bash / MSYS): binaries carry .exe, and `uname -s` reads
 # MINGW64_NT-10.0-… or MSYS_NT-…
+# GNU tar (Git for Windows) reads a `C:/…` path as `host:file` and fails with
+# "Cannot connect to C"; --force-local makes it a local file again. bsdtar
+# (macOS) has no such flag and never sees such a path.
 case "$OS" in
-    MINGW* | MSYS* | CYGWIN*) EXE=".exe" ;;
-    *) EXE="" ;;
+    MINGW* | MSYS* | CYGWIN*) EXE=".exe"; TAR_LOCAL="--force-local" ;;
+    *) EXE=""; TAR_LOCAL="" ;;
 esac
 
 HAVE=""
@@ -91,7 +94,8 @@ if [ -n "$TARGET" ] && command -v curl >/dev/null 2>&1; then
     if curl -fsSL --retry 2 -o "$TMP/$ASSET" "$URL" &&
         curl -fsSL --retry 2 -o "$TMP/$ASSET.sha256" "$URL.sha256"; then
         if checksum_ok "$TMP/$ASSET" "$TMP/$ASSET.sha256"; then
-            if tar -xzf "$TMP/$ASSET" -C "$TMP" && install_bins "$TMP/bin"; then
+            # shellcheck disable=SC2086
+            if tar $TAR_LOCAL -xzf "$TMP/$ASSET" -C "$TMP" && install_bins "$TMP/bin"; then
                 exit 0
             fi
         else
