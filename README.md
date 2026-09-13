@@ -744,9 +744,11 @@ the `SessionEnd` hook or the daemon's own liveness check notices the close first
 ### Which account a fork runs as (v0.28)
 
 A fork run authenticates the way the session that asked for it does. For the in-session paths that
-is free — the Stop hook is a child of your Claude Code, so `CLAUDE_CODE_OAUTH_TOKEN`,
-`ANTHROPIC_BASE_URL`, a corporate `HTTPS_PROXY` and friends are already in its environment. The
-daemon is the exception, and it was the bug: it is spawned **once**, by whichever client's hook
+is nearly free — the Stop hook is a child of your Claude Code, so `ANTHROPIC_API_KEY`,
+`ANTHROPIC_BASE_URL`, `CLAUDE_CONFIG_DIR`, a corporate `HTTPS_PROXY` and friends are already in
+its environment. `CLAUDE_CODE_OAUTH_TOKEN` is not: see
+[below](#a-session-that-logs-in-with-claude_code_oauth_token-v029). The daemon is the other
+exception, and it was the bug: it is spawned **once**, by whichever client's hook
 first found no daemon running, and then serves every session on the machine for hours. On a
 machine running several harnesses (or several logins) its environment is an arbitrary other
 session's — a daemon started from opencode has no Claude token at all, so every `flush_on_close`
@@ -771,6 +773,30 @@ must not hand a child a stale copy of an unrelated shell's `PATH`. Add to the li
 `AUTOFORK_CARRY_ENV=NAME1,NAME2` (read from the client's environment, so it travels with the
 snapshot); `AUTOFORK_NO_CARRY_ENV=1` turns the carry off entirely. `autofork doctor` prints what
 the current environment will carry.
+
+#### A session that logs in with `CLAUDE_CODE_OAUTH_TOKEN` (v0.29)
+
+Claude Code removes `CLAUDE_CODE_OAUTH_TOKEN` from the environment of everything it spawns — hooks
+and Bash tool shells alike — while every other credential variable passes through. autofork's
+hooks are those children, so they never see the token. That is harmless when the session also has
+a stored login (keychain, `.credentials.json`) or an `apiKeyHelper` in its config dir: the fork run
+finds it there. But a session that authenticates **only** through that variable — typically a
+`claude setup-token` token exported in the launching shell, often alongside a separate
+`CLAUDE_CONFIG_DIR` — leaves autofork nothing to authenticate with, and every headless or
+flush-on-close fork fails with `Not logged in · Please run /login`.
+
+Export the same token a second time, under a name Claude Code does not scrub:
+
+```sh
+export CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-…
+export AUTOFORK_CLAUDE_CODE_OAUTH_TOKEN="$CLAUDE_CODE_OAUTH_TOKEN"
+```
+
+Every `claude` process autofork spawns then gets it as `CLAUDE_CODE_OAUTH_TOKEN`, and it is part
+of the carried snapshot above, so the daemon's children get it too. When both are set,
+`AUTOFORK_CLAUDE_CODE_OAUTH_TOKEN` wins — it is the one you set for autofork on purpose; an empty
+value counts as unset. `autofork doctor` warns when it sees `CLAUDE_CODE_OAUTH_TOKEN` without the
+override.
 
 ### Session liveness
 

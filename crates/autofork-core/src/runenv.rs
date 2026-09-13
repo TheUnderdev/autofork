@@ -3,12 +3,14 @@
 //! client's own process to whatever ends up spawning the fork.
 //!
 //! Why this exists: a fork child normally inherits the environment of the
-//! process that spawns it, and for the in-session paths that is exactly
+//! process that spawns it, and for the in-session paths that is nearly
 //! right — the parked Stop hook is a child of the user's Claude Code, so
-//! `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_BASE_URL`, a corporate proxy's
-//! `HTTPS_PROXY` and friends are already there. The daemon is the exception.
-//! It is spawned ONCE, by whichever client's hook first found no daemon
-//! running, and then serves every session on the machine for hours. On a
+//! `ANTHROPIC_BASE_URL`, a corporate proxy's `HTTPS_PROXY` and friends are
+//! already there. The one exception is `CLAUDE_CODE_OAUTH_TOKEN`, which
+//! Claude Code scrubs from every child it spawns, hooks included; see
+//! [`OAUTH_TOKEN_OVERRIDE`] for the way around it. The daemon is the other
+//! exception. It is spawned ONCE, by whichever client's hook first found no
+//! daemon running, and then serves every session on the machine for hours. On a
 //! machine with several harnesses (Claude Code, opencode, codex) or several
 //! auth methods, the daemon's env is therefore an arbitrary snapshot of some
 //! *other* session's shell:
@@ -36,6 +38,42 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The Claude Code OAuth token autofork's own `claude` children run with.
+///
+/// Claude Code removes `CLAUDE_CODE_OAUTH_TOKEN` from the environment of
+/// everything it spawns — hooks, Bash tool shells — while every other
+/// credential var (`ANTHROPIC_API_KEY`, `CLAUDE_CONFIG_DIR`, the AWS ones…)
+/// passes through. A session that authenticates *only* with that token (no
+/// keychain login, no `apiKeyHelper` in its config dir) therefore leaves
+/// autofork nothing to authenticate its fork runs with, and every headless or
+/// flush-on-close fork dies with "Not logged in".
+///
+/// Exporting the same token under this name as well gets it past the scrub:
+/// every `claude` process autofork spawns gets it as
+/// `CLAUDE_CODE_OAUTH_TOKEN`, and the [`Snapshot`] carries it to the daemon's
+/// children the same way. It wins over a plain `CLAUDE_CODE_OAUTH_TOKEN`
+/// when both are present — it is the one you set for autofork on purpose. An
+/// empty value counts as unset.
+pub const OAUTH_TOKEN_OVERRIDE: &str = "AUTOFORK_CLAUDE_CODE_OAUTH_TOKEN";
+
+/// The name Claude Code reads the token from.
+pub const OAUTH_TOKEN: &str = "CLAUDE_CODE_OAUTH_TOKEN";
+
+/// The [`OAUTH_TOKEN_OVERRIDE`] value in this process's env, if set.
+pub fn oauth_token_override() -> Option<String> {
+    std::env::var(OAUTH_TOKEN_OVERRIDE)
+        .ok()
+        .filter(|v| !v.is_empty())
+}
+
+/// Point a `claude` child at the [`OAUTH_TOKEN_OVERRIDE`] token, if one is
+/// set. Called on every `claude` autofork spawns itself.
+pub fn apply_oauth_override(cmd: &mut std::process::Command) {
+    if let Some(token) = oauth_token_override() {
+        cmd.env(OAUTH_TOKEN, token);
+    }
+}
+
 /// The env vars carried from a session to its fork runs.
 ///
 /// Deliberately a fixed list, not "everything": the daemon would otherwise
@@ -51,6 +89,7 @@ pub const NAMES: &[&str] = &[
     "ANTHROPIC_BASE_URL",
     "ANTHROPIC_CUSTOM_HEADERS",
     "CLAUDE_CODE_OAUTH_TOKEN",
+    OAUTH_TOKEN_OVERRIDE,
     "CLAUDE_CONFIG_DIR",
     // Which provider Claude Code talks to at all.
     "CLAUDE_CODE_USE_BEDROCK",
@@ -153,10 +192,22 @@ impl Snapshot {
                 names.push(extra);
             }
         }
-        let vars = names
+        Self::build(names, |n| std::env::var(n).ok())
+    }
+
+    /// [`Self::capture`] over an arbitrary lookup, so tests need not mutate
+    /// the process env. An [`OAUTH_TOKEN_OVERRIDE`] value replaces whatever
+    /// `CLAUDE_CODE_OAUTH_TOKEN` the lookup had: the daemon's children then
+    /// authenticate with it even though the hook never saw the real name.
+    fn build(names: Vec<String>, get: impl Fn(&str) -> Option<String>) -> Self {
+        let mut vars: Vec<(String, String)> = names
             .iter()
-            .filter_map(|n| std::env::var(n).ok().map(|v| (n.clone(), v)))
+            .filter_map(|n| get(n).map(|v| (n.clone(), v)))
             .collect();
+        if let Some(token) = get(OAUTH_TOKEN_OVERRIDE).filter(|v| !v.is_empty()) {
+            vars.retain(|(k, _)| k != OAUTH_TOKEN);
+            vars.push((OAUTH_TOKEN.to_string(), token));
+        }
         Self { names, vars }
     }
 
@@ -255,6 +306,61 @@ mod tests {
         let rendered = format!("{snap:?}");
         assert!(!rendered.contains("sk-ant-secret"), "{rendered}");
         assert!(rendered.contains("CLAUDE_CODE_OAUTH_TOKEN"), "{rendered}");
+    }
+
+    fn names() -> Vec<String> {
+        NAMES.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn value<'a>(snap: &'a Snapshot, name: &str) -> Option<&'a str> {
+        snap.vars
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn the_override_is_carried_as_the_oauth_token() {
+        // Claude Code scrubbed CLAUDE_CODE_OAUTH_TOKEN from the hook's env;
+        // only the override got through.
+        let snap = Snapshot::build(names(), |n| {
+            (n == OAUTH_TOKEN_OVERRIDE).then(|| "sk-ant-oat-session".to_string())
+        });
+        assert_eq!(value(&snap, OAUTH_TOKEN), Some("sk-ant-oat-session"));
+        assert_eq!(
+            value(&snap, OAUTH_TOKEN_OVERRIDE),
+            Some("sk-ant-oat-session")
+        );
+        assert_eq!(
+            snap.vars.iter().filter(|(k, _)| k == OAUTH_TOKEN).count(),
+            1,
+            "{snap:?}"
+        );
+    }
+
+    #[test]
+    fn the_override_wins_over_a_plain_token() {
+        let snap = Snapshot::build(names(), |n| match n {
+            OAUTH_TOKEN => Some("stale".into()),
+            OAUTH_TOKEN_OVERRIDE => Some("fresh".into()),
+            _ => None,
+        });
+        assert_eq!(value(&snap, OAUTH_TOKEN), Some("fresh"));
+        assert_eq!(
+            snap.vars.iter().filter(|(k, _)| k == OAUTH_TOKEN).count(),
+            1,
+            "{snap:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_override_is_ignored() {
+        let snap = Snapshot::build(names(), |n| match n {
+            OAUTH_TOKEN => Some("plain".into()),
+            OAUTH_TOKEN_OVERRIDE => Some(String::new()),
+            _ => None,
+        });
+        assert_eq!(value(&snap, OAUTH_TOKEN), Some("plain"));
     }
 
     #[test]

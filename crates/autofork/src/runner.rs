@@ -292,6 +292,10 @@ fn run_attempt(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    // Claude Code scrubbed CLAUDE_CODE_OAUTH_TOKEN from our env on the way
+    // into the hook; a token-only session gets its fork runs authenticated
+    // through AUTOFORK_CLAUDE_CODE_OAUTH_TOKEN instead (see `runenv`).
+    autofork_core::runenv::apply_oauth_override(&mut cmd);
     // Detach from the controlling terminal: closing the parent's terminal
     // window SIGHUPs the process group, and a fork's WORK should survive the
     // session closing even when its report cannot.

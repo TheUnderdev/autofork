@@ -683,6 +683,22 @@ pub fn doctor(paths: &Paths) -> Result<(), String> {
              (flush-on-close) inherit the daemon's environment instead of this session's"
         ),
     }
+    // Claude Code scrubs CLAUDE_CODE_OAUTH_TOKEN from its hooks, so a token
+    // in this shell never reaches autofork unless it is also exported under
+    // the override name.
+    use autofork_core::runenv::{oauth_token_override, OAUTH_TOKEN, OAUTH_TOKEN_OVERRIDE};
+    if oauth_token_override().is_some() {
+        ok(&format!(
+            "fork credentials: {OAUTH_TOKEN_OVERRIDE} is set — claude fork runs authenticate \
+             with it as {OAUTH_TOKEN}"
+        ));
+    } else if std::env::var_os(OAUTH_TOKEN).is_some() {
+        println!(
+            "  WARN: fork credentials: {OAUTH_TOKEN} is set here, but Claude Code strips it \
+             from its hooks, so autofork never sees it — if that token is how your sessions \
+             log in, export {OAUTH_TOKEN_OVERRIDE} with the same value"
+        );
+    }
 
     // opencode integration (only reported when opencode or the plugin is
     // present — a Claude-Code-only install stays quiet).
