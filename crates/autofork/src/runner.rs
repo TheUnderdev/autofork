@@ -25,7 +25,7 @@
 
 use crate::client::Client;
 use autofork_core::config::Paths;
-use autofork_core::protocol::{RequestBody, WakeFork};
+use autofork_core::protocol::{RequestBody, ResponseBody, WakeFork};
 use std::collections::HashMap;
 use std::io::Read;
 use std::process::{Command, Stdio};
@@ -80,6 +80,24 @@ pub struct RunResult {
     /// which exits 2 with it). `None` means the report was spooled for silent
     /// delivery instead.
     pub wake_block: Option<String>,
+    /// The run finished after its pause ended (the daemon's `RunState` said
+    /// so): the user spoke, or a background task's completion started a new
+    /// pause, while the run was in flight. The caller must not re-park on
+    /// the old pause's behalf — the new pause has (or will have) its own
+    /// parked Stop hook.
+    pub stale: bool,
+}
+
+/// What one wake's runs leave behind for the parked Stop hook.
+#[derive(Default)]
+pub struct WakeOutcome {
+    /// Continuing chain reports to wake the parent with (stderr + exit 2).
+    pub wake_blocks: Vec<String>,
+    /// At least one run finished after the pause it was selected in ended.
+    /// The hook exits instead of re-parking: a Stop poll parked now would
+    /// be a poll on a turn that is not idle, and could even fire an
+    /// `idle: 0s` fork mid-turn (the epoch bump re-armed every latch).
+    pub stale: bool,
 }
 
 /// Whether this process is currently executing fork runs. The harness
@@ -122,7 +140,7 @@ pub fn execute_wake(
     cwd: &std::path::Path,
     forks: Vec<WakeFork>,
     reports: &mut HashMap<String, String>,
-) -> Vec<String> {
+) -> WakeOutcome {
     // Batch-parallel like the opencode plugin: each fork run is independent
     // (the daemon holds `after` dependents until predecessors complete).
     RUNNING.store(true, Ordering::SeqCst);
@@ -165,18 +183,19 @@ pub fn execute_wake(
         handles.push((name, h));
         // (reports spool under the conversation id inside run_one)
     }
-    let mut wake_blocks = Vec::new();
+    let mut outcome = WakeOutcome::default();
     for (name, h) in handles {
         let Ok(result) = h.join() else { continue };
         if let Some(report) = result.report {
             reports.insert(name, report);
         }
         if let Some(block) = result.wake_block {
-            wake_blocks.push(block);
+            outcome.wake_blocks.push(block);
         }
+        outcome.stale |= result.stale;
     }
     RUNNING.store(false, Ordering::SeqCst);
-    wake_blocks
+    outcome
 }
 
 /// Run one fork. `can_wake` says whether the caller can deliver a continuing
@@ -381,6 +400,27 @@ fn finish_run(
         )
     };
     let block = autofork_core::wake::report_block(&spec.name, &spec.trigger, status, &body);
+    // Did the pause this run was selected in end while it was in flight (the
+    // user spoke; a background task's completion started a new pause)? Only
+    // the parked hook asks: the end-runner's session is gone, nothing can
+    // move its pause on. Old daemons answer Error — treated as fresh.
+    let stale = can_wake && run_is_stale(paths, session_id, &run_ref);
+    // A chain run's report is an evaluation of one stop — "here is what the
+    // parent should do next, given where it stopped". If the user has spoken
+    // since, that stop is history and the verdict is about a conversation
+    // that no longer exists: delivering it would wake (or later feed) the
+    // parent with instructions for the wrong moment. Drop it; the fork
+    // re-evaluates at the new pause's first Stop, and THAT report supersedes
+    // this one. Non-chain runs (a journal, a handover) still spool: their
+    // report is a record of work done, not a verdict on a moment.
+    let discard = stale && spec.chain;
+    if discard {
+        eprintln!(
+            "[headless] fork '{}' finished after the user moved on; its report is stale and dropped \
+             (the fork re-evaluates at the next stop)",
+            spec.name
+        );
+    }
     // A continuing chain report is the goal loop's handoff: the parent is the
     // worker, and the loop only advances once it has SEEN the report. So it
     // goes back to the caller, which wakes the session with it, instead of
@@ -389,8 +429,8 @@ fn finish_run(
     // which survives session resume (a resumed leg gets a fresh session id),
     // so a report finished after you left still reaches you when you pick the
     // conversation back up.
-    let wake_block = (chain_next && can_wake).then(|| block.clone());
-    if wake_block.is_none() {
+    let wake_block = (chain_next && can_wake && !discard).then(|| block.clone());
+    if wake_block.is_none() && !discard {
         send(
             paths,
             RequestBody::SpoolReport {
@@ -411,9 +451,29 @@ fn finish_run(
         },
     );
     RunResult {
-        report: (status == "completed" && !report.is_empty()).then_some(report),
+        // A discarded report is carried nowhere either: the next chain
+        // iteration must not be told "your previous run said X" about a
+        // stop that is history.
+        report: (status == "completed" && !report.is_empty() && !discard).then_some(report),
         wake_block,
+        stale,
     }
+}
+
+/// Ask the daemon whether a run's pause has moved on. Any failure (no
+/// daemon, an old daemon answering Error) reads as fresh: the pre-v0.30
+/// behavior, never a dropped report by accident.
+fn run_is_stale(paths: &Paths, session_id: &str, run_ref: &str) -> bool {
+    let Ok(mut client) = Client::connect_or_spawn(paths, Duration::from_secs(5)) else {
+        return false;
+    };
+    matches!(
+        client.request(RequestBody::RunState {
+            session_id: session_id.to_string(),
+            run_ref: run_ref.to_string(),
+        }),
+        Ok(ResponseBody::RunState { stale: true })
+    )
 }
 
 fn send(paths: &Paths, body: RequestBody) {

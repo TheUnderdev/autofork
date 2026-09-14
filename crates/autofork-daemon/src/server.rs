@@ -202,6 +202,10 @@ async fn dispatch(daemon: &Arc<Daemon>, body: RequestBody) -> ResponseBody {
             cont.unwrap_or(false),
         ),
         RequestBody::PeekDue { session_id } => daemon.handle_peek_due(&session_id),
+        RequestBody::RunState {
+            session_id,
+            run_ref,
+        } => daemon.handle_run_state(&session_id, &run_ref),
         RequestBody::SpoolReport {
             session_id,
             fork,

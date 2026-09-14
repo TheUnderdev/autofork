@@ -3693,3 +3693,143 @@ fn emit_can_be_scoped_to_one_session() {
         other => panic!("unexpected {other:?}"),
     }
 }
+
+#[test]
+fn a_run_finishing_after_the_user_spoke_is_stale() {
+    // The goal fork is mid-run when the user sends a message. Its verdict is
+    // about a stop that is now history: the daemon reports it stale, does
+    // not let its completion resolve the NEW pause's parked poll, and the
+    // fork re-evaluates at the new pause's first idle — the supersession.
+    let mut h = Harness::new("1s", "0").wake_grace_secs(0);
+    h.write_fork(
+        "goal.md",
+        "---\nfork: true\nrun_on: [idle: 0s]\nchain: true\ngate: true\n---\nGOAL",
+    );
+    h.start_daemon();
+    assert_ack(h.send_event(oc_event(&h, EventKind::SessionStart, "oc1")));
+
+    // Pause 1: the goal fork fires at the Stop and its run starts.
+    let rx = h.park_stop_wait(oc_event(&h, EventKind::Stop, "oc1"));
+    let forks = wake_forks(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert_eq!(forks[0].name, "goal");
+    assert_ack(h.request(RequestBody::ForkSpawned {
+        session_id: "oc1".into(),
+        fork: "goal".into(),
+        run_ref: "ses_g1".into(),
+    }));
+    assert!(matches!(
+        h.request(RequestBody::RunState {
+            session_id: "oc1".into(),
+            run_ref: "ses_g1".into(),
+        }),
+        ResponseBody::RunState { stale: false }
+    ));
+
+    // The user speaks while the run is in flight: a new pause.
+    assert_ack(h.send_event(h.prompt_submit("oc1", true)));
+    assert!(matches!(
+        h.request(RequestBody::RunState {
+            session_id: "oc1".into(),
+            run_ref: "ses_g1".into(),
+        }),
+        ResponseBody::RunState { stale: true }
+    ));
+
+    // The new turn ends and parks its poll. The goal fork is due (fresh
+    // latch in the new epoch) but skipped: run 1 is still in flight and
+    // overlap is false.
+    let parked = h.park_stop_wait(oc_event(&h, EventKind::Stop, "oc1"));
+    assert!(
+        parked.recv_timeout(Duration::from_millis(1500)).is_err(),
+        "an in-flight run must hold the overlap gate"
+    );
+
+    // Run 1 finishes, asking to continue. Stale: the completion must not
+    // resolve the new pause's poll `Waited` (a headless hook would exit and
+    // leave the pause pollless) — it nudges it, and the re-evaluation wakes
+    // the goal fork for the new pause now that nothing is in flight.
+    assert_ack(h.request(RequestBody::ForkCompleted {
+        session_id: "oc1".into(),
+        fork: "goal".into(),
+        run_ref: "ses_g1".into(),
+        status: "completed".into(),
+        cont: Some(true),
+    }));
+    let forks = wake_forks(parked.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert_eq!(
+        forks[0].name, "goal",
+        "the next goal run supersedes the stale one"
+    );
+}
+
+#[test]
+fn a_stale_completion_leaves_the_new_pause_gate_alone() {
+    // Two goal runs overlap: run 1 (old pause) settles AFTER run 2 (new
+    // pause) took the gate. Before the stale check, run 1's settlement
+    // released run 2's gate and let the held idle forks loose under a live
+    // chain.
+    let mut h = Harness::new("1s", "0").wake_grace_secs(0);
+    h.write_fork(
+        "goal.md",
+        "---\nfork: true\nrun_on: [idle: 0s]\nchain: true\ngate: true\noverlap: true\n---\nGOAL",
+    );
+    h.write_fork("handover.md", "---\nfork: true\nrun_on: [idle: 1s]\n---\nH");
+    h.start_daemon();
+    assert_ack(h.send_event(oc_event(&h, EventKind::SessionStart, "oc1")));
+
+    // Pause 1: run 1 starts.
+    let rx = h.park_stop_wait(oc_event(&h, EventKind::Stop, "oc1"));
+    assert_eq!(
+        wake_forks(rx.recv_timeout(Duration::from_secs(10)).unwrap())[0].name,
+        "goal"
+    );
+    assert_ack(h.request(RequestBody::ForkSpawned {
+        session_id: "oc1".into(),
+        fork: "goal".into(),
+        run_ref: "ses_g1".into(),
+    }));
+
+    // The user speaks; pause 2: run 2 starts (overlap allowed) and holds
+    // the gate.
+    assert_ack(h.send_event(h.prompt_submit("oc1", true)));
+    let rx2 = h.park_stop_wait(oc_event(&h, EventKind::Stop, "oc1"));
+    let forks = wake_forks(rx2.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert_eq!(forks.len(), 1, "{forks:?}");
+    assert_eq!(forks[0].name, "goal");
+    assert_ack(h.request(RequestBody::ForkSpawned {
+        session_id: "oc1".into(),
+        fork: "goal".into(),
+        run_ref: "ses_g2".into(),
+    }));
+
+    // Run 1 settles, stale. The gate run 2 holds must survive: handover's
+    // deadline elapses, but it stays held.
+    assert_ack(h.request(RequestBody::ForkCompleted {
+        session_id: "oc1".into(),
+        fork: "goal".into(),
+        run_ref: "ses_g1".into(),
+        status: "completed".into(),
+        cont: None,
+    }));
+    let rx3 = h.park_stop_wait(oc_event(&h, EventKind::Stop, "oc1"));
+    assert!(
+        rx3.recv_timeout(Duration::from_millis(2500)).is_err(),
+        "a stale settlement must not release the gate of the run that holds it"
+    );
+
+    // Run 2 settles for real: the gate releases and handover fires.
+    assert_ack(h.request(RequestBody::ForkCompleted {
+        session_id: "oc1".into(),
+        fork: "goal".into(),
+        run_ref: "ses_g2".into(),
+        status: "completed".into(),
+        cont: None,
+    }));
+    assert!(matches!(
+        rx3.recv_timeout(Duration::from_secs(5)).unwrap(),
+        ResponseBody::Waited
+    ));
+    let rx4 = h.park_stop_wait(oc_event(&h, EventKind::Stop, "oc1"));
+    let forks = wake_forks(rx4.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert_eq!(forks[0].name, "handover");
+}

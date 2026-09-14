@@ -20,7 +20,7 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
-const SCHEMA_VERSION: i32 = 14;
+const SCHEMA_VERSION: i32 = 15;
 
 /// Split a comma-joined tag column back into a list (trimmed, empties
 /// dropped). `NULL` (unset) stays `None`.
@@ -425,6 +425,19 @@ impl Store {
             conn.execute_batch(
                 "BEGIN;
                  ALTER TABLE sessions ADD COLUMN final_flush_at INTEGER;
+                 COMMIT;",
+            )?;
+        }
+        if version < 15 {
+            // The pause a fork spawn belongs to. A run that finishes after the
+            // user has spoken again (the epoch moved on) evaluated a moment
+            // that is history: its report is stale, and the fork re-evaluates
+            // at the next stop. Stamped at record time from the session row;
+            // NULL for rows recorded before this column existed (never
+            // stale).
+            conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE fork_spawns ADD COLUMN pause_epoch INTEGER;
                  COMMIT;",
             )?;
         }
@@ -1157,7 +1170,10 @@ impl Store {
     /// Record a fork spawn observed in the session transcript. `fork_name` is
     /// `None` when the spawn prompt didn't carry the fingerprint (the row then
     /// only classifies completion notifications, never releases dependents).
-    /// Idempotent per (session, tool_use_id).
+    /// Idempotent per (session, tool_use_id). The row is stamped with the
+    /// session's current pause epoch, so a completion can tell whether the
+    /// pause the run evaluated is still the current one (see
+    /// [`Store::spawn_is_stale`]).
     pub fn record_spawn(
         &self,
         session_id: &str,
@@ -1166,11 +1182,39 @@ impl Store {
         now: i64,
     ) -> rusqlite::Result<()> {
         self.conn.execute(
-            "INSERT OR IGNORE INTO fork_spawns (session_id, tool_use_id, fork_name, spawned_at)
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT OR IGNORE INTO fork_spawns
+               (session_id, tool_use_id, fork_name, spawned_at, pause_epoch)
+             VALUES (?1, ?2, ?3, ?4,
+                     (SELECT pause_epoch FROM sessions WHERE session_id = ?1))",
             params![session_id, tool_use_id, fork_name, now],
         )?;
         Ok(())
+    }
+
+    /// Whether a recorded fork spawn is stale: the session's pause epoch has
+    /// moved past the one the spawn was stamped with — the user (or a
+    /// background task's completion) started a new pause while the run was
+    /// in flight, so the run evaluated a stop that is already history. A
+    /// spawn the registry doesn't know, one recorded before epochs were
+    /// stamped, or one whose session is gone is never stale.
+    pub fn spawn_is_stale(
+        &self,
+        session_id: &str,
+        tool_use_id: Option<&str>,
+        task_id: Option<&str>,
+    ) -> rusqlite::Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM fork_spawns f
+             JOIN sessions s ON s.session_id = f.session_id
+             WHERE f.session_id = ?1
+               AND ((?2 IS NOT NULL AND f.tool_use_id = ?2)
+                 OR (?3 IS NOT NULL AND f.task_id = ?3))
+               AND f.pause_epoch IS NOT NULL
+               AND f.pause_epoch <> s.pause_epoch",
+            params![session_id, tool_use_id, task_id],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
     }
 
     /// Attach the background task id to a recorded spawn (from the Agent
@@ -1744,6 +1788,37 @@ mod tests {
             s.get_session("a").unwrap().unwrap().pause_started_at,
             Some(200)
         );
+    }
+
+    #[test]
+    fn spawn_stale_once_the_pause_moves_on() {
+        let s = store();
+        seed_session(&s, "a", "/p", 100);
+        s.record_spawn("a", "toolu_1", Some("goal"), 110).unwrap();
+        s.set_spawn_task_id("a", "toolu_1", "task_1").unwrap();
+        // Same pause: fresh.
+        assert!(!s.spawn_is_stale("a", Some("toolu_1"), None).unwrap());
+        // The user spoke while the run was in flight: the run's pause is
+        // over, whichever id the completion is matched by.
+        s.bump_pause_epoch("a").unwrap();
+        assert!(s.spawn_is_stale("a", Some("toolu_1"), None).unwrap());
+        assert!(s.spawn_is_stale("a", None, Some("task_1")).unwrap());
+        // A spawn recorded in the new pause is fresh again; unknown ids and
+        // a terminal status change nothing about staleness.
+        s.record_spawn("a", "toolu_2", Some("goal"), 130).unwrap();
+        assert!(!s.spawn_is_stale("a", Some("toolu_2"), None).unwrap());
+        assert!(!s.spawn_is_stale("a", Some("toolu_nope"), None).unwrap());
+        s.mark_spawn_terminal("a", Some("toolu_1"), None, "completed", 140)
+            .unwrap();
+        assert!(s.spawn_is_stale("a", Some("toolu_1"), None).unwrap());
+        // Rows from before the column existed carry NULL: never stale.
+        s.conn
+            .execute(
+                "UPDATE fork_spawns SET pause_epoch = NULL WHERE tool_use_id = 'toolu_1'",
+                [],
+            )
+            .unwrap();
+        assert!(!s.spawn_is_stale("a", Some("toolu_1"), None).unwrap());
     }
 
     #[test]

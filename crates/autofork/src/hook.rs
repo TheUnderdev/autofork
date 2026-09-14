@@ -220,7 +220,7 @@ fn run_hook_inner(kind: HookKind) -> Option<()> {
                         eprintln!("{payload}");
                         std::process::exit(2);
                     }
-                    let wake_blocks = crate::runner::execute_wake(
+                    let outcome = crate::runner::execute_wake(
                         &paths,
                         &input.session_id,
                         &resume_target,
@@ -228,6 +228,18 @@ fn run_hook_inner(kind: HookKind) -> Option<()> {
                         forks.unwrap_or_default(),
                         &mut reports,
                     );
+                    if outcome.stale {
+                        // The pause these runs were selected in ended while
+                        // they ran (the user spoke). Whatever was worth
+                        // keeping is spooled; a chain verdict was dropped.
+                        // Do NOT re-park: this poll would be a Stop on a
+                        // turn that is not idle, and the epoch bump re-armed
+                        // every latch — an `idle: 0s` fork would fire
+                        // mid-turn from it. The new pause parks its own poll
+                        // at its own Stop (or already has).
+                        return Some(());
+                    }
+                    let wake_blocks = outcome.wake_blocks;
                     if !wake_blocks.is_empty() {
                         // The goal fast path: a chain run asked to continue,
                         // so its report is work for the parent — deliver it by

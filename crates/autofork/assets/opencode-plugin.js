@@ -504,7 +504,20 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
     // `chain: true` forks (the daemon double-checks the definition too).
     const chainNext = status === "completed" && run.chain && wantsContinue(report);
     if (chainNext) report = stripContinue(report);
-    if (status === "completed" && report) {
+    // A chain run's report is a verdict on one stop. If the user spoke while
+    // the run was in flight (the daemon saw the parent's pause move on), that
+    // stop is history: injecting the verdict now would steer the parent by a
+    // conversation that no longer exists. Drop it — the fork re-evaluates at
+    // the new pause's first idle, and that report supersedes this one. The
+    // completion frame still goes out (the daemon needs the run terminal);
+    // it re-arms nothing for a stale run. Non-chain reports still land: they
+    // record work done, not a verdict on a moment.
+    let discard = false;
+    if (run.chain && status === "completed") {
+      const state = await call("run-state", { session_id: run.parent, run_ref: id });
+      discard = state?.stale === true;
+    }
+    if (status === "completed" && report && !discard) {
       reports.set(reportKey(run.parent, run.fork), report);
     }
     const body =
@@ -514,7 +527,9 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
     const block = `---\nsource: autofork\nfork: ${run.fork} (trigger: ${run.trigger}) — ${status}\n---\n${body}`;
     selfPrompt.add(run.parent);
     try {
-      if (chainNext) {
+      if (discard) {
+        // Nothing to inject; fall through to the completion frame.
+      } else if (chainNext) {
         // The chain continues: inject the report as a REAL turn, so the
         // parent model reacts to it (works toward the goal) instead of
         // parking it for later. Flag the busy transition this starts as

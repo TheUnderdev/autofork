@@ -71,6 +71,15 @@ pub enum RequestBody {
         fork: String,
         text: String,
     },
+    /// Is this fork run's report still worth delivering? Asked by the
+    /// clients that deliver reports themselves (the Claude Code headless
+    /// runner, the opencode plugin) once a run finishes, BEFORE spooling or
+    /// injecting it. Answered with `RunState`: `stale: true` means the
+    /// session's pause moved on while the run was in flight (the user spoke,
+    /// or a background task's completion started a new pause) — the run
+    /// evaluated a stop that is already history. Additive frame; old daemons
+    /// answer `Error`, which callers treat as "fresh".
+    RunState { session_id: String, run_ref: String },
     /// Take (and clear) the spooled reports for a session — called by the
     /// UserPromptSubmit hook to deliver them as additionalContext. Additive
     /// frame; old daemons answer `Error`, treated as "none".
@@ -278,6 +287,10 @@ pub enum ResponseBody {
     /// Additive.
     Emitted {
         sessions: usize,
+    },
+    /// Answer to `RunState`: whether the run's pause has moved on. Additive.
+    RunState {
+        stale: bool,
     },
     Error {
         code: ErrorCode,

@@ -54,6 +54,10 @@ pub enum OcHookKind {
     ForkSpawned,
     /// A fork run reached a terminal status.
     ForkCompleted,
+    /// Is a finished run's report still worth injecting? Answers on stdout:
+    /// `{"stale":true}` when the parent's pause moved on (the user spoke)
+    /// while the run was in flight, else `{"stale":false}`.
+    RunState,
 }
 
 /// What the plugin writes on stdin. One shape for every kind; unused fields
@@ -117,6 +121,7 @@ pub fn run_hook(kind: OcHookKind) {
         match kind {
             OcHookKind::StopWait => println!("{{\"waited\":true}}"),
             OcHookKind::Message => println!("{{}}"),
+            OcHookKind::RunState => println!("{{\"stale\":false}}"),
             _ => {}
         }
     }
@@ -303,6 +308,17 @@ fn run_hook_inner(kind: OcHookKind) -> Option<()> {
                 fork: input.fork.clone()?,
                 run_ref: input.run_ref.clone()?,
             });
+        }
+        OcHookKind::RunState => {
+            let mut client = Client::connect_or_spawn(&paths, Duration::from_secs(5)).ok()?;
+            let stale = matches!(
+                client.request(RequestBody::RunState {
+                    session_id: input.session_id.clone(),
+                    run_ref: input.run_ref.clone()?,
+                }),
+                Ok(ResponseBody::RunState { stale: true })
+            );
+            println!("{}", serde_json::json!({ "stale": stale }));
         }
         OcHookKind::ForkCompleted => {
             let mut client = Client::connect_or_spawn(&paths, Duration::from_secs(5)).ok()?;

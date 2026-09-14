@@ -654,12 +654,22 @@ impl Daemon {
                                 .unwrap_or(None)
                         };
                         if let Some(fork) = fork {
-                            self.on_own_fork_terminal(
-                                &ev.session_id,
-                                &fork,
-                                status,
-                                ev.notif_continue == Some(true),
-                            );
+                            let stale = {
+                                let store = self.store.lock().unwrap();
+                                store
+                                    .spawn_is_stale(
+                                        &ev.session_id,
+                                        ev.notif_tool_use_id.as_deref(),
+                                        ev.notif_task_id.as_deref(),
+                                    )
+                                    .unwrap_or(false)
+                            };
+                            let cont = ev.notif_continue == Some(true);
+                            if stale {
+                                self.on_stale_fork_terminal(&ev.session_id, &fork, status, cont);
+                            } else {
+                                self.on_own_fork_terminal(&ev.session_id, &fork, status, cont);
+                            }
                         }
                     }
                     !matched && !self.recently_woke(&ev.session_id, t)
@@ -1422,20 +1432,70 @@ impl Daemon {
         cont: bool,
     ) -> ResponseBody {
         self.touch_busy();
-        let transitioned = {
+        let (transitioned, stale) = {
             let store = self.store.lock().unwrap();
+            let stale = store
+                .spawn_is_stale(session_id, Some(run_ref), None)
+                .unwrap_or(false);
             let (matched, transitioned) = store
                 .mark_spawn_terminal(session_id, Some(run_ref), None, status, now())
                 .unwrap_or((false, false));
-            tracing::debug!(session = %session_id, fork, run_ref, status, matched, cont,
-                "opencode fork completion");
-            transitioned
+            tracing::debug!(session = %session_id, fork, run_ref, status, matched, cont, stale,
+                "fork completion");
+            (transitioned, stale)
         };
         if transitioned {
-            self.on_own_fork_terminal(session_id, fork, status, cont);
+            if stale {
+                self.on_stale_fork_terminal(session_id, fork, status, cont);
+            } else {
+                self.on_own_fork_terminal(session_id, fork, status, cont);
+            }
         }
-        self.cancel_wait(session_id);
+        if stale {
+            // The run's pause is over; the poll parked for the NEW pause (if
+            // any) must not be resolved `Waited` by it — that would end a
+            // headless hook's loop and leave the new pause with no poll at
+            // all. A nudge re-evaluates instead: the run just went terminal,
+            // so an `overlap: false` fork it was blocking (its own next
+            // iteration, typically) is selectable now.
+            self.nudge(session_id);
+        } else {
+            self.cancel_wait(session_id);
+        }
         ResponseBody::Ack
+    }
+
+    /// `RunState`: whether a run's report is still worth delivering. See
+    /// [`Store::spawn_is_stale`].
+    pub fn handle_run_state(self: &Arc<Self>, session_id: &str, run_ref: &str) -> ResponseBody {
+        self.touch_busy();
+        let stale = {
+            let store = self.store.lock().unwrap();
+            store
+                .spawn_is_stale(session_id, Some(run_ref), None)
+                .unwrap_or(false)
+        };
+        ResponseBody::RunState { stale }
+    }
+
+    /// One of the daemon's own fork runs reached a terminal status AFTER the
+    /// pause it was selected in ended (`Store::spawn_is_stale`): the user
+    /// spoke, or a background task's completion started a new pause, while
+    /// the run was in flight. Whatever it concluded is about a stop that is
+    /// already history, so nothing of the old pause's bookkeeping applies:
+    ///
+    /// - no chain re-arm — the sentinel asked to continue a chain the user's
+    ///   message already ended (and the fork's latch is fresh in the new
+    ///   epoch anyway: an `idle: 0s` chain fork re-evaluates at the new
+    ///   pause's first Stop, which is the supersession);
+    /// - no gate release — the epoch bump already dropped the old pause's
+    ///   gate, and `active_gate` now belongs to whatever this fork's NEXT run
+    ///   holds in the new pause; releasing it here would let the held idle
+    ///   forks loose under a live goal chain.
+    fn on_stale_fork_terminal(&self, session_id: &str, fork_name: &str, status: &str, cont: bool) {
+        tracing::info!(session = %session_id, fork = fork_name, status, cont,
+            "fork run finished after its pause ended: stale, \
+             not re-arming or releasing anything (the fork re-evaluates at the next stop)");
     }
 
     /// One of the daemon's own fork runs reached a terminal status (the
@@ -1571,7 +1631,7 @@ impl Daemon {
                 // (fork, status, continue_requested) for spawns this delta
                 // flipped terminal — processed after the lock drops, since
                 // the terminal handler takes its own locks.
-                let mut settled: Vec<(String, String, bool)> = Vec::new();
+                let mut settled: Vec<(String, String, bool, bool)> = Vec::new();
                 {
                     let store = self.store.lock().unwrap();
                     for (tool_use_id, fork_name) in &delta.spawns {
@@ -1636,7 +1696,19 @@ impl Daemon {
                                     n.tool_use_id.as_deref(),
                                     n.task_id.as_deref(),
                                 ) {
-                                    settled.push((fork, status.to_string(), n.continue_requested));
+                                    let stale = store
+                                        .spawn_is_stale(
+                                            &ev.session_id,
+                                            n.tool_use_id.as_deref(),
+                                            n.task_id.as_deref(),
+                                        )
+                                        .unwrap_or(false);
+                                    settled.push((
+                                        fork,
+                                        status.to_string(),
+                                        n.continue_requested,
+                                        stale,
+                                    ));
                                 }
                             }
                         }
@@ -1647,8 +1719,12 @@ impl Daemon {
                         delta.prompt_tokens,
                     );
                 }
-                for (fork, status, cont) in settled {
-                    self.on_own_fork_terminal(&ev.session_id, &fork, &status, cont);
+                for (fork, status, cont, stale) in settled {
+                    if stale {
+                        self.on_stale_fork_terminal(&ev.session_id, &fork, &status, cont);
+                    } else {
+                        self.on_own_fork_terminal(&ev.session_id, &fork, &status, cont);
+                    }
                 }
                 delta.prompt_tokens.or(session.prompt_tokens)
             }

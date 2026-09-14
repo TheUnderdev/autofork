@@ -64,6 +64,11 @@ impl Env {
             .args(["hook", event])
             .env("AUTOFORK_HOME", &self.home)
             .env("AUTOFORK_SOCKET", &self.socket)
+            // Keep the real home directory out of discovery: a user-level
+            // `~/.claude` fork (an `idle: 0s` goal fork, say) would otherwise
+            // wake these sessions and fail the assertions.
+            .env("AUTOFORK_CLAUDE_DIR", self.home.join("claude"))
+            .env("AUTOFORK_AGENTS_DIR", self.home.join("agents"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -256,6 +261,11 @@ fn disable_tags_env_filters_fork() {
             .args(["hook", event])
             .env("AUTOFORK_HOME", &env.home)
             .env("AUTOFORK_SOCKET", &env.socket)
+            // Keep the real home directory out of discovery: a user-level
+            // `~/.claude` fork (an `idle: 0s` goal fork, say) would otherwise
+            // wake these sessions and fail the assertions.
+            .env("AUTOFORK_CLAUDE_DIR", env.home.join("claude"))
+            .env("AUTOFORK_AGENTS_DIR", env.home.join("agents"))
             .env("AUTOFORK_DISABLE_TAGS", "ci")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -283,6 +293,11 @@ fn disable_tags_env_filters_fork() {
             .args(["hook", "user-prompt-submit"])
             .env("AUTOFORK_HOME", &home)
             .env("AUTOFORK_SOCKET", &socket)
+            // Keep the real home directory out of discovery: a user-level
+            // `~/.claude` fork (an `idle: 0s` goal fork, say) would otherwise
+            // wake these sessions and fail the assertions.
+            .env("AUTOFORK_CLAUDE_DIR", home.join("claude"))
+            .env("AUTOFORK_AGENTS_DIR", home.join("agents"))
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -314,6 +329,11 @@ fn fork_env_guard_short_circuits_hook() {
         .args(["hook", "stop-wait"])
         .env("AUTOFORK_HOME", &env.home)
         .env("AUTOFORK_SOCKET", &env.socket)
+        // Keep the real home directory out of discovery: a user-level
+        // `~/.claude` fork (an `idle: 0s` goal fork, say) would otherwise
+        // wake these sessions and fail the assertions.
+        .env("AUTOFORK_CLAUDE_DIR", env.home.join("claude"))
+        .env("AUTOFORK_AGENTS_DIR", env.home.join("agents"))
         .env("AUTOFORK_FORK", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -354,6 +374,11 @@ fn fork_env_guard_short_circuits_opencode_hook() {
         .args(["opencode", "hook", "session-start"])
         .env("AUTOFORK_HOME", &env.home)
         .env("AUTOFORK_SOCKET", &env.socket)
+        // Keep the real home directory out of discovery: a user-level
+        // `~/.claude` fork (an `idle: 0s` goal fork, say) would otherwise
+        // wake these sessions and fail the assertions.
+        .env("AUTOFORK_CLAUDE_DIR", env.home.join("claude"))
+        .env("AUTOFORK_AGENTS_DIR", env.home.join("agents"))
         .env("AUTOFORK_FORK", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -401,6 +426,11 @@ fn concurrent_session_starts_race_to_one_daemon() {
             .args(["hook", "session-start"])
             .env("AUTOFORK_HOME", &env.home)
             .env("AUTOFORK_SOCKET", &env.socket)
+            // Keep the real home directory out of discovery: a user-level
+            // `~/.claude` fork (an `idle: 0s` goal fork, say) would otherwise
+            // wake these sessions and fail the assertions.
+            .env("AUTOFORK_CLAUDE_DIR", env.home.join("claude"))
+            .env("AUTOFORK_AGENTS_DIR", env.home.join("agents"))
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -421,6 +451,11 @@ fn concurrent_session_starts_race_to_one_daemon() {
         .arg("status")
         .env("AUTOFORK_HOME", &env.home)
         .env("AUTOFORK_SOCKET", &env.socket)
+        // Keep the real home directory out of discovery: a user-level
+        // `~/.claude` fork (an `idle: 0s` goal fork, say) would otherwise
+        // wake these sessions and fail the assertions.
+        .env("AUTOFORK_CLAUDE_DIR", env.home.join("claude"))
+        .env("AUTOFORK_AGENTS_DIR", env.home.join("agents"))
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -440,6 +475,11 @@ fn hook_never_fails_on_garbage_stdin() {
             .args(["hook", event])
             .env("AUTOFORK_HOME", &env.home)
             .env("AUTOFORK_SOCKET", &env.socket)
+            // Keep the real home directory out of discovery: a user-level
+            // `~/.claude` fork (an `idle: 0s` goal fork, say) would otherwise
+            // wake these sessions and fail the assertions.
+            .env("AUTOFORK_CLAUDE_DIR", env.home.join("claude"))
+            .env("AUTOFORK_AGENTS_DIR", env.home.join("agents"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -461,6 +501,7 @@ fn hook_never_fails_on_garbage_stdin() {
 fn mock_headless_daemon(
     socket: PathBuf,
     wake: ResponseBody,
+    run_stale: bool,
 ) -> (
     thread::JoinHandle<()>,
     std::sync::Arc<std::sync::Mutex<Vec<String>>>,
@@ -512,7 +553,19 @@ fn mock_headless_daemon(
                                 .lock()
                                 .unwrap()
                                 .push(serde_json::to_string(other).unwrap());
-                            ResponseBody::Ack
+                            match other {
+                                RequestBody::RunState { .. } => {
+                                    ResponseBody::RunState { stale: run_stale }
+                                }
+                                // A hook that learns its wake was stale exits
+                                // without re-parking: the completion frame is
+                                // the last thing this mock will ever see.
+                                RequestBody::ForkCompleted { .. } if run_stale => {
+                                    done.store(true, std::sync::atomic::Ordering::SeqCst);
+                                    ResponseBody::Ack
+                                }
+                                _ => ResponseBody::Ack,
+                            }
                         }
                     };
                     let resp = Response {
@@ -576,13 +629,18 @@ fn headless_wake_runs_forks_and_spools_reports() {
         }]),
         feed: None,
     };
-    let (daemon, frames) = mock_headless_daemon(env.socket.clone(), wake);
+    let (daemon, frames) = mock_headless_daemon(env.socket.clone(), wake, false);
     wait_for_socket(&env.socket);
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_autofork"))
         .args(["hook", "stop-wait"])
         .env("AUTOFORK_HOME", &env.home)
         .env("AUTOFORK_SOCKET", &env.socket)
+        // Keep the real home directory out of discovery: a user-level
+        // `~/.claude` fork (an `idle: 0s` goal fork, say) would otherwise
+        // wake these sessions and fail the assertions.
+        .env("AUTOFORK_CLAUDE_DIR", env.home.join("claude"))
+        .env("AUTOFORK_AGENTS_DIR", env.home.join("agents"))
         .env("AUTOFORK_CLAUDE_BIN", &stub)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -620,4 +678,93 @@ fn headless_wake_runs_forks_and_spools_reports() {
     let argv = std::fs::read_to_string(&argv_log).unwrap();
     assert!(argv.contains("--settings"), "{argv}");
     assert!(argv.contains(r#"{"disableAllHooks":true}"#), "{argv}");
+}
+
+#[test]
+fn headless_drops_a_chain_report_that_finished_after_the_user_spoke() {
+    // A chain run asks to continue, but the daemon says the parent's pause
+    // moved on while it ran (the user spoke): the verdict is about a stop
+    // that is history. The hook neither wakes the session with it (exit 2)
+    // nor spools it, still reports the completion, and exits instead of
+    // re-parking on a turn that is not idle.
+    let env = Env::new("1h");
+    std::fs::write(
+        env.home.join("config.toml"),
+        "default_idle_deadline = \"1h\"\nquiet_period = \"1h\"\n",
+    )
+    .unwrap();
+    let stub = env.project.join("claude-stub.sh");
+    std::fs::write(
+        &stub,
+        "#!/bin/sh\nprintf '{\"session_id\":\"fork-1\",\"result\":\"do more <<autofork:continue>>\",\"is_error\":false}'\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let wake = ResponseBody::Wake {
+        payload: "unused by the headless runner".into(),
+        forks: Some(vec![autofork_core::protocol::WakeFork {
+            name: "goal".into(),
+            path: "/x/goal.md".into(),
+            trigger: "idle".into(),
+            overlap: false,
+            after: Vec::new(),
+            chain: true,
+            model: Some("stub-model".into()),
+            model_fallbacks: Vec::new(),
+            mode: None,
+            prompt: "Read the file /x/goal.md".into(),
+        }]),
+        feed: None,
+    };
+    let (daemon, frames) = mock_headless_daemon(env.socket.clone(), wake, true);
+    wait_for_socket(&env.socket);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_autofork"))
+        .args(["hook", "stop-wait"])
+        .env("AUTOFORK_HOME", &env.home)
+        .env("AUTOFORK_SOCKET", &env.socket)
+        // Keep the real home directory out of discovery: a user-level
+        // `~/.claude` fork (an `idle: 0s` goal fork, say) would otherwise
+        // wake these sessions and fail the assertions.
+        .env("AUTOFORK_CLAUDE_DIR", env.home.join("claude"))
+        .env("AUTOFORK_AGENTS_DIR", env.home.join("agents"))
+        .env("AUTOFORK_CLAUDE_BIN", &stub)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(env.hook_input("s-stale").to_string().as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a stale verdict never wakes the session"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("<<autofork"), "no wake payload: {stderr}");
+    assert!(stderr.contains("stale"), "the drop is logged: {stderr}");
+    daemon.join().unwrap();
+
+    let frames = frames.lock().unwrap().join("\n");
+    assert!(frames.contains("\"fork_spawned\""), "{frames}");
+    assert!(frames.contains("\"run_state\""), "{frames}");
+    assert!(
+        !frames.contains("\"spool_report\""),
+        "stale report spooled: {frames}"
+    );
+    assert!(
+        frames.contains("\"fork_completed\"") && frames.contains("\"continue\":true"),
+        "{frames}"
+    );
 }

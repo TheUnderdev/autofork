@@ -312,6 +312,18 @@ nothing however it phrases its report, and the daemon re-checks the definition).
 back to the `chain_limit` config key, default 25). Your own next message always ends the chain —
 genuine activity starts a new pause and the fork re-evaluates on the next one.
 
+**A verdict that arrives late is dropped.** A chain run's report is an evaluation of one stop:
+"given where the parent stopped, here is what it should do next". If you send a message while the
+run is still in flight, that stop is history — the report is about a conversation that no longer
+exists — so it is discarded rather than delivered (since v0.30): the headless runner neither wakes
+the session with it nor spools it, the opencode plugin does not inject it, and the daemon lets it
+neither re-arm the chain nor release a gate (the gate now belongs to the run the new pause
+started). The fork simply re-evaluates at the new pause's first stop, and *that* report supersedes
+the stale one. The same applies when a background task's completion starts a new pause mid-run.
+The daemon decides staleness by stamping each run with the pause it was selected in (the `RunState`
+frame answers whether that pause has moved on); non-chain runs — a journal, a handover — still
+spool, since their report records work done rather than a verdict on a moment.
+
 ### Runaway protection
 
 The per-pause counters above assume the daemon can tell genuine user activity from autofork's own
@@ -687,7 +699,11 @@ the goal fast path, the async twin of codex's synchronous block-and-inject. A go
 runs autonomously under the headless runner too: fork evaluates → parent wakes and works → parent
 stops → fork evaluates again, until a report omits the sentinel. Settled and failed runs still
 spool silently. (Before v0.22 a continuing report only surfaced at your next manual prompt, so the
-loop advanced *between* your messages rather than on its own.)
+loop advanced *between* your messages rather than on its own.) A continuing report that lands
+after you have already sent your next message is stale and dropped instead — see
+[Chain forks](#chain-forks-the-fork-decides-whether-to-run-again) — and the hook process exits
+rather than re-parking on a turn that is not idle; the new pause parks its own poll at its own
+Stop.
 
 `fork_runner = "subagent"` opts back into the pre-v0.18 behavior: the session's own model spawns
 fork subagents (near-total prompt-cache reuse, forks on the session's model) at the price of
