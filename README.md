@@ -521,7 +521,7 @@ External moments add `AUTOFORK_TRIGGER` and, per kind, `AUTOFORK_WATCH` + `AUTOF
 |---|---|---|
 | Claude Code | spooled, delivered as `additionalContext` at your next prompt | the parked Stop poll exits 2 with the block |
 | codex | spooled, delivered as `additionalContext` at your next prompt | the Stop hook blocks-and-injects it at the next turn end |
-| opencode | spooled, delivered inside your next turn (a hidden part on your message, via the plugin's `chat.message` hook) — or, if it fires while the session is idle, injected as a **no-reply message** | injected as a real turn, with your model/agent pinned |
+| opencode | spooled, delivered inside your next turn (a hidden part on your message, via the plugin's `chat.message` hook) — or, if it fires while the session is idle, injected as a **no-reply message** whose only part is hidden the same way | injected as a real turn, with your model/agent pinned — the turn's own text is hidden, you see only the model's reaction |
 
 One honest limit: on Claude Code and codex there is no channel into a *running* turn. A quiet feed
 therefore reaches the model at its next prompt, and a wake feed at the next turn boundary. opencode
@@ -943,6 +943,8 @@ session lifecycle events and talks to the same autofork daemon; when a fork come
    forked opencode session doesn't inherit them, and cache reuse needs an identical prefix),
 3. when the copy finishes, injects its report into your session as a **no-reply message** — no
    turn is spent; your model sees the report block (`source: autofork`) on your next exchange,
+   and your transcript shows nothing (the part is `synthetic`, which opencode ships to the model
+   but never renders — the same invisibility Claude Code's `additionalContext` has),
 4. reports the completion to the daemon, which releases any `after` dependents.
 
 Fork-run sessions are titled `autofork/<fork> (<trigger>)` in the session list while they run, and

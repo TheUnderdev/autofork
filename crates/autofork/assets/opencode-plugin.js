@@ -17,6 +17,11 @@
 // next turn. Exception: a `chain: true` fork's report that carries the
 // continue sentinel is injected as a real turn (the parent reacts to it),
 // and the daemon re-fires the fork once the turn settles — the goal loop.
+// Every part the plugin injects into a parent is `synthetic: true`: opencode
+// ships synthetic text to the model but leaves it out of the rendered
+// transcript (a user message with no visible text draws nothing), so feeds
+// and reports are as invisible here as a Claude Code hook's
+// additionalContext — the TUI shows only what the model does with them.
 // A run's session is deleted once its report is delivered (startup sweep
 // for leftovers), so fork runs never accumulate in opencode's database.
 //
@@ -332,7 +337,7 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
   // the daemon pushes mid-pause has no turn to ride (that is the
   // `chat.message` drain's job), so it rides the same zero-turn no-reply
   // message a fork report does — the model sees it on its next exchange,
-  // nothing is spent, and the transcript shows one injected block.
+  // nothing is spent, and the transcript shows nothing (synthetic part).
   // A `deliver: wake` feed is injected as a real turn instead, pinning the
   // parent's model/agent exactly as a chain report does, and the turn it
   // starts is flagged non-waking so it does not bump the pause epoch and
@@ -350,13 +355,13 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
           body: {
             ...(parent.model ? { model: parent.model } : {}),
             ...(parent.agent ? { agent: parent.agent } : {}),
-            parts: [{ type: "text", text }],
+            parts: [{ type: "text", text, synthetic: true }],
           },
         });
       } else {
         await client.session.prompt({
           path: { id: parentID },
-          body: { noReply: true, parts: [{ type: "text", text }] },
+          body: { noReply: true, parts: [{ type: "text", text, synthetic: true }] },
         });
       }
     } catch {
@@ -542,13 +547,13 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
           body: {
             ...(parent.model ? { model: parent.model } : {}),
             ...(parent.agent ? { agent: parent.agent } : {}),
-            parts: [{ type: "text", text: block }],
+            parts: [{ type: "text", text: block, synthetic: true }],
           },
         });
       } else {
         await client.session.prompt({
           path: { id: run.parent },
-          body: { noReply: true, parts: [{ type: "text", text: block }] },
+          body: { noReply: true, parts: [{ type: "text", text: block, synthetic: true }] },
         });
       }
     } catch {
