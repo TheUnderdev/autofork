@@ -2515,7 +2515,10 @@ fn unescape_ansi(s: &str) -> String {
     out
 }
 
-#[cfg(test)]
+// The analyser reasons in POSIX paths (a guard governs a POSIX shell);
+// on Windows the same PathBufs display with backslashes, so the string
+// assertions here are Unix-only. The logic itself compiles everywhere.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

@@ -1163,6 +1163,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // path display differs on Windows
     fn guard_block() {
         let home = crate::sys::home_dir().unwrap();
         let p = parse(

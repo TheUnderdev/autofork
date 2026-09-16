@@ -584,7 +584,10 @@ pub fn remote_url_host(url: &str) -> Option<String> {
     (!host.is_empty()).then(|| host.to_string())
 }
 
-#[cfg(test)]
+// The analyser reasons in POSIX paths (a guard governs a POSIX shell);
+// on Windows the same PathBufs display with backslashes, so the string
+// assertions here are Unix-only. The logic itself compiles everywhere.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
