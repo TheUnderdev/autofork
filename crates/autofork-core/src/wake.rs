@@ -365,6 +365,9 @@ pub fn guard_paragraph(g: &crate::guard::Guard) -> String {
     if !g.network {
         out.push_str(" You have no network (git may still sync and push a repository inside your write list).");
     }
+    if !g.allows_family(crate::guard::ToolFamily::Mcp) {
+        out.push_str(" MCP tools (Slack, mail, calendars, search servers) are off for you.");
+    }
     if !g.deny.is_empty() {
         let list: Vec<String> = g.deny.iter().map(|d| format!("`{d}`")).collect();
         out.push_str(&format!(

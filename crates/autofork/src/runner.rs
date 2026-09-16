@@ -274,6 +274,9 @@ fn family_tools(f: autofork_core::guard::ToolFamily) -> &'static [&'static str] 
         F::Edit => &["Edit", "Write", "MultiEdit", "NotebookEdit"],
         F::Web => &["WebFetch", "WebSearch"],
         F::Task => &["Agent", "Task"],
+        // MCP tools have no fixed names; they are kept out of the run
+        // altogether with `--strict-mcp-config` (see `run_attempt`).
+        F::Mcp => &[],
     }
 }
 
@@ -541,6 +544,13 @@ fn run_attempt(
             cmd.arg("--append-system-prompt")
                 .arg(autofork_core::wake::guard_paragraph(g));
             cmd.arg("--system-prompt-snapshot").arg("off");
+            // MCP tools are the outside world (Slack, mail, calendars); a
+            // guard keeps them out unless the author named `mcp`. With no
+            // `--mcp-config` given, `--strict-mcp-config` loads no server at
+            // all, whatever the user's own settings configure.
+            if !g.allows_family(autofork_core::guard::ToolFamily::Mcp) {
+                cmd.arg("--strict-mcp-config");
+            }
         }
         // Unguarded run. Headless runs cannot answer permission prompts;
         // without a mode a write simply stalls until the run times out.

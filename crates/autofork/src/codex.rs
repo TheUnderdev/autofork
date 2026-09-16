@@ -1217,14 +1217,16 @@ fn resolve_sandbox(mode: Option<&str>, parent_permission_mode: Option<&str>) -> 
 fn guard_sandbox(g: &Guard) -> Vec<String> {
     let toolless = g.tools.as_ref().is_some_and(|t| t.is_empty());
     if g.write.is_empty() || toolless {
-        return vec!["--sandbox".to_string(), "read-only".to_string()];
+        let mut args = vec!["--sandbox".to_string(), "read-only".to_string()];
+        args.extend(guard_mcp_args(g));
+        return args;
     }
     let roots: Vec<String> = g
         .write
         .iter()
         .map(|p| toml_string(&p.to_string_lossy()))
         .collect();
-    vec![
+    let mut args = vec![
         "--sandbox".to_string(),
         "workspace-write".to_string(),
         "-c".to_string(),
@@ -1234,7 +1236,20 @@ fn guard_sandbox(g: &Guard) -> Vec<String> {
         ),
         "-c".to_string(),
         format!("sandbox_workspace_write.network_access={}", g.network),
-    ]
+    ];
+    args.extend(guard_mcp_args(g));
+    args
+}
+
+/// MCP tools are the outside world; a guard keeps every server out of the
+/// run unless the author named `mcp`. Overriding the table to empty beats
+/// whatever `~/.codex/config.toml` registers.
+fn guard_mcp_args(g: &Guard) -> Vec<String> {
+    if g.allows_family(autofork_core::guard::ToolFamily::Mcp) {
+        Vec::new()
+    } else {
+        vec!["-c".to_string(), "mcp_servers={}".to_string()]
+    }
 }
 
 /// Where a guarded run starts — the one place a guard moves a run.
@@ -2062,7 +2077,12 @@ mod tests {
     fn a_guard_that_changes_nothing_is_read_only() {
         assert_eq!(
             guard_sandbox(&guard_with(&[])),
-            vec!["--sandbox".to_string(), "read-only".to_string()]
+            vec![
+                "--sandbox".to_string(),
+                "read-only".to_string(),
+                "-c".to_string(),
+                "mcp_servers={}".to_string()
+            ]
         );
         // `tools: []` too: a pure reviewer has no business writing either.
         let toolless = Guard {
@@ -2071,7 +2091,12 @@ mod tests {
         };
         assert_eq!(
             guard_sandbox(&toolless),
-            vec!["--sandbox".to_string(), "read-only".to_string()]
+            vec![
+                "--sandbox".to_string(),
+                "read-only".to_string(),
+                "-c".to_string(),
+                "mcp_servers={}".to_string()
+            ]
         );
     }
 
@@ -2086,8 +2111,19 @@ mod tests {
                 r#"sandbox_workspace_write.writable_roots=["/a","/b c"]"#.to_string(),
                 "-c".to_string(),
                 "sandbox_workspace_write.network_access=false".to_string(),
+                "-c".to_string(),
+                "mcp_servers={}".to_string(),
             ]
         );
+        // naming `mcp` keeps the servers
+        let g = Guard {
+            tools: Some(vec![
+                autofork_core::guard::ToolFamily::Shell,
+                autofork_core::guard::ToolFamily::Mcp,
+            ]),
+            ..guard_with(&["/a"])
+        };
+        assert!(!guard_sandbox(&g).contains(&"mcp_servers={}".to_string()));
     }
 
     #[test]

@@ -52,15 +52,21 @@ pub enum ToolFamily {
     Web,
     /// Spawning subagents.
     Task,
+    /// Tools served by MCP servers (Slack, mail, calendars, search, …):
+    /// the harness's external side effects. Unlike the built-in families
+    /// this one is OFF unless the author names it — a guard exists to keep
+    /// a fork from acting on the world, and an MCP tool is the world.
+    Mcp,
 }
 
 impl ToolFamily {
-    pub const ALL: [ToolFamily; 5] = [
+    pub const ALL: [ToolFamily; 6] = [
         ToolFamily::Read,
         ToolFamily::Shell,
         ToolFamily::Edit,
         ToolFamily::Web,
         ToolFamily::Task,
+        ToolFamily::Mcp,
     ];
 
     pub fn parse(s: &str) -> Option<ToolFamily> {
@@ -70,6 +76,7 @@ impl ToolFamily {
             "edit" | "write" => ToolFamily::Edit,
             "web" => ToolFamily::Web,
             "task" | "agent" => ToolFamily::Task,
+            "mcp" => ToolFamily::Mcp,
             _ => return None,
         })
     }
@@ -81,6 +88,7 @@ impl ToolFamily {
             ToolFamily::Edit => "edit",
             ToolFamily::Web => "web",
             ToolFamily::Task => "task",
+            ToolFamily::Mcp => "mcp",
         }
     }
 }
@@ -92,8 +100,9 @@ pub struct Guard {
     /// The only places the fork may change anything. Empty = read-only.
     #[serde(default)]
     pub write: Vec<PathBuf>,
-    /// Tool families the fork may use at all. `None` = every family.
-    /// `Some(vec![])` = no tool at all (a pure reviewer).
+    /// Tool families the fork may use at all. `None` = every built-in
+    /// family (never `mcp`, which must be named). `Some(vec![])` = no tool
+    /// at all (a pure reviewer).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ToolFamily>>,
     /// Whether generic network tools (curl, wget, ssh, gh, …) and the web
@@ -117,12 +126,27 @@ pub struct Guard {
 /// One tool call, harness-neutral.
 #[derive(Debug, Clone)]
 pub enum ToolCall<'a> {
-    Shell { command: &'a str, cwd: &'a Path },
-    Edit { path: &'a Path, cwd: &'a Path },
+    Shell {
+        command: &'a str,
+        cwd: &'a Path,
+    },
+    Edit {
+        path: &'a Path,
+        cwd: &'a Path,
+    },
     Read,
-    Web { target: Option<&'a str> },
+    Web {
+        target: Option<&'a str>,
+    },
     Task,
-    Other { name: &'a str },
+    /// A tool served by an MCP server.
+    Mcp {
+        name: &'a str,
+    },
+    /// A harness built-in outside the families (todo lists, skills, LSP…).
+    Other {
+        name: &'a str,
+    },
 }
 
 impl ToolCall<'_> {
@@ -133,6 +157,7 @@ impl ToolCall<'_> {
             ToolCall::Read => Some(ToolFamily::Read),
             ToolCall::Web { .. } => Some(ToolFamily::Web),
             ToolCall::Task => Some(ToolFamily::Task),
+            ToolCall::Mcp { .. } => Some(ToolFamily::Mcp),
             ToolCall::Other { .. } => None,
         }
     }
@@ -175,7 +200,7 @@ impl Guard {
 
     pub fn allows_family(&self, family: ToolFamily) -> bool {
         match &self.tools {
-            None => true,
+            None => family != ToolFamily::Mcp,
             Some(list) => list.contains(&family),
         }
     }
@@ -194,6 +219,19 @@ impl Guard {
                     ToolCall::Read => "reading files".to_string(),
                     ToolCall::Web { .. } => "the web".to_string(),
                     ToolCall::Task => "subagents".to_string(),
+                    ToolCall::Mcp { name } => {
+                        return Verdict::Deny {
+                            message: self.compose(
+                                fork_name,
+                                &[format!(
+                                    "`{name}` is an MCP tool, and this fork may use {}; MCP tools \
+                                     act on the outside world and are off unless the fork's guard \
+                                     names `mcp` in its tools",
+                                    self.tools_phrase()
+                                )],
+                            ),
+                        }
+                    }
                     ToolCall::Other { name } => format!("the `{name}` tool"),
                 };
                 return Verdict::Deny {
@@ -210,6 +248,7 @@ impl Guard {
         match call {
             ToolCall::Read => Verdict::Allow,
             ToolCall::Task => Verdict::Allow,
+            ToolCall::Mcp { .. } => Verdict::Allow,
             ToolCall::Other { name } => {
                 if self.tools.as_ref().is_some_and(|t| t.is_empty()) {
                     Verdict::Deny {
@@ -357,7 +396,7 @@ impl Guard {
 
     fn tools_phrase(&self) -> String {
         match &self.tools {
-            None => "every tool".to_string(),
+            None => "every built-in tool".to_string(),
             Some(t) if t.is_empty() => "no tool at all: it decides from the conversation it inherited and writes its report".to_string(),
             Some(t) => {
                 let names: Vec<&str> = t.iter().map(|f| f.name()).collect();
@@ -670,6 +709,52 @@ mod tests {
                 &ToolCall::Other { name: "todowrite" },
                 Path::new("/tmp")
             ),
+            Verdict::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn mcp_tools_are_off_unless_named() {
+        let g = guard(&["/tmp/brain"]);
+        match g.evaluate(
+            "h",
+            &ToolCall::Mcp {
+                name: "slack_post_message",
+            },
+            Path::new("/tmp"),
+        ) {
+            Verdict::Deny { message } => {
+                assert!(message.contains("slack_post_message"), "{message}");
+                assert!(message.contains("MCP"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+        // a built-in outside the families is still fine by default
+        assert_eq!(
+            g.evaluate(
+                "h",
+                &ToolCall::Other { name: "todowrite" },
+                Path::new("/tmp")
+            ),
+            Verdict::Allow
+        );
+        // naming the family opens it
+        let g = Guard {
+            tools: Some(vec![ToolFamily::Read, ToolFamily::Mcp]),
+            ..guard(&[])
+        };
+        assert_eq!(
+            g.evaluate(
+                "h",
+                &ToolCall::Mcp {
+                    name: "slack_post_message"
+                },
+                Path::new("/tmp")
+            ),
+            Verdict::Allow
+        );
+        assert!(matches!(
+            g.evaluate("h", &ToolCall::Task, Path::new("/tmp")),
             Verdict::Deny { .. }
         ));
     }

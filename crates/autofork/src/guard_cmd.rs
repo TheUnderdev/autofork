@@ -100,7 +100,10 @@ fn map_call<'a>(
                 target: s("url").or(s("query")),
             },
             "task" => ToolCall::Task,
-            other => ToolCall::Other { name: other },
+            other if OPENCODE_BUILTINS.contains(&other) => ToolCall::Other { name: other },
+            // opencode names MCP tools `<server>_<tool>`; anything that is
+            // not a known built-in is one.
+            other => ToolCall::Mcp { name: other },
         },
         "claude-code" | "claude" => match tool {
             "Bash" => {
@@ -126,6 +129,7 @@ fn map_call<'a>(
                 target: s("url").or(s("query")),
             },
             "Agent" | "Task" => ToolCall::Task,
+            other if other.starts_with("mcp__") => ToolCall::Mcp { name: other },
             other => ToolCall::Other { name: other },
         },
         _ => match tool {
@@ -149,10 +153,28 @@ fn map_call<'a>(
             "read" => ToolCall::Read,
             "web" => ToolCall::Web { target: s("url") },
             "task" => ToolCall::Task,
+            "mcp" => ToolCall::Mcp {
+                name: s("name").unwrap_or("mcp"),
+            },
             other => ToolCall::Other { name: other },
         },
     }
 }
+
+/// opencode's own tools outside the five families. Everything else the
+/// plugin reports is an MCP tool.
+const OPENCODE_BUILTINS: [&str; 10] = [
+    "todowrite",
+    "todoread",
+    "skill",
+    "lsp",
+    "question",
+    "invalid",
+    "batch",
+    "toolsearch",
+    "plan",
+    "notebook",
+];
 
 #[derive(Default)]
 struct MapBuf {

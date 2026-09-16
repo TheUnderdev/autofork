@@ -417,7 +417,7 @@ The author states only what the fork may **change**; everything else follows fro
 | key | value | default |
 |---|---|---|
 | `write` | a path, a list of paths (absolute or `~/…`), or `none` — the write set | `none` (read-only) |
-| `tools` | `all`, `none` (a pure reviewer: no tool at all), or a list of families: `read`, `shell`, `edit`, `web`, `task` | `all` |
+| `tools` | `all`, `none` (a pure reviewer: no tool at all), or a list of families: `read`, `shell`, `edit`, `web`, `task`, `mcp` — `all` means every built-in family; `mcp` (tools served by MCP servers: Slack, mail, calendars, search…) is **off unless named**, because a guard exists to keep a fork from acting on the world and an MCP tool is the world | `all` |
 | `network` | `true` lets generic network tools (curl, wget, ssh, gh, the web tools) through | `false` |
 | `message` | the author's words, quoted back to the fork every time it hits the guard | — |
 
@@ -453,9 +453,9 @@ every client. Enforcement differs by what each harness exposes:
 
 | client | enforcement |
 |---|---|
-| opencode | the plugin's `tool.execute.before` hook calls `autofork guard eval` on every tool call of a guarded fork session (and of its subagents): a refusal is thrown as the tool's error — the model reads the message; a sandboxed command has its `command` rewritten; `tool.execute.after` appends the explanation when a sandboxed command fails on the rule. Both the live path and close-time `opencode run --fork` runs (via `AUTOFORK_FORK_PATH`). |
-| Claude Code (headless runner) | a fork run has no hooks (`disableAllHooks`, see the runner section), so the guard becomes settings: Claude Code's native Bash sandbox (`filesystem.allowWrite` = the write set, `network.allowedDomains` = the hosts of the write set's git remotes, `allowUnsandboxedCommands: false`), `permissions.allow` `Edit(//path/**)` rules for the write set under `--permission-mode default` (everything else needs an approval nobody can give), tool denies for the families the guard excludes, and the guard paragraph appended to the system prompt. Claude Code's own violation report is what the model reads when the sandbox blocks a command. |
-| codex | no tool hooks at all: the guard becomes the sandbox (`read-only` for an empty write set, else `workspace-write` with `writable_roots` = the write set and no network) and the run starts inside the first write root, since codex makes the cwd writable. The analyser and the custom message do not apply here. |
+| opencode | the plugin's `tool.execute.before` hook calls `autofork guard eval` on every tool call of a guarded fork session (and of its subagents): a refusal is thrown as the tool's error — the model reads the message; a sandboxed command has its `command` rewritten; `tool.execute.after` appends the explanation when a sandboxed command fails on the rule. Any tool that is not an opencode built-in is an MCP tool and refused unless `mcp` is named. Both the live path and close-time `opencode run --fork` runs (via `AUTOFORK_FORK_PATH`). |
+| Claude Code (headless runner) | a fork run has no hooks (`disableAllHooks`, see the runner section), so the guard becomes settings: Claude Code's native Bash sandbox (`filesystem.allowWrite` = the write set, `network.allowedDomains` = the hosts of the write set's git remotes, `allowUnsandboxedCommands: false`), `permissions.allow` `Edit(//path/**)` rules for the write set under `--permission-mode default` (everything else needs an approval nobody can give), tool denies for the families the guard excludes, `--strict-mcp-config` (no MCP server is loaded at all) unless `mcp` is named, and the guard paragraph appended to the system prompt. Claude Code's own violation report is what the model reads when the sandbox blocks a command. |
+| codex | no tool hooks at all: the guard becomes the sandbox (`read-only` for an empty write set, else `workspace-write` with `writable_roots` = the write set and no network), the MCP server table is overridden to empty unless `mcp` is named, and the run starts inside the first write root, since codex makes the cwd writable. The analyser and the custom message do not apply here. |
 
 `autofork guard check --fork <file> [--cwd <dir>] -- <cmd>` (or `--path <file>` for an edit) prints
 what a fork's guard would say, message included. Every decision is appended to
