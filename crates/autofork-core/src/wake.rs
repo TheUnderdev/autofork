@@ -344,8 +344,15 @@ pub fn guard_paragraph(g: &crate::guard::Guard) -> String {
     if g.write.is_empty() {
         out.push_str(" You may not change any file.");
     } else {
-        let list: Vec<String> = g.write.iter().map(|p| format!("`{}`", p.display())).collect();
-        out.push_str(&format!(" You may only change files under: {}.", list.join(", ")));
+        let list: Vec<String> = g
+            .write
+            .iter()
+            .map(|p| format!("`{}`", p.display()))
+            .collect();
+        out.push_str(&format!(
+            " You may only change files under: {}.",
+            list.join(", ")
+        ));
     }
     match &g.tools {
         Some(t) if t.is_empty() => out.push_str(" You have no tools at all: decide from the conversation you inherited and write your report."),
@@ -358,7 +365,19 @@ pub fn guard_paragraph(g: &crate::guard::Guard) -> String {
     if !g.network {
         out.push_str(" You have no network (git may still sync and push a repository inside your write list).");
     }
-    if let Some(m) = g.message.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+    if !g.deny.is_empty() {
+        let list: Vec<String> = g.deny.iter().map(|d| format!("`{d}`")).collect();
+        out.push_str(&format!(
+            " These commands are refused outright: {}.",
+            list.join(", ")
+        ));
+    }
+    if let Some(m) = g
+        .message
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+    {
         out.push(' ');
         out.push_str(m);
     }

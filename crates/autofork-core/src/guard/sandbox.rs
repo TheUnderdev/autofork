@@ -52,7 +52,8 @@ pub fn wrap(command: &str, cwd: &Path, guard: &Guard, tmp_dir: &Path) -> Result<
         let name = format!("guard-{:016x}.sb", crate::sys::fnv1a64(&profile));
         let path = tmp_dir.join(name);
         if !path.exists() {
-            std::fs::write(&path, &profile).map_err(|e| format!("cannot write sandbox profile: {e}"))?;
+            std::fs::write(&path, &profile)
+                .map_err(|e| format!("cannot write sandbox profile: {e}"))?;
         }
         let _ = cwd;
         Ok(format!(
@@ -68,11 +69,15 @@ pub fn wrap(command: &str, cwd: &Path, guard: &Guard, tmp_dir: &Path) -> Result<
         args.push("/bin/bash".into());
         args.push("-c".into());
         args.push(command.to_string());
-        Ok(args.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" "))
+        Ok(args
+            .iter()
+            .map(|a| shell_quote(a))
+            .collect::<Vec<_>>()
+            .join(" "))
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        let _ = (command, cwd, tmp_dir);
+        let _ = (command, cwd, tmp_dir, writes);
         Err("no sandbox on this platform".into())
     }
 }
@@ -135,7 +140,10 @@ pub fn seatbelt_profile(writes: &[PathBuf]) -> String {
     p.push_str("(version 1)\n(allow default)\n(deny network*)\n(deny file-write*)\n");
     p.push_str("(allow file-write*\n");
     for w in writes.iter().chain(scratch_roots().iter()) {
-        p.push_str(&format!("  (subpath {})\n", sb_quote(&w.display().to_string())));
+        p.push_str(&format!(
+            "  (subpath {})\n",
+            sb_quote(&w.display().to_string())
+        ));
     }
     p.push_str("  (literal \"/dev/null\")\n  (literal \"/dev/zero\")\n  (literal \"/dev/stdout\")\n  (literal \"/dev/stderr\")\n");
     p.push_str("  (regex #\"^/dev/tty\")\n  (regex #\"^/dev/fd/\")\n  (regex #\"^/dev/pts/\")\n  (literal \"/dev/ptmx\")\n");
@@ -190,7 +198,10 @@ fn sb_quote(s: &str) -> String {
 
 /// Single-quote for a POSIX shell.
 pub fn shell_quote(s: &str) -> String {
-    if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_./=:@%+,".contains(c)) {
+    if !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./=:@%+,".contains(c))
+    {
         return s.to_string();
     }
     format!("'{}'", s.replace('\'', "'\\''"))
@@ -199,7 +210,9 @@ pub fn shell_quote(s: &str) -> String {
 #[cfg(target_os = "linux")]
 fn which(bin: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).map(|d| d.join(bin)).find(|p| p.is_file())
+    std::env::split_paths(&path)
+        .map(|d| d.join(bin))
+        .find(|p| p.is_file())
 }
 
 #[cfg(test)]
@@ -226,8 +239,12 @@ mod tests {
 
     #[test]
     fn violation_detection() {
-        assert!(looks_like_violation("PermissionError: [Errno 1] Operation not permitted: 'x'"));
-        assert!(looks_like_violation("curl: (6) Could not resolve host: example.com"));
+        assert!(looks_like_violation(
+            "PermissionError: [Errno 1] Operation not permitted: 'x'"
+        ));
+        assert!(looks_like_violation(
+            "curl: (6) Could not resolve host: example.com"
+        ));
         assert!(!looks_like_violation("error: no such file or directory"));
     }
 }

@@ -177,6 +177,7 @@ a missing marker can't silently disable a real fork. `fork: false` is an explici
 | `background_hold` | what idle means to this fork while the session has background work running: `true` waits for it, `false` fires at the stop regardless | config `background_hold` (`true`) |
 | `model` | model for this fork's runs: a value or a fallback list (`[sonnet, haiku]` — a failed run retries on the next), scalar or keyed by client (`claude-code:` / `opencode:` / `codex:`) | config `[fork_models]`, else inherit the session's |
 | `mode` | operation mode for the runs (permission mode / codex sandbox / opencode agent), scalar or client map | config `[fork_modes]`, else the client default |
+| `guard` | what a run may touch: `write:` (the only paths it may change), `tools:` (families it may use), `network:`, `message:` (the author's course-correction text) — see [Guards](#guards-what-a-fork-may-touch-v031) | unguarded |
 
 `model:` and `mode:` (v0.17) exist because a fork rarely needs the parent
 session's expensive model: your session runs on the big model, the journal
@@ -391,6 +392,78 @@ At **close** the hold does not apply. There is no settling and no poll left to r
 through, so holding would drop them rather than defer them — the flush batch takes the whole set
 and puts the gate fork first instead. The end-runner is sequential, so a gate still leads and
 everything else still runs after it, in one batch.
+
+### Guards: what a fork may touch (v0.31)
+
+A fork inherits the parent's whole conversation, and a cheap model routinely keeps executing the
+parent's **last instruction** instead of the fork's own job — it force-pushes the parent's branch,
+posts the parent's PR comment, runs the parent's build on a shared workspace, and then reports a
+finished handover. A `guard:` block turns that into a wall the fork hits *with an explanation*:
+
+```yaml
+---
+fork: true
+run_on: [idle: 4m]
+guard:
+  write: [~/brain, ~/.claude]      # the only places this run may change anything
+  message: >-
+    You are the handover fork. Your only output is the brain. If the parent left
+    work undone, that is the parent's to finish — say so in your report.
+---
+```
+
+The author states only what the fork may **change**; everything else follows from it.
+
+| key | value | default |
+|---|---|---|
+| `write` | a path, a list of paths (absolute or `~/…`), or `none` — the write set | `none` (read-only) |
+| `tools` | `all`, `none` (a pure reviewer: no tool at all), or a list of families: `read`, `shell`, `edit`, `web`, `task` | `all` |
+| `network` | `true` lets generic network tools (curl, wget, ssh, gh, the web tools) through | `false` |
+| `message` | the author's words, quoted back to the fork every time it hits the guard | — |
+
+**What the guard decides, per tool call.** An edit or write is allowed iff its path is inside the
+write set (symlinks resolved). A shell command goes through a static **shell analyser**
+(`autofork guard analyse -- <cmd>` shows what it sees): the command is parsed with the real bash
+grammar and interpreted abstractly — it follows `cd`/`pushd`/`popd`/subshells/`env -C`/`git -C`,
+expands literal variables and `$(pwd)`, treats redirections as writes, unwraps `bash -c`, `sh -c`,
+`eval`, `source`, `xargs`, `find -exec`, `nohup`/`nice`/`timeout`/`env`, reads a shell script it is
+handed, and classifies every simple command: pure readers (`cat`, `grep`, `git status`, …) produce
+nothing; writers (`rm`, `cp`, `tee`, `sed -i`, `tar x`, `git commit`, …) produce writes on the paths
+they touch; `git push`/`fetch`/`pull` are gated on the **repository** being inside the write set, so a
+fork that owns a repo may still sync and push it while the parent's repo stays untouchable; forges
+(`gh`, `glab`), deploy tools, mail, `sudo`, `kill`/`launchctl` are refused outright; a script that
+lives inside the write set runs as the fork's own tooling. Then:
+
+- every effect provably inside the write set → the command runs as is;
+- any effect provably outside it → **refused**, and the model reads *which* command crossed *which*
+  line, the author's `message`, and one instruction: do not retry through another route, leave it to
+  the parent, report what you did not do — written for the weakest model that will ever read it;
+- anything the analyser cannot prove (`python3 -c …`, `node`, `make`, `cargo build`, an unknown
+  binary, a path built from a variable it cannot expand) → the command runs inside an **OS sandbox**
+  derived from the same write set: writes only under it (plus `$TMPDIR`), no network at all. A
+  `python3 -c` that stays home works; one that wanders fails at the syscall, and the same explanation
+  is appended to its output. macOS uses Seatbelt (nothing to install); Linux uses bubblewrap
+  (`bwrap`); without a sandbox such commands are refused instead (`autofork doctor` says which).
+
+The analyser errs toward *unknown*, never toward *safe*: an unparseable line, an unexpandable
+variable, a command it has never heard of all fall through to the sandbox.
+
+**Where it is enforced.** The guard travels in the wake, and the spawn prompt states it up front, on
+every client. Enforcement differs by what each harness exposes:
+
+| client | enforcement |
+|---|---|
+| opencode | the plugin's `tool.execute.before` hook calls `autofork guard eval` on every tool call of a guarded fork session (and of its subagents): a refusal is thrown as the tool's error — the model reads the message; a sandboxed command has its `command` rewritten; `tool.execute.after` appends the explanation when a sandboxed command fails on the rule. Both the live path and close-time `opencode run --fork` runs (via `AUTOFORK_FORK_PATH`). |
+| Claude Code (headless runner) | a fork run has no hooks (`disableAllHooks`, see the runner section), so the guard becomes settings: Claude Code's native Bash sandbox (`filesystem.allowWrite` = the write set, `network.allowedDomains` = the hosts of the write set's git remotes, `allowUnsandboxedCommands: false`), `permissions.allow` `Edit(//path/**)` rules for the write set under `--permission-mode default` (everything else needs an approval nobody can give), tool denies for the families the guard excludes, and the guard paragraph appended to the system prompt. Claude Code's own violation report is what the model reads when the sandbox blocks a command. |
+| codex | no tool hooks at all: the guard becomes the sandbox (`read-only` for an empty write set, else `workspace-write` with `writable_roots` = the write set and no network) and the run starts inside the first write root, since codex makes the cwd writable. The analyser and the custom message do not apply here. |
+
+`autofork guard check --fork <file> [--cwd <dir>] -- <cmd>` (or `--path <file>` for an edit) prints
+what a fork's guard would say, message included. Every decision is appended to
+`~/.autofork/logs/guard.log`.
+
+A guard does not replace `mode:`. Keep `mode:` for what the harness should be (a read-only codex
+sandbox, an opencode agent with its own permission table); add `guard:` for what the *fork* may
+touch, stated once, enforced everywhere.
 
 ## Lifecycle hooks
 
@@ -613,6 +686,8 @@ autofork emit <name>     # raise a named external event for every listening sess
 autofork logs [-f]       # daemon log
 autofork prune           # close [stale?] sessions now instead of waiting for the session timeout
 autofork doctor          # install checks
+autofork guard check --fork <file> -- <cmd>   # what a fork's guard says to a command (or --path <file>)
+autofork guard analyse -- <cmd>               # what the shell analyser sees in a command line
 autofork stop-daemon     # retire the daemon (it restarts on the next event)
 
 autofork opencode install    # install the opencode bridge plugin (see "opencode support")

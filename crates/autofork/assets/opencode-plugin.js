@@ -91,6 +91,144 @@ function wantsContinue(text) {
   return text.replace(INVISIBLE, "").includes(CONTINUE);
 }
 
+// ── Fork guards ─────────────────────────────────────────────────────────
+//
+// A guarded fork (`guard:` in its frontmatter) states what its run may
+// *change*: a write set, optionally a tool allowlist and a network switch.
+// It exists because a fork inherits the parent's entire conversation, and a
+// cheap model routinely keeps executing the parent's last instruction
+// instead of the fork's own job — pushing the parent's branch, editing its
+// workspace. The guard turns that into a wall the run hits *with the
+// author's explanation attached*, which is what makes a weak model
+// course-correct instead of flailing at it from another angle.
+//
+// The decision is not made here. `autofork guard eval` reads the fork file
+// and answers allow/deny/sandbox for one tool call (the shell analyser that
+// backs it is far too much machinery to carry in a plugin, and the same
+// binary answers for every harness, so one guard behaves identically under
+// opencode, Claude Code and codex). This file only maps the verdict onto
+// opencode's tool boundary:
+//
+// - deny → `throw` inside `tool.execute.before`. opencode aborts the call
+//   and hands the model the error message as the tool result, so the
+//   guard's course-correction text IS what the run reads back. (That is
+//   opencode's documented plugin behaviour, not a trick — its own example
+//   throws to refuse a read of `.env`.)
+// - sandbox → the command the analyser could not vouch for is rewritten in
+//   place (`output.args.command = …`), so it runs under an OS sandbox that
+//   permits writes only inside the write set and no network at all.
+//   Mutating the args object is how opencode lets a plugin rewrite a call.
+//   The sandbox's own failures read like unexplained EPERM noise, so the
+//   verdict's message is parked per callID and appended in
+//   `tool.execute.after` when the output looks like a rule hit — the model
+//   must see *why* `open()` failed, or it just retries somewhere else.
+// - anything else (binary missing, garbage on stdout, a spawn that blew
+//   up) → also a throw. A guard that cannot decide must not wave the call
+//   through: fail closed, say so, and let the run report the problem.
+//
+// Unguarded sessions — every session the user drives — must not pay for
+// any of this: the resolver answers from a Map after the first call, and a
+// null answer returns before anything is spawned.
+const GUARD_MAX_DEPTH = 8;
+
+// Output that reads like the sandbox's rule rather than the command's own
+// failure (keep in sync with looks_like_violation in guard/sandbox.rs).
+const GUARD_VIOLATION = [
+  "operation not permitted",
+  "eperm",
+  "permission denied",
+  "read-only file system",
+  "erofs",
+  "network is unreachable",
+  "could not resolve host",
+  "temporary failure in name resolution",
+  "nodename nor servname provided",
+  "connection refused",
+];
+
+function looksLikeViolation(output) {
+  const o = String(output ?? "").toLowerCase();
+  return GUARD_VIOLATION.some((f) => o.includes(f));
+}
+
+// The two tool-boundary hooks, over a resolver that answers "which fork
+// guards this session?" — `{ fork_path, fork, cwd }` or null. The resolver
+// differs per mode (a live plugin walks its fork-run registry; a close-time
+// fork run has one fixed answer from the environment), the enforcement does
+// not.
+function guardHooks(resolveTarget) {
+  // callID -> the verdict message to append if the sandboxed command fails
+  // on the sandbox's terms. Entered by `before`, consumed by `after`.
+  const sandboxed = new Map();
+
+  async function evaluate(payload) {
+    // Same preassembled-buffer stdin as `call` above: incremental writes
+    // are not reliably flushed by every Bun vintage, and a guard eval that
+    // never sees EOF would hang the tool call forever.
+    const proc = Bun.spawn([BIN, "guard", "eval"], {
+      stdin: new TextEncoder().encode(JSON.stringify(payload)),
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    const out = await new Response(proc.stdout).text();
+    await proc.exited;
+    const verdict = JSON.parse(out.trim());
+    if (!verdict?.action) throw new Error(`no verdict in ${JSON.stringify(out.slice(0, 200))}`);
+    return verdict;
+  }
+
+  return {
+    "tool.execute.before": async (input, output) => {
+      const target = await resolveTarget(input?.sessionID);
+      if (!target) return; // the overwhelmingly common case: not a fork run
+      let verdict;
+      try {
+        verdict = await evaluate({
+          fork_path: target.fork_path,
+          ...(target.fork ? { fork: target.fork } : {}),
+          client: "opencode",
+          tool: input?.tool ?? "",
+          args: output?.args ?? {},
+          cwd: target.cwd,
+        });
+      } catch (e) {
+        // Fail closed, and name the failure: the run can put it in its
+        // report, which is how a broken install gets noticed at all.
+        throw new Error(
+          `autofork guard could not evaluate this call, so it was refused: ${e?.message ?? e}`,
+        );
+      }
+      if (verdict.action === "deny") {
+        throw new Error(verdict.message || "autofork guard: this call is not allowed for this fork");
+      }
+      if (verdict.action === "sandbox" && verdict.command) {
+        if (output?.args) output.args.command = verdict.command;
+        if (input?.callID && verdict.message) {
+          // A call that never reaches `after` (aborted mid-flight) leaves
+          // its entry behind, so keep the map small: oldest out first.
+          if (sandboxed.size >= 64) sandboxed.delete(sandboxed.keys().next().value);
+          sandboxed.set(input.callID, verdict.message);
+        }
+      }
+    },
+    "tool.execute.after": async (input, output) => {
+      const id = input?.callID;
+      if (!id) return;
+      const message = sandboxed.get(id);
+      if (message === undefined) return;
+      sandboxed.delete(id);
+      // The sandbox refuses at the syscall, so what comes back is a bare
+      // EPERM / unreachable-network from whatever the command happened to
+      // be doing. Unexplained, a model reads that as a flaky environment
+      // and tries the same thing another way; with the guard's message
+      // attached it reads it as a rule and stops.
+      if (typeof output?.output === "string" && looksLikeViolation(output.output)) {
+        output.output += "\n\n" + message;
+      }
+    },
+  };
+}
+
 function stripContinue(text) {
   if (!wantsContinue(text)) return text;
   return text
@@ -113,7 +251,24 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
   // tell it apart, and registering it makes the daemon roster every fork on
   // the fork run and spawn N more when it closes: an unbounded cascade. Do
   // nothing at all in such a process (the CLI hook bridge has the same guard).
-  if (process.env.AUTOFORK_FORK || process.env.AUTOFORK_SESSION_ID) return {};
+  //
+  // One exception: a *guarded* fork's close-time run still has to be
+  // guarded, and this process IS the run. The end-runner passes the fork
+  // file in AUTOFORK_FORK_PATH; every session in the process (the run, and
+  // any subagent it spawns) belongs to that run, so one fixed target serves
+  // them all and no session bookkeeping is needed. Only the two
+  // tool-boundary hooks are returned — nothing else here comes back to
+  // life: no session registration, no polls, no reports.
+  if (process.env.AUTOFORK_FORK || process.env.AUTOFORK_SESSION_ID) {
+    const forkPath = process.env.AUTOFORK_FORK_PATH;
+    if (!forkPath) return {};
+    const target = {
+      fork_path: forkPath,
+      fork: process.env.AUTOFORK_FORK_NAME || undefined,
+      cwd: directory,
+    };
+    return guardHooks(() => target);
+  }
 
   // Per-session tracking (parent sessions only).
   // sessionID -> { started, lastStatus, tokens, model: {providerID, modelID} | null, agent }
@@ -143,6 +298,61 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
   const backoff = new Map();
 
   const reportKey = (parentID, fork) => `${parentID}::${fork}`;
+
+  // sessionID -> the guard target that applies to it (`{fork_path, fork,
+  // cwd}`), or null for "nothing guards this session". Both answers are
+  // cached: the negative one is what keeps the tool hook free for the
+  // user's own sessions, which is every session but ours.
+  const guardTargets = new Map();
+
+  // Which fork guards this session? Either it IS a guarded fork run, or it
+  // descends from one — a `task` subagent gets its own session whose
+  // parentID chains back to the run, and a guard the subagent can step
+  // around is no guard at all. The walk is bounded (a cycle or a deep chain
+  // must not turn one tool call into an unbounded fetch storm) and every id
+  // it passes through is cached with the same answer.
+  async function guardTargetFor(id) {
+    if (!id) return null;
+    if (guardTargets.has(id)) return guardTargets.get(id);
+    const chain = [];
+    let target = null;
+    let cur = id;
+    for (let depth = 0; depth < GUARD_MAX_DEPTH && cur; depth++) {
+      // The registry is consulted before the cache: a session id we cached
+      // as unguarded must never stay unguarded if it turns out to be a
+      // guarded run after all. (It cannot today — a run is registered
+      // before its first prompt, so no tool call precedes it — but a stale
+      // negative is the one way this cache could silently disarm a guard.)
+      const run = forkRuns.get(cur);
+      if (!run && guardTargets.has(cur)) {
+        target = guardTargets.get(cur);
+        break;
+      }
+      chain.push(cur);
+      let info = null;
+      try {
+        info = (await client.session.get({ path: { id: cur } }))?.data;
+      } catch {
+        // Transient: stop walking, but do not cache a guess — a fork run we
+        // failed to resolve must get another chance on its next tool call.
+        return run?.guard && run.path
+          ? { fork_path: run.path, fork: run.fork, cwd: directory }
+          : null;
+      }
+      if (run?.guard && run.path) {
+        // The run's own directory is the cwd the guard reasons about
+        // (relative paths in its commands resolve there).
+        target = { fork_path: run.path, fork: run.fork, cwd: info?.directory || directory };
+        break;
+      }
+      if (!info?.parentID) break;
+      cur = info.parentID;
+    }
+    for (const seen of chain) guardTargets.set(seen, target);
+    return target;
+  }
+
+  const guard = guardHooks(guardTargetFor);
 
   // "providerID/modelID" -> real context window (limit.context), from the
   // provider catalog (models.dev plus the user's config overrides). Without
@@ -405,6 +615,12 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
           fork: spec.name,
           trigger: spec.trigger,
           chain: spec.chain === true,
+          // The guard's two coordinates: the fork file `guard eval` reads,
+          // and whether this fork declares a guard at all (the evaluator
+          // re-reads the file, so the spec's copy is only the flag that
+          // makes this run guarded).
+          path: spec.path,
+          guard: spec.guard ?? null,
           done: false,
         });
         liveByFork.set(spec.name, (liveByFork.get(spec.name) ?? 0) + 1);
@@ -642,6 +858,10 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
   }
 
   return {
+    // The fork guard at opencode's tool boundary (see the block above).
+    // Both hooks return immediately for a session no guarded fork owns.
+    "tool.execute.before": guard["tool.execute.before"],
+    "tool.execute.after": guard["tool.execute.after"],
     // Instance shutdown: close every session we registered (the daemon
     // reopens them on the next event after a resume) and release the parked
     // polls. Abrupt exits that never reach this are covered by the poll
@@ -790,6 +1010,7 @@ export const AutoforkPlugin = async ({ client, directory, worktree }) => {
         }
         sessions.delete(id);
         ignored.delete(id);
+        guardTargets.delete(id);
         backoff.delete(id);
         injectTurn.delete(id);
         return;

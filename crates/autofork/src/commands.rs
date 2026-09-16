@@ -587,6 +587,16 @@ pub fn doctor(paths: &Paths) -> Result<(), String> {
         }
     }
 
+    // The guard sandbox: what a guarded fork falls back to for a command
+    // the analyser cannot prove. Not a problem when missing — the guard
+    // refuses such commands instead — but worth knowing.
+    match autofork_core::guard::sandbox::availability() {
+        Ok(()) => ok("guard sandbox: available (commands the guard cannot prove run confined)"),
+        Err(e) => println!(
+            "  note: guard sandbox unavailable ({e}); guarded forks refuse commands the analyser cannot prove"
+        ),
+    }
+
     // Daemon liveness + version.
     match Client::connect(paths, Duration::from_secs(2)) {
         Ok(mut client) => match client.request(RequestBody::Hello {

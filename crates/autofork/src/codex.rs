@@ -38,6 +38,20 @@
 //!   warm prefix, parent untouched. Preflight failures fall back to the
 //!   native fork.
 //!
+//! A fork's **guard** (`guard:` in its frontmatter) arrives here as sandbox
+//! flags and nothing else: codex has no tool hooks, so the guard's shell
+//! analyser, its per-call refusals and the author's `message:` cannot reach a
+//! codex run — the OS sandbox and the guard paragraph the spawn prompt
+//! already carries are the whole enforcement. A guarded run is `--sandbox
+//! read-only` when it may change nothing, else `workspace-write` with
+//! `writable_roots` = the write set and the network off unless the guard
+//! grants it, and it *starts inside the write set* (see [`guard_cwd`]) —
+//! codex makes the run's cwd writable on top of the roots, so leaving the run
+//! in the parent's project would hand it the one directory the guard is there
+//! to protect. A guard outranks `mode:` and the parent's permission mode
+//! alike: it is stricter than any of them by construction, and a guarded run
+//! never bypasses the sandbox.
+//!
 //! Codex hooks are trust-gated (untrusted hooks are silently skipped), so
 //! `autofork codex install` both merges our hooks into `$CODEX_HOME/hooks.json`
 //! and trusts them through the same `hooks/list` + `config/batchWrite` RPCs
@@ -45,6 +59,7 @@
 
 use crate::client::{spawn_daemon_detached, Client};
 use autofork_core::config::Paths;
+use autofork_core::guard::Guard;
 use autofork_core::protocol::{Event, EventKind, RequestBody, ResponseBody, WakeFork};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -986,7 +1001,18 @@ fn attempt_run(
         None => true,
         Some(m) => Some(m) == parent_model,
     };
-    let sandbox = resolve_sandbox(spec.mode.as_deref(), parent_permission_mode);
+    // A guard outranks `mode:` and the parent's permission mode: it is
+    // stricter than either by construction, so neither the fork file nor a
+    // parent running in bypass mode may widen it.
+    let sandbox = match spec.guard.as_ref() {
+        Some(g) => guard_sandbox(g),
+        None => resolve_sandbox(spec.mode.as_deref(), parent_permission_mode),
+    };
+    // Codex forks are the one place a guard moves the run itself: see
+    // `guard_cwd`. The directory lives as long as this attempt — a scratch
+    // one is removed when `guard_dir` drops.
+    let guard_dir = spec.guard.as_ref().map(|g| guard_cwd(paths, g));
+    let cwd = guard_dir.as_ref().map_or(cwd, |d| d.path.as_path());
 
     // Cache-copy runs are opt-in (`AUTOFORK_CODEX_CACHE_COPY=1` in codex's
     // environment): the default matches opencode's semantics — every run is
@@ -1144,7 +1170,8 @@ fn attempt_run(
 }
 
 /// Resolve the sandbox flags: a fork's `mode:` names a codex sandbox
-/// directly; without one, derive it from the parent's permission mode.
+/// directly; without one, derive it from the parent's permission mode. A
+/// guarded run never comes through here — [`guard_sandbox`] decides for it.
 fn resolve_sandbox(mode: Option<&str>, parent_permission_mode: Option<&str>) -> Vec<String> {
     match mode {
         Some("danger-full-access") => {
@@ -1168,6 +1195,121 @@ fn resolve_sandbox(mode: Option<&str>, parent_permission_mode: Option<&str>) -> 
             .map(String::from)
             .collect(),
     }
+}
+
+/// The sandbox flags of a *guarded* run: the guard alone decides, and it
+/// never yields `--dangerously-bypass-approvals-and-sandbox` — a guarded fork
+/// stays inside the OS sandbox whatever the parent session runs as.
+///
+/// A fork that may change nothing (an empty `write:`) or hold no tool at all
+/// (`tools: []`) runs `read-only`. Anything else runs `workspace-write` with
+/// the write set as codex's `writable_roots` (which are *additional* roots on
+/// top of the cwd — hence [`guard_cwd`]) and the network explicitly off
+/// unless the guard grants it: `network_access` defaults to false, but the
+/// user's `config.toml` may have turned it on for their own sessions, and a
+/// guard's "no network" has to outrank that too.
+///
+/// This is where the guard ends on codex. There are no tool hooks to call
+/// `autofork guard eval` from, so the shell analyser's per-command verdicts,
+/// the `tools:` families and the author's `message:` never reach the model
+/// here — the sandbox is the wall, and the guard paragraph in the spawn
+/// prompt is the explanation.
+fn guard_sandbox(g: &Guard) -> Vec<String> {
+    let toolless = g.tools.as_ref().is_some_and(|t| t.is_empty());
+    if g.write.is_empty() || toolless {
+        return vec!["--sandbox".to_string(), "read-only".to_string()];
+    }
+    let roots: Vec<String> = g
+        .write
+        .iter()
+        .map(|p| toml_string(&p.to_string_lossy()))
+        .collect();
+    vec![
+        "--sandbox".to_string(),
+        "workspace-write".to_string(),
+        "-c".to_string(),
+        format!(
+            "sandbox_workspace_write.writable_roots=[{}]",
+            roots.join(",")
+        ),
+        "-c".to_string(),
+        format!("sandbox_workspace_write.network_access={}", g.network),
+    ]
+}
+
+/// Where a guarded run starts — the one place a guard moves a run.
+///
+/// Codex's `workspace-write` sandbox makes the run's working directory
+/// writable *in addition to* `writable_roots`, so a guarded fork left in the
+/// parent's project would be free to write exactly what the guard exists to
+/// keep it out of. It starts in the first `write:` entry that is a directory
+/// instead — the fork's own ground. When the guard names no directory at all
+/// (a read-only guard, or one that lists files), it starts in a fresh empty
+/// scratch directory under the autofork tmp dir, which is removed when the
+/// returned handle drops at the end of the run.
+fn guard_cwd(paths: &Paths, g: &Guard) -> ScratchCwd {
+    for w in &g.write {
+        if w.is_dir() {
+            return ScratchCwd {
+                path: w.clone(),
+                scratch: false,
+            };
+        }
+    }
+    let path = paths
+        .base
+        .join("tmp")
+        .join(format!("guard-cwd-{}", uuid_v4()));
+    match std::fs::create_dir_all(&path) {
+        Ok(()) => ScratchCwd {
+            path,
+            scratch: true,
+        },
+        // Nowhere to make one: the system temp dir is the next least
+        // interesting place to stand, and the sandbox leaves it writable
+        // anyway.
+        Err(_) => ScratchCwd {
+            path: std::env::temp_dir(),
+            scratch: false,
+        },
+    }
+}
+
+/// The working directory of a guarded run; removes it again if we made it.
+struct ScratchCwd {
+    path: PathBuf,
+    scratch: bool,
+}
+
+impl Drop for ScratchCwd {
+    fn drop(&mut self) {
+        if self.scratch {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+/// One TOML basic string for a `-c key=value` override: codex parses the
+/// value as TOML, so a path with a backslash or a quote in it has to be
+/// escaped or the override is silently read as a bare literal.
+fn toml_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                out.push_str(&format!("\\u{:04X}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Preflight + build the throwaway `CODEX_HOME` for a cache-copy run. `None`
@@ -1907,6 +2049,127 @@ mod tests {
             resolve_sandbox(None, None),
             vec!["--sandbox".to_string(), "workspace-write".to_string()]
         );
+    }
+
+    fn guard_with(write: &[&str]) -> Guard {
+        Guard {
+            write: write.iter().map(PathBuf::from).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_guard_that_changes_nothing_is_read_only() {
+        assert_eq!(
+            guard_sandbox(&guard_with(&[])),
+            vec!["--sandbox".to_string(), "read-only".to_string()]
+        );
+        // `tools: []` too: a pure reviewer has no business writing either.
+        let toolless = Guard {
+            tools: Some(vec![]),
+            ..guard_with(&["/tmp/brain"])
+        };
+        assert_eq!(
+            guard_sandbox(&toolless),
+            vec!["--sandbox".to_string(), "read-only".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_write_set_becomes_writable_roots() {
+        assert_eq!(
+            guard_sandbox(&guard_with(&["/a", "/b c"])),
+            vec![
+                "--sandbox".to_string(),
+                "workspace-write".to_string(),
+                "-c".to_string(),
+                r#"sandbox_workspace_write.writable_roots=["/a","/b c"]"#.to_string(),
+                "-c".to_string(),
+                "sandbox_workspace_write.network_access=false".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn network_rides_only_when_the_guard_grants_it() {
+        let g = Guard {
+            network: true,
+            ..guard_with(&["/tmp/brain"])
+        };
+        let args = guard_sandbox(&g);
+        assert!(
+            args.contains(&"sandbox_workspace_write.network_access=true".to_string()),
+            "{args:?}"
+        );
+        let off = guard_sandbox(&guard_with(&["/tmp/brain"]));
+        assert!(
+            off.contains(&"sandbox_workspace_write.network_access=false".to_string()),
+            "{off:?}"
+        );
+    }
+
+    #[test]
+    fn toml_strings_are_escaped() {
+        assert_eq!(toml_string(r"C:\work"), r#""C:\\work""#);
+        assert_eq!(toml_string(r#"/a"b"#), r#""/a\"b""#);
+        assert_eq!(toml_string("/a\nb"), r#""/a\nb""#);
+    }
+
+    #[test]
+    fn a_guard_beats_the_fork_mode_and_the_parent() {
+        // `mode: danger-full-access` on its own bypasses the sandbox …
+        assert_eq!(
+            resolve_sandbox(Some("danger-full-access"), Some("bypassPermissions")),
+            vec!["--dangerously-bypass-approvals-and-sandbox".to_string()]
+        );
+        // … but a guard is the stricter statement, and nothing it produces
+        // ever bypasses.
+        for g in [guard_with(&[]), guard_with(&["/tmp/brain"])] {
+            let args = guard_sandbox(&g);
+            assert!(
+                !args
+                    .iter()
+                    .any(|a| a.contains("dangerously-bypass-approvals-and-sandbox")),
+                "{args:?}"
+            );
+            assert_eq!(args[0], "--sandbox");
+        }
+    }
+
+    #[test]
+    fn a_guarded_run_starts_inside_the_write_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("autofork");
+        let paths = Paths::new(base.clone());
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        // First *existing* directory wins; a missing one is skipped.
+        let g = guard_with(&[
+            &tmp.path().join("gone").display().to_string(),
+            &repo.display().to_string(),
+        ]);
+        let cwd = guard_cwd(&paths, &g);
+        assert_eq!(cwd.path, repo);
+        assert!(!cwd.scratch);
+
+        // A file is not somewhere to stand either: scratch dir, and it is
+        // gone once the run is over.
+        let file = tmp.path().join("notes.md");
+        std::fs::write(&file, b"x").unwrap();
+        let scratch_path = {
+            let cwd = guard_cwd(&paths, &guard_with(&[&file.display().to_string()]));
+            assert!(cwd.scratch);
+            assert!(cwd.path.is_dir());
+            assert!(cwd.path.starts_with(base.join("tmp")));
+            cwd.path.clone()
+        };
+        assert!(!scratch_path.exists());
+
+        // A read-only guard names nothing at all.
+        let cwd = guard_cwd(&paths, &guard_with(&[]));
+        assert!(cwd.scratch);
+        assert!(cwd.path.is_dir());
     }
 
     #[test]

@@ -139,8 +139,9 @@ fn parse_client_scoped(
 
 /// `guard:` — what a fork run may touch. A map with `write:` (a path, a
 /// list of paths, or `none`), `tools:` (`none`, `all`, or a list of
-/// families: read, shell, edit, web, task), `network:` (bool) and
-/// `message:` (the author's course-correction text). Paths must be
+/// families: read, shell, edit, web, task), `network:` (bool), `deny:` (a
+/// command pattern or a list: `ssh`, `git push*`) and `message:` (the
+/// author's course-correction text). Paths must be
 /// absolute or `~/…`.
 fn parse_guard(v: &serde_yaml::Value, name: &str, warnings: &mut Vec<String>) -> Option<Guard> {
     use serde_yaml::Value as Y;
@@ -224,6 +225,26 @@ fn parse_guard(v: &serde_yaml::Value, name: &str, warnings: &mut Vec<String>) ->
                     out
                 });
             }
+            "deny" => {
+                let items: Vec<String> = match val {
+                    Y::Null => Vec::new(),
+                    Y::String(s) => vec![s.clone()],
+                    Y::Sequence(seq) => seq.iter().filter_map(|x| x.as_str().map(String::from)).collect(),
+                    _ => {
+                        warnings.push(format!("fork '{name}': guard.deny must be a command pattern or a list of them; ignoring"));
+                        continue;
+                    }
+                };
+                for s in items {
+                    let s = s.trim().to_string();
+                    if s.is_empty() {
+                        continue;
+                    }
+                    if !g.deny.contains(&s) {
+                        g.deny.push(s);
+                    }
+                }
+            }
             "network" => match val {
                 Y::Bool(b) => g.network = *b,
                 _ => warnings.push(format!("fork '{name}': guard.network must be true or false; using false")),
@@ -234,7 +255,7 @@ fn parse_guard(v: &serde_yaml::Value, name: &str, warnings: &mut Vec<String>) ->
                 _ => warnings.push(format!("fork '{name}': guard.message must be a string; ignoring")),
             },
             other => warnings.push(format!(
-                "fork '{name}': guard.{other} is not a guard key (write, tools, network, message); ignoring it"
+                "fork '{name}': guard.{other} is not a guard key (write, tools, network, deny, message); ignoring it"
             )),
         }
     }
@@ -941,7 +962,10 @@ pub fn parse_fork_file(name: &str, content: &str) -> ForkParse {
         .as_ref()
         .map(|v| parse_client_scoped(v, "mode", name, &mut warnings))
         .unwrap_or_default();
-    let guard = raw.guard.as_ref().and_then(|v| parse_guard(v, name, &mut warnings));
+    let guard = raw
+        .guard
+        .as_ref()
+        .and_then(|v| parse_guard(v, name, &mut warnings));
 
     for w in &warnings {
         tracing::warn!(fork = name, "{w}");
@@ -1136,6 +1160,77 @@ mod tests {
         // `model:` is live again since v0.17 — no warning, parsed.
         assert_eq!(p.def.model, ClientScoped::Scalar(vec!["haiku".into()]));
         assert!(!p.warnings.iter().any(|w| w.contains("'model'")));
+    }
+
+    #[test]
+    fn guard_block() {
+        let home = crate::sys::home_dir().unwrap();
+        let p = parse(
+            "---\nfork: true\nguard:\n  write: [/tmp/brain, ~/.claude, ~/.claude/]\n  message: |\n    Only the brain.\n---\n",
+        );
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+        let g = p.def.guard.as_ref().unwrap();
+        assert_eq!(
+            g.write,
+            vec![PathBuf::from("/tmp/brain"), home.join(".claude")]
+        );
+        assert!(g.tools.is_none());
+        assert!(!g.network);
+        assert_eq!(g.message.as_deref(), Some("Only the brain."));
+        assert_eq!(
+            g.display(),
+            format!("write: [/tmp/brain, {}]", home.join(".claude").display())
+        );
+
+        // A scalar path, a read-only guard, tool families, network.
+        let p = parse(
+            "---\nfork: true\nguard:\n  write: /a\n  tools: [read, shell]\n  network: true\n---\n",
+        );
+        let g = p.def.guard.as_ref().unwrap();
+        assert_eq!(g.write, vec![PathBuf::from("/a")]);
+        assert_eq!(
+            g.tools.as_deref(),
+            Some(&[ToolFamily::Read, ToolFamily::Shell][..])
+        );
+        assert!(g.network);
+        let p = parse("---\nfork: true\nguard:\n  write: none\n  tools: none\n---\n");
+        let g = p.def.guard.as_ref().unwrap();
+        assert!(g.write.is_empty());
+        assert_eq!(g.tools.as_deref(), Some(&[][..]));
+        assert_eq!(g.display(), "write: none | tools: none");
+        let p =
+            parse("---\nfork: true\nguard:\n  write: /a\n  deny: [ssh, \"git push*\", ssh]\n---\n");
+        assert_eq!(
+            p.def.guard.as_ref().unwrap().deny,
+            vec!["ssh".to_string(), "git push*".to_string()]
+        );
+        let p = parse("---\nfork: true\nguard:\n  deny: ssh\n---\n");
+        assert_eq!(p.def.guard.as_ref().unwrap().deny, vec!["ssh".to_string()]);
+
+        // Relative paths, unknown families and unknown keys warn, never drop the fork.
+        let p = parse("---\nfork: true\nguard:\n  write: [relative/dir, /ok]\n  tools: [read, laser]\n  bogus: 1\n---\n");
+        assert_eq!(
+            p.def.guard.as_ref().unwrap().write,
+            vec![PathBuf::from("/ok")]
+        );
+        assert_eq!(
+            p.def.guard.as_ref().unwrap().tools.as_deref(),
+            Some(&[ToolFamily::Read][..])
+        );
+        assert!(p.warnings.iter().any(|w| w.contains("relative/dir")));
+        assert!(p.warnings.iter().any(|w| w.contains("laser")));
+        assert!(p.warnings.iter().any(|w| w.contains("bogus")));
+
+        // Not a map: warn, no guard.
+        let p = parse("---\nfork: true\nguard: yes\n---\n");
+        assert!(p.def.guard.is_none());
+        assert!(p.warnings.iter().any(|w| w.contains("guard")));
+
+        // `guard:` alone marks a file fork-like.
+        assert!(matches!(
+            parse_fork_file("x", "---\nguard:\n  write: /a\n---\n"),
+            ForkParse::NotFork { fork_like: true }
+        ));
     }
 
     #[test]

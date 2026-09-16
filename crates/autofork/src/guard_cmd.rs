@@ -20,7 +20,11 @@ use serde::Deserialize;
 pub fn fork_name_from_path(path: &Path) -> String {
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("fork");
     if stem.eq_ignore_ascii_case("fork") {
-        if let Some(parent) = path.parent().and_then(|p| p.file_name()).and_then(|s| s.to_str()) {
+        if let Some(parent) = path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+        {
             return parent.to_string();
         }
     }
@@ -29,12 +33,13 @@ pub fn fork_name_from_path(path: &Path) -> String {
 
 /// Load a fork file and return its guard, if it declares one.
 pub fn load_guard(path: &Path) -> Result<Option<Guard>, String> {
-    let content = std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let name = fork_name_from_path(path);
     match parse_fork_file(&name, &content) {
         ForkParse::Fork(parsed) => Ok(parsed.def.guard),
         ForkParse::NotFork { .. } => Ok(None),
-        ForkParse::Invalid { .. } => Err(format!("{} has invalid frontmatter", path.display())),
+        ForkParse::Invalid => Err(format!("{} has invalid frontmatter", path.display())),
     }
 }
 
@@ -59,21 +64,41 @@ pub struct EvalInput {
 
 /// Map a harness tool call onto the guard's vocabulary. Returns the
 /// call plus owned strings it borrows from.
-fn map_call<'a>(client: &str, tool: &'a str, args: &'a serde_json::Value, cwd: &'a Path, buf: &'a mut MapBuf) -> ToolCall<'a> {
+fn map_call<'a>(
+    client: &str,
+    tool: &'a str,
+    args: &'a serde_json::Value,
+    cwd: &'a Path,
+    buf: &'a mut MapBuf,
+) -> ToolCall<'a> {
     let s = |k: &str| args.get(k).and_then(|v| v.as_str());
     match client {
         "opencode" => match tool {
             "bash" => {
                 buf.command = s("command").unwrap_or("").to_string();
-                buf.cwd = s("workdir").map(PathBuf::from).unwrap_or_else(|| cwd.to_path_buf());
-                ToolCall::Shell { command: &buf.command, cwd: &buf.cwd }
+                buf.cwd = s("workdir")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| cwd.to_path_buf());
+                ToolCall::Shell {
+                    command: &buf.command,
+                    cwd: &buf.cwd,
+                }
             }
             "edit" | "write" | "patch" | "multiedit" | "apply_patch" => {
-                buf.path = s("filePath").or(s("file_path")).or(s("path")).map(PathBuf::from).unwrap_or_default();
-                ToolCall::Edit { path: &buf.path, cwd }
+                buf.path = s("filePath")
+                    .or(s("file_path"))
+                    .or(s("path"))
+                    .map(PathBuf::from)
+                    .unwrap_or_default();
+                ToolCall::Edit {
+                    path: &buf.path,
+                    cwd,
+                }
             }
             "read" | "glob" | "grep" | "list" | "ls" | "lsp" | "codesearch" => ToolCall::Read,
-            "webfetch" | "websearch" => ToolCall::Web { target: s("url").or(s("query")) },
+            "webfetch" | "websearch" => ToolCall::Web {
+                target: s("url").or(s("query")),
+            },
             "task" => ToolCall::Task,
             other => ToolCall::Other { name: other },
         },
@@ -81,26 +106,45 @@ fn map_call<'a>(client: &str, tool: &'a str, args: &'a serde_json::Value, cwd: &
             "Bash" => {
                 buf.command = s("command").unwrap_or("").to_string();
                 buf.cwd = cwd.to_path_buf();
-                ToolCall::Shell { command: &buf.command, cwd: &buf.cwd }
+                ToolCall::Shell {
+                    command: &buf.command,
+                    cwd: &buf.cwd,
+                }
             }
             "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => {
-                buf.path = s("file_path").or(s("notebook_path")).map(PathBuf::from).unwrap_or_default();
-                ToolCall::Edit { path: &buf.path, cwd }
+                buf.path = s("file_path")
+                    .or(s("notebook_path"))
+                    .map(PathBuf::from)
+                    .unwrap_or_default();
+                ToolCall::Edit {
+                    path: &buf.path,
+                    cwd,
+                }
             }
             "Read" | "Glob" | "Grep" | "LS" => ToolCall::Read,
-            "WebFetch" | "WebSearch" => ToolCall::Web { target: s("url").or(s("query")) },
+            "WebFetch" | "WebSearch" => ToolCall::Web {
+                target: s("url").or(s("query")),
+            },
             "Agent" | "Task" => ToolCall::Task,
             other => ToolCall::Other { name: other },
         },
         _ => match tool {
             "shell" | "bash" => {
                 buf.command = s("command").unwrap_or("").to_string();
-                buf.cwd = s("cwd").map(PathBuf::from).unwrap_or_else(|| cwd.to_path_buf());
-                ToolCall::Shell { command: &buf.command, cwd: &buf.cwd }
+                buf.cwd = s("cwd")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| cwd.to_path_buf());
+                ToolCall::Shell {
+                    command: &buf.command,
+                    cwd: &buf.cwd,
+                }
             }
             "edit" | "write" => {
                 buf.path = s("path").map(PathBuf::from).unwrap_or_default();
-                ToolCall::Edit { path: &buf.path, cwd }
+                ToolCall::Edit {
+                    path: &buf.path,
+                    cwd,
+                }
             }
             "read" => ToolCall::Read,
             "web" => ToolCall::Web { target: s("url") },
@@ -122,7 +166,10 @@ pub fn evaluate(paths: &Paths, input: &EvalInput) -> Result<Verdict, String> {
     let Some(guard) = load_guard(&input.fork_path)? else {
         return Ok(Verdict::Allow);
     };
-    let name = input.fork.clone().unwrap_or_else(|| fork_name_from_path(&input.fork_path));
+    let name = input
+        .fork
+        .clone()
+        .unwrap_or_else(|| fork_name_from_path(&input.fork_path));
     let client = input.client.as_deref().unwrap_or("generic");
     let mut buf = MapBuf::default();
     let call = map_call(client, &input.tool, &input.args, &input.cwd, &mut buf);
@@ -134,7 +181,11 @@ pub fn evaluate(paths: &Paths, input: &EvalInput) -> Result<Verdict, String> {
 fn log_verdict(paths: &Paths, fork: &str, tool: &str, call: &ToolCall, verdict: &Verdict) {
     use std::io::Write;
     let what = match call {
-        ToolCall::Shell { command, .. } => command.chars().take(160).collect::<String>().replace('\n', " "),
+        ToolCall::Shell { command, .. } => command
+            .chars()
+            .take(160)
+            .collect::<String>()
+            .replace('\n', " "),
         ToolCall::Edit { path, .. } => path.display().to_string(),
         ToolCall::Web { target } => target.unwrap_or("").to_string(),
         _ => String::new(),
@@ -146,7 +197,11 @@ fn log_verdict(paths: &Paths, fork: &str, tool: &str, call: &ToolCall, verdict: 
     };
     let dir = paths.base.join("logs");
     let _ = std::fs::create_dir_all(&dir);
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("guard.log")) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("guard.log"))
+    {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -161,46 +216,82 @@ fn log_verdict(paths: &Paths, fork: &str, tool: &str, call: &ToolCall, verdict: 
 pub fn eval_stdin(paths: &Paths) {
     let mut raw = String::new();
     if let Err(e) = std::io::stdin().read_to_string(&mut raw) {
-        print_verdict(&Verdict::Deny { message: format!("autofork guard could not read its input: {e}") });
+        print_verdict(&Verdict::Deny {
+            message: format!("autofork guard could not read its input: {e}"),
+        });
         return;
     }
     let input: EvalInput = match serde_json::from_str(&raw) {
         Ok(i) => i,
         Err(e) => {
-            print_verdict(&Verdict::Deny { message: format!("autofork guard could not parse its input: {e}") });
+            print_verdict(&Verdict::Deny {
+                message: format!("autofork guard could not parse its input: {e}"),
+            });
             return;
         }
     };
     match evaluate(paths, &input) {
         Ok(v) => print_verdict(&v),
-        Err(e) => print_verdict(&Verdict::Deny { message: format!("autofork guard could not load the fork: {e}") }),
+        Err(e) => print_verdict(&Verdict::Deny {
+            message: format!("autofork guard could not load the fork: {e}"),
+        }),
     }
 }
 
 fn print_verdict(v: &Verdict) {
-    println!("{}", serde_json::to_string(v).unwrap_or_else(|_| "{\"action\":\"deny\",\"message\":\"autofork guard: internal error\"}".into()));
+    println!(
+        "{}",
+        serde_json::to_string(v).unwrap_or_else(|_| {
+            "{\"action\":\"deny\",\"message\":\"autofork guard: internal error\"}".into()
+        })
+    );
 }
 
 /// `guard check`: what this fork's guard says to a command or an edit.
-pub fn check(paths: &Paths, fork: &Path, cwd: Option<PathBuf>, path: Option<PathBuf>, command: Vec<String>) -> Result<(), String> {
+pub fn check(
+    paths: &Paths,
+    fork: &Path,
+    cwd: Option<PathBuf>,
+    path: Option<PathBuf>,
+    command: Vec<String>,
+) -> Result<(), String> {
     let cwd = cwd.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")));
     let Some(guard) = load_guard(fork)? else {
-        println!("{} declares no guard: everything is allowed", fork.display());
+        println!(
+            "{} declares no guard: everything is allowed",
+            fork.display()
+        );
         return Ok(());
     };
     let name = fork_name_from_path(fork);
     let verdict = if let Some(p) = path {
-        guard.evaluate(&name, &ToolCall::Edit { path: &p, cwd: &cwd }, &paths.base.join("tmp"))
+        guard.evaluate(
+            &name,
+            &ToolCall::Edit {
+                path: &p,
+                cwd: &cwd,
+            },
+            &paths.base.join("tmp"),
+        )
     } else if !command.is_empty() {
         let cmd = command.join(" ");
-        guard.evaluate(&name, &ToolCall::Shell { command: &cmd, cwd: &cwd }, &paths.base.join("tmp"))
+        guard.evaluate(
+            &name,
+            &ToolCall::Shell {
+                command: &cmd,
+                cwd: &cwd,
+            },
+            &paths.base.join("tmp"),
+        )
     } else {
         return Err("give a command (after --) or --path".into());
     };
     match verdict {
         Verdict::Allow => println!("allow"),
         Verdict::Deny { message } => println!("deny\n\n{message}"),
-        Verdict::Sandbox { command, message } => println!("sandbox\n\n{command}\n\non failure:\n{message}"),
+        Verdict::Sandbox { command, message } => {
+            println!("sandbox\n\n{command}\n\non failure:\n{message}")
+        }
     }
     Ok(())
 }
@@ -212,7 +303,7 @@ pub fn analyse(cwd: Option<PathBuf>, command: Vec<String>) -> Result<(), String>
         return Err("give a command after --".into());
     }
     let cmd = command.join(" ");
-    let a = shell::analyse(&cmd, &cwd, &[]);
+    let a = shell::analyse(&cmd, &cwd, &[], &[]);
     if a.effects.is_empty() {
         println!("clean: reads only");
     }
@@ -220,9 +311,14 @@ pub fn analyse(cwd: Option<PathBuf>, command: Vec<String>) -> Result<(), String>
         match e {
             shell::Effect::Write { path, by } => println!("write    {}    ← {by}", path.display()),
             shell::Effect::Exec { path, by } => println!("exec     {}    ← {by}", path.display()),
-            shell::Effect::GitRemote { repo, by, publish } => println!("{} {}    ← {by}", if *publish { "publish " } else { "sync    " }, repo.display()),
+            shell::Effect::GitRemote { repo, by, publish } => println!(
+                "{} {}    ← {by}",
+                if *publish { "publish " } else { "sync    " },
+                repo.display()
+            ),
             shell::Effect::Network { by } => println!("network  ← {by}"),
             shell::Effect::Publish { by, what } => println!("publish  {what}    ← {by}"),
+            shell::Effect::Denied { by, pattern } => println!("denied   {pattern}    ← {by}"),
             shell::Effect::Escalate { by } => println!("escalate ← {by}"),
             shell::Effect::Disrupt { by } => println!("disrupt  ← {by}"),
             shell::Effect::Unknown { by, why } => println!("unknown  {why}    ← {by}"),

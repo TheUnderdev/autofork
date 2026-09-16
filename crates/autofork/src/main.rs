@@ -306,9 +306,12 @@ fn main() {
         }
         Command::Guard { command } => match command {
             GuardCommand::Eval => guard_cmd::eval_stdin(&paths),
-            GuardCommand::Check { fork, cwd, path, command } => {
-                exit_on_err(guard_cmd::check(&paths, &fork, cwd, path, command))
-            }
+            GuardCommand::Check {
+                fork,
+                cwd,
+                path,
+                command,
+            } => exit_on_err(guard_cmd::check(&paths, &fork, cwd, path, command)),
             GuardCommand::Analyse { cwd, command } => exit_on_err(guard_cmd::analyse(cwd, command)),
         },
         Command::StopDaemon { drain } => exit_on_err(stop_daemon(&paths, drain)),

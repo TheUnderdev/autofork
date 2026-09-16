@@ -454,6 +454,20 @@ mod tests {
     }
 
     #[test]
+    fn plugin_wires_the_fork_guard_to_the_tool_boundary() {
+        let src = plugin_source();
+        // The two hooks opencode calls around every tool call. Without them
+        // a guarded fork's run is unguarded under opencode, silently.
+        assert!(src.contains("\"tool.execute.before\""));
+        assert!(src.contains("\"tool.execute.after\""));
+        // They decide nothing themselves: the verdict comes from the binary.
+        assert!(src.contains("[BIN, \"guard\", \"eval\"]"));
+        // And a close-time fork run (a separate process) guards itself from
+        // the env the end-runner sets.
+        assert!(src.contains("AUTOFORK_FORK_PATH"));
+    }
+
+    #[test]
     fn project_root_ignores_the_slash_worktree() {
         use std::path::Path;
         // A real worktree above the directory wins.

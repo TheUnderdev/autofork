@@ -102,6 +102,12 @@ pub struct Guard {
     /// that owns a repo may still sync and push it.
     #[serde(default)]
     pub network: bool,
+    /// Command patterns refused on sight, wherever they appear (top level,
+    /// inside `bash -c`, behind `xargs` or a wrapper): `ssh`, `git push*`,
+    /// `rm -rf *`. Tokens match arguments in order, `*` in a token matches
+    /// any text, a trailing `*` token matches the rest of the line.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<String>,
     /// The author's course-correction text, quoted back to the fork
     /// whenever it hits the guard.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -139,12 +145,17 @@ pub enum Verdict {
     Allow,
     /// Refuse the call; `message` is what the model reads instead of a
     /// tool result.
-    Deny { message: String },
+    Deny {
+        message: String,
+    },
     /// Run the shell command, but inside an OS sandbox confined to the
     /// write set with no network. `command` is the wrapped command line;
     /// `message` is what to append to the output if it fails on the
     /// sandbox's rule.
-    Sandbox { command: String, message: String },
+    Sandbox {
+        command: String,
+        message: String,
+    },
 }
 
 impl Guard {
@@ -176,7 +187,9 @@ impl Guard {
         if let Some(f) = family {
             if !self.allows_family(f) {
                 let what = match call {
-                    ToolCall::Shell { command, .. } => format!("the shell (`{}`)", excerpt(command)),
+                    ToolCall::Shell { command, .. } => {
+                        format!("the shell (`{}`)", excerpt(command))
+                    }
                     ToolCall::Edit { path, .. } => format!("editing `{}`", path.display()),
                     ToolCall::Read => "reading files".to_string(),
                     ToolCall::Web { .. } => "the web".to_string(),
@@ -184,7 +197,13 @@ impl Guard {
                     ToolCall::Other { name } => format!("the `{name}` tool"),
                 };
                 return Verdict::Deny {
-                    message: self.compose(fork_name, &[format!("{what} is not available to this fork: it may use {}", self.tools_phrase())]),
+                    message: self.compose(
+                        fork_name,
+                        &[format!(
+                            "{what} is not available to this fork: it may use {}",
+                            self.tools_phrase()
+                        )],
+                    ),
                 };
             }
         }
@@ -194,7 +213,10 @@ impl Guard {
             ToolCall::Other { name } => {
                 if self.tools.as_ref().is_some_and(|t| t.is_empty()) {
                     Verdict::Deny {
-                        message: self.compose(fork_name, &[format!("the `{name}` tool is not available to this fork")]),
+                        message: self.compose(
+                            fork_name,
+                            &[format!("the `{name}` tool is not available to this fork")],
+                        ),
                     }
                 } else {
                     Verdict::Allow
@@ -204,36 +226,61 @@ impl Guard {
                 if self.network {
                     Verdict::Allow
                 } else {
-                    let t = target.map(|t| format!(" (`{}`)", excerpt(t))).unwrap_or_default();
+                    let t = target
+                        .map(|t| format!(" (`{}`)", excerpt(t)))
+                        .unwrap_or_default();
                     Verdict::Deny {
-                        message: self.compose(fork_name, &[format!("fetching from the web{t} is not allowed: this fork has no network")]),
+                        message: self.compose(
+                            fork_name,
+                            &[format!(
+                                "fetching from the web{t} is not allowed: this fork has no network"
+                            )],
+                        ),
                     }
                 }
             }
             ToolCall::Edit { path, cwd } => {
-                let abs = if path.is_absolute() { path.to_path_buf() } else { cwd.join(path) };
+                let abs = if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    cwd.join(path)
+                };
                 let abs = normalize(&abs);
                 if self.writable(&abs) {
                     Verdict::Allow
                 } else {
                     Verdict::Deny {
-                        message: self.compose(fork_name, &[format!("editing `{}` is outside the list", abs.display())]),
+                        message: self.compose(
+                            fork_name,
+                            &[format!("editing `{}` is outside the list", abs.display())],
+                        ),
                     }
                 }
             }
-            ToolCall::Shell { command, cwd } => self.evaluate_shell(fork_name, command, cwd, tmp_dir),
+            ToolCall::Shell { command, cwd } => {
+                self.evaluate_shell(fork_name, command, cwd, tmp_dir)
+            }
         }
     }
 
-    fn evaluate_shell(&self, fork_name: &str, command: &str, cwd: &Path, tmp_dir: &Path) -> Verdict {
-        let analysis = shell::analyse(command, cwd, &self.write);
+    fn evaluate_shell(
+        &self,
+        fork_name: &str,
+        command: &str,
+        cwd: &Path,
+        tmp_dir: &Path,
+    ) -> Verdict {
+        let analysis = shell::analyse(command, cwd, &self.write, &self.deny);
         let mut denies: Vec<String> = Vec::new();
         let mut unknowns: Vec<String> = Vec::new();
         for e in &analysis.effects {
             match e {
                 shell::Effect::Write { path, by } => {
                     if !self.writable(path) {
-                        denies.push(format!("`{by}` writes `{}`, outside the list", path.display()));
+                        denies.push(format!(
+                            "`{by}` writes `{}`, outside the list",
+                            path.display()
+                        ));
                     }
                 }
                 shell::Effect::Exec { path, by } => {
@@ -244,18 +291,28 @@ impl Guard {
                 shell::Effect::GitRemote { repo, by, publish } => {
                     if !self.writable(repo) {
                         let verb = if *publish { "publishes" } else { "syncs" };
-                        denies.push(format!("`{by}` {verb} the repository at `{}`, outside the list", repo.display()));
+                        denies.push(format!(
+                            "`{by}` {verb} the repository at `{}`, outside the list",
+                            repo.display()
+                        ));
                     }
                 }
                 shell::Effect::Network { by } => {
                     if !self.network {
-                        denies.push(format!("`{by}` uses the network, which this fork does not have"));
+                        denies.push(format!(
+                            "`{by}` uses the network, which this fork does not have"
+                        ));
                     }
                 }
                 shell::Effect::Publish { by, what } => {
                     if !self.network {
                         denies.push(format!("`{by}` {what}, which this fork may not do"));
                     }
+                }
+                shell::Effect::Denied { by, pattern } => {
+                    denies.push(format!(
+                        "`{by}` matches this fork's deny list (`{pattern}`)"
+                    ));
                 }
                 shell::Effect::Escalate { by } => {
                     denies.push(format!("`{by}` escalates privileges, which no fork may do"));
@@ -269,7 +326,9 @@ impl Guard {
             }
         }
         if !denies.is_empty() {
-            return Verdict::Deny { message: self.compose(fork_name, &denies) };
+            return Verdict::Deny {
+                message: self.compose(fork_name, &denies),
+            };
         }
         if unknowns.is_empty() {
             return Verdict::Allow;
@@ -281,12 +340,17 @@ impl Guard {
                     unknowns.join("; ")
                 )];
                 reasons.truncate(1);
-                Verdict::Sandbox { command: wrapped, message: self.compose(fork_name, &reasons) }
+                Verdict::Sandbox {
+                    command: wrapped,
+                    message: self.compose(fork_name, &reasons),
+                }
             }
             Err(why) => {
                 let mut reasons = unknowns;
                 reasons.push(format!("autofork cannot confine it either ({why}), so it is refused; express the work as plain shell commands on explicit paths"));
-                Verdict::Deny { message: self.compose(fork_name, &reasons) }
+                Verdict::Deny {
+                    message: self.compose(fork_name, &reasons),
+                }
             }
         }
     }
@@ -306,8 +370,15 @@ impl Guard {
         if self.write.is_empty() {
             "This fork may not change any file.".to_string()
         } else {
-            let list: Vec<String> = self.write.iter().map(|p| format!("`{}`", p.display())).collect();
-            format!("This fork may only change files under: {}.", list.join(", "))
+            let list: Vec<String> = self
+                .write
+                .iter()
+                .map(|p| format!("`{}`", p.display()))
+                .collect();
+            format!(
+                "This fork may only change files under: {}.",
+                list.join(", ")
+            )
         }
     }
 
@@ -315,11 +386,20 @@ impl Guard {
     /// weakest model that will ever read it: what was blocked, why, what
     /// the author wants, and the one thing not to do next.
     pub fn compose(&self, fork_name: &str, reasons: &[String]) -> String {
-        let mut out = format!("autofork guard — fork `{fork_name}`. {}", self.scope_phrase());
+        let mut out = format!(
+            "autofork guard — fork `{fork_name}`. {}",
+            self.scope_phrase()
+        );
         let shown: Vec<&String> = reasons.iter().take(3).collect();
         if !shown.is_empty() {
             out.push_str("\nBlocked: ");
-            out.push_str(&shown.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("; "));
+            out.push_str(
+                &shown
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            );
             out.push('.');
         }
         if let Some(m) = &self.message {
@@ -358,6 +438,9 @@ impl Guard {
         }
         if self.network {
             parts.push("network: yes".to_string());
+        }
+        if !self.deny.is_empty() {
+            parts.push(format!("deny: [{}]", self.deny.join(", ")));
         }
         parts.join(" | ")
     }
@@ -467,8 +550,12 @@ fn git_remote_hosts(repo: &Path) -> Vec<String> {
     };
     for line in cfg.lines() {
         let line = line.trim();
-        let Some(url) = line.strip_prefix("url") else { continue };
-        let Some(url) = url.trim_start().strip_prefix('=') else { continue };
+        let Some(url) = line.strip_prefix("url") else {
+            continue;
+        };
+        let Some(url) = url.trim_start().strip_prefix('=') else {
+            continue;
+        };
         if let Some(h) = remote_url_host(url.trim()) {
             if !out.contains(&h) {
                 out.push(h);
@@ -502,7 +589,10 @@ mod tests {
     use super::*;
 
     fn guard(write: &[&str]) -> Guard {
-        Guard { write: write.iter().map(PathBuf::from).collect(), ..Default::default() }
+        Guard {
+            write: write.iter().map(PathBuf::from).collect(),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -517,10 +607,16 @@ mod tests {
 
     #[test]
     fn edit_outside_is_denied_with_message() {
-        let g = Guard { message: Some("Only the brain.".into()), ..guard(&["/tmp/brain"]) };
+        let g = Guard {
+            message: Some("Only the brain.".into()),
+            ..guard(&["/tmp/brain"])
+        };
         let v = g.evaluate(
             "handover",
-            &ToolCall::Edit { path: Path::new("src/main.rs"), cwd: Path::new("/work/proj") },
+            &ToolCall::Edit {
+                path: Path::new("src/main.rs"),
+                cwd: Path::new("/work/proj"),
+            },
             Path::new("/tmp"),
         );
         match v {
@@ -534,7 +630,10 @@ mod tests {
         assert_eq!(
             g.evaluate(
                 "handover",
-                &ToolCall::Edit { path: Path::new("/tmp/brain/a.md"), cwd: Path::new("/work") },
+                &ToolCall::Edit {
+                    path: Path::new("/tmp/brain/a.md"),
+                    cwd: Path::new("/work")
+                },
                 Path::new("/tmp")
             ),
             Verdict::Allow
@@ -543,33 +642,123 @@ mod tests {
 
     #[test]
     fn tools_none_denies_everything() {
-        let g = Guard { tools: Some(vec![]), ..Default::default() };
-        assert!(matches!(g.evaluate("r", &ToolCall::Read, Path::new("/tmp")), Verdict::Deny { .. }));
+        let g = Guard {
+            tools: Some(vec![]),
+            ..Default::default()
+        };
         assert!(matches!(
-            g.evaluate("r", &ToolCall::Shell { command: "ls", cwd: Path::new("/") }, Path::new("/tmp")),
+            g.evaluate("r", &ToolCall::Read, Path::new("/tmp")),
             Verdict::Deny { .. }
         ));
-        assert!(matches!(g.evaluate("r", &ToolCall::Other { name: "todowrite" }, Path::new("/tmp")), Verdict::Deny { .. }));
+        assert!(matches!(
+            g.evaluate(
+                "r",
+                &ToolCall::Shell {
+                    command: "ls",
+                    cwd: Path::new("/")
+                },
+                Path::new("/tmp")
+            ),
+            Verdict::Deny { .. }
+        ));
+        assert!(matches!(
+            g.evaluate(
+                "r",
+                &ToolCall::Other { name: "todowrite" },
+                Path::new("/tmp")
+            ),
+            Verdict::Deny { .. }
+        ));
     }
 
     #[test]
     fn web_needs_network() {
         let g = guard(&[]);
-        assert!(matches!(g.evaluate("f", &ToolCall::Web { target: Some("https://x") }, Path::new("/tmp")), Verdict::Deny { .. }));
-        let g = Guard { network: true, ..guard(&[]) };
-        assert_eq!(g.evaluate("f", &ToolCall::Web { target: None }, Path::new("/tmp")), Verdict::Allow);
+        assert!(matches!(
+            g.evaluate(
+                "f",
+                &ToolCall::Web {
+                    target: Some("https://x")
+                },
+                Path::new("/tmp")
+            ),
+            Verdict::Deny { .. }
+        ));
+        let g = Guard {
+            network: true,
+            ..guard(&[])
+        };
+        assert_eq!(
+            g.evaluate("f", &ToolCall::Web { target: None }, Path::new("/tmp")),
+            Verdict::Allow
+        );
+    }
+
+    #[test]
+    fn deny_list_refuses_on_sight() {
+        let g = Guard {
+            network: true,
+            deny: vec!["ssh".into(), "git push*".into()],
+            ..guard(&["/tmp/brain"])
+        };
+        let tmp = Path::new("/tmp");
+        for c in [
+            "ssh host ls",
+            "nohup ssh host",
+            "bash -c 'ssh host'",
+            "cd /tmp/brain && git push origin main",
+            "echo x | xargs ssh",
+        ] {
+            match g.evaluate(
+                "f",
+                &ToolCall::Shell {
+                    command: c,
+                    cwd: Path::new("/tmp/brain"),
+                },
+                tmp,
+            ) {
+                Verdict::Deny { message } => {
+                    assert!(message.contains("deny list"), "{c}: {message}")
+                }
+                other => panic!("{c}: {other:?}"),
+            }
+        }
+        // `git pull` of the writable repo is not on the list.
+        assert_eq!(
+            g.evaluate(
+                "f",
+                &ToolCall::Shell {
+                    command: "git pull",
+                    cwd: Path::new("/tmp/brain")
+                },
+                tmp
+            ),
+            Verdict::Allow
+        );
     }
 
     #[test]
     fn remote_url_hosts() {
-        assert_eq!(remote_url_host("https://github.com/a/b.git").as_deref(), Some("github.com"));
-        assert_eq!(remote_url_host("ssh://git@git.valls.dev:2222/m/brain.git").as_deref(), Some("git.valls.dev"));
-        assert_eq!(remote_url_host("git@github.com:a/b.git").as_deref(), Some("github.com"));
+        assert_eq!(
+            remote_url_host("https://github.com/a/b.git").as_deref(),
+            Some("github.com")
+        );
+        assert_eq!(
+            remote_url_host("ssh://git@git.example.org:2222/m/brain.git").as_deref(),
+            Some("git.example.org")
+        );
+        assert_eq!(
+            remote_url_host("git@github.com:a/b.git").as_deref(),
+            Some("github.com")
+        );
         assert_eq!(remote_url_host("/local/path"), None);
     }
 
     #[test]
     fn normalize_collapses_dots() {
-        assert_eq!(normalize(Path::new("/a/b/../c/./d")), PathBuf::from("/a/c/d"));
+        assert_eq!(
+            normalize(Path::new("/a/b/../c/./d")),
+            PathBuf::from("/a/c/d")
+        );
     }
 }

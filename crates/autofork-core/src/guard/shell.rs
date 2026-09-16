@@ -38,12 +38,18 @@ pub enum Effect {
     Exec { path: PathBuf, by: String },
     /// A git operation that talks to a remote for the repository at `repo`
     /// (`publish`: pushes/sends; otherwise fetch/pull/clone/ls-remote).
-    GitRemote { repo: PathBuf, by: String, publish: bool },
+    GitRemote {
+        repo: PathBuf,
+        by: String,
+        publish: bool,
+    },
     /// Uses the network without publishing anything by itself.
     Network { by: String },
     /// Publishes: posts, pushes, deploys, sends. `what` finishes the
     /// sentence "`by` …".
     Publish { by: String, what: String },
+    /// Matches a pattern on the guard's deny list.
+    Denied { by: String, pattern: String },
     /// Escalates privileges (sudo, su, doas, chroot).
     Escalate { by: String },
     /// Kills processes or reconfigures the machine.
@@ -69,10 +75,13 @@ impl Analysis {
 /// Analyse `command` as run from `cwd`. `trusted` are directories whose
 /// scripts run as the fork's own tooling (the write set): a script found
 /// there is reported as [`Effect::Exec`] and not analysed by content.
-pub fn analyse(command: &str, cwd: &Path, trusted: &[PathBuf]) -> Analysis {
-    let mut w = Walker::new(cwd, trusted);
+pub fn analyse(command: &str, cwd: &Path, trusted: &[PathBuf], deny: &[String]) -> Analysis {
+    let mut w = Walker::new(cwd, trusted, deny);
     w.analyse_source(command);
-    Analysis { effects: w.effects, parse_error: w.parse_error }
+    Analysis {
+        effects: w.effects,
+        parse_error: w.parse_error,
+    }
 }
 
 const MAX_DEPTH: u32 = 8;
@@ -130,6 +139,7 @@ struct Walker {
     vars: HashMap<String, String>,
     functions: HashSet<String>,
     trusted: Vec<PathBuf>,
+    deny: Vec<Vec<String>>,
     home: Option<PathBuf>,
     effects: Vec<Effect>,
     parse_error: bool,
@@ -137,8 +147,13 @@ struct Walker {
 }
 
 impl Walker {
-    fn new(cwd: &Path, trusted: &[PathBuf]) -> Self {
+    fn new(cwd: &Path, trusted: &[PathBuf], deny: &[String]) -> Self {
         Walker {
+            deny: deny
+                .iter()
+                .map(|p| p.split_whitespace().map(String::from).collect::<Vec<_>>())
+                .filter(|p| !p.is_empty())
+                .collect(),
             cwd: Cwd::Known(normalize(cwd)),
             prev_cwd: Cwd::Known(normalize(cwd)),
             dir_stack: Vec::new(),
@@ -179,18 +194,30 @@ impl Walker {
             return;
         }
         let mut parser = Parser::new();
-        if parser.set_language(&tree_sitter_bash::LANGUAGE.into()).is_err() {
-            self.effects.push(Effect::Unknown { by: excerpt(src), why: "could not be parsed (grammar unavailable)".into() });
+        if parser
+            .set_language(&tree_sitter_bash::LANGUAGE.into())
+            .is_err()
+        {
+            self.effects.push(Effect::Unknown {
+                by: excerpt(src),
+                why: "could not be parsed (grammar unavailable)".into(),
+            });
             return;
         }
         let Some(tree) = parser.parse(src, None) else {
-            self.effects.push(Effect::Unknown { by: excerpt(src), why: "could not be parsed as shell".into() });
+            self.effects.push(Effect::Unknown {
+                by: excerpt(src),
+                why: "could not be parsed as shell".into(),
+            });
             return;
         };
         let root = tree.root_node();
         if root.has_error() {
             self.parse_error = true;
-            self.effects.push(Effect::Unknown { by: excerpt(src), why: "could not be fully parsed as shell".into() });
+            self.effects.push(Effect::Unknown {
+                by: excerpt(src),
+                why: "could not be fully parsed as shell".into(),
+            });
         }
         self.depth += 1;
         self.walk(root, src.as_bytes());
@@ -247,11 +274,18 @@ impl Walker {
             }
             "raw_string" => {
                 let t = text(node);
-                Val::Lit(t.trim_start_matches('\'').trim_end_matches('\'').to_string())
+                Val::Lit(
+                    t.trim_start_matches('\'')
+                        .trim_end_matches('\'')
+                        .to_string(),
+                )
             }
             "ansi_c_string" => {
                 let t = text(node);
-                let inner = t.strip_prefix("$'").and_then(|s| s.strip_suffix('\'')).unwrap_or(&t);
+                let inner = t
+                    .strip_prefix("$'")
+                    .and_then(|s| s.strip_suffix('\''))
+                    .unwrap_or(&t);
                 Val::Lit(unescape_ansi(inner))
             }
             "number" => Val::Lit(text(node)),
@@ -361,7 +395,11 @@ impl Walker {
             return Val::Lit(v.clone());
         }
         match name {
-            "HOME" => self.home.as_ref().map(|h| Val::Lit(h.display().to_string())).unwrap_or(Val::Unknown),
+            "HOME" => self
+                .home
+                .as_ref()
+                .map(|h| Val::Lit(h.display().to_string()))
+                .unwrap_or(Val::Unknown),
             "PWD" => match &self.cwd {
                 Cwd::Known(p) => Val::Lit(p.display().to_string()),
                 Cwd::Unknown => Val::Unknown,
@@ -378,7 +416,9 @@ impl Walker {
     }
 
     fn handle_assignment(&mut self, node: Node, src: &[u8]) {
-        let Some(name_node) = node.child_by_field_name("name") else { return };
+        let Some(name_node) = node.child_by_field_name("name") else {
+            return;
+        };
         let name = name_node.utf8_text(src).unwrap_or("").to_string();
         let whole = node.utf8_text(src).unwrap_or("");
         let value = match node.child_by_field_name("value") {
@@ -426,7 +466,10 @@ impl Walker {
         match self.path(v) {
             PVal::Known(p) => {
                 if !is_device(&p) {
-                    self.effects.push(Effect::Write { path: p, by: by.to_string() });
+                    self.effects.push(Effect::Write {
+                        path: p,
+                        by: by.to_string(),
+                    });
                 }
             }
             PVal::Unknown => self.effects.push(Effect::Unknown {
@@ -438,7 +481,10 @@ impl Walker {
 
     fn write_cwd(&mut self, by: &str) {
         match &self.cwd {
-            Cwd::Known(c) => self.effects.push(Effect::Write { path: c.clone(), by: by.to_string() }),
+            Cwd::Known(c) => self.effects.push(Effect::Write {
+                path: c.clone(),
+                by: by.to_string(),
+            }),
             Cwd::Unknown => self.effects.push(Effect::Unknown {
                 by: by.to_string(),
                 why: "writes into a working directory autofork lost track of".into(),
@@ -447,7 +493,10 @@ impl Walker {
     }
 
     fn unknown(&mut self, by: &str, why: &str) {
-        self.effects.push(Effect::Unknown { by: by.to_string(), why: why.to_string() });
+        self.effects.push(Effect::Unknown {
+            by: by.to_string(),
+            why: why.to_string(),
+        });
     }
 
     fn is_trusted(&self, p: &Path) -> bool {
@@ -461,14 +510,17 @@ impl Walker {
     // -- redirects ---------------------------------------------------------
 
     fn handle_redirect(&mut self, node: Node, src: &[u8]) {
-        let Some(dest) = node.child_by_field_name("destination") else { return };
+        let Some(dest) = node.child_by_field_name("destination") else {
+            return;
+        };
         let whole = node.utf8_text(src).unwrap_or("");
         let dest_start = dest.start_byte() - node.start_byte();
         let op = whole[..dest_start.min(whole.len())].trim();
         let op = op.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&');
         let dest_text = dest.utf8_text(src).unwrap_or("");
         // fd duplication (`2>&1`, `>&-`) is not a file.
-        if op.ends_with('&') && (dest_text.chars().all(|c| c.is_ascii_digit()) || dest_text == "-") {
+        if op.ends_with('&') && (dest_text.chars().all(|c| c.is_ascii_digit()) || dest_text == "-")
+        {
             return;
         }
         let writes = matches!(op, ">" | ">>" | ">|" | "&>" | "&>>" | "<>" | ">&" | ">>&");
@@ -543,8 +595,25 @@ impl Walker {
         let base = name.rsplit('/').next().unwrap_or(&name).to_string();
         let args: Vec<Val> = argv[1..].to_vec();
 
+        // The deny list is checked before anything else, on every command
+        // the walk reaches — a wrapper, a nested shell or xargs does not
+        // hide it. An argument we cannot resolve counts as matching: a deny
+        // list errs toward refusing.
+        if let Some(pat) = self.denied_by(&base, &name, &args) {
+            self.effects.push(Effect::Denied {
+                by: by.to_string(),
+                pattern: pat,
+            });
+            return;
+        }
+
         // `x --version` / `x --help` never does anything.
-        if args.len() == 1 && matches!(args[0].lit(), Some("--version" | "--help" | "-h" | "version" | "help")) {
+        if args.len() == 1
+            && matches!(
+                args[0].lit(),
+                Some("--version" | "--help" | "-h" | "version" | "help")
+            )
+        {
             return;
         }
 
@@ -558,12 +627,13 @@ impl Walker {
                     self.cwd = top;
                 }
             }
-            "export" | "local" | "declare" | "typeset" | "readonly" | "unset" | "set" | "shift" | "return" | "exit"
-            | "break" | "continue" | "wait" | "trap" | "ulimit" | "umask" | "alias" | "unalias" | "hash" | "type"
-            | "true" | "false" | ":" | "test" | "[" | "[[" | "read" | "getopts" | "let" | "printf" | "echo" | "pwd"
-            | "dirs" | "jobs" | "fg" | "bg" | "disown" | "times" | "help" | "which" | "whereis" | "whatis"
-            | "compgen" | "complete" | "enable" | "logout" | "suspend" | "history" | "fc" | "caller" | "mapfile"
-            | "readarray" | "sleep" => {
+            "export" | "local" | "declare" | "typeset" | "readonly" | "unset" | "set" | "shift"
+            | "return" | "exit" | "break" | "continue" | "wait" | "trap" | "ulimit" | "umask"
+            | "alias" | "unalias" | "hash" | "type" | "true" | "false" | ":" | "test" | "["
+            | "[[" | "read" | "getopts" | "let" | "printf" | "echo" | "pwd" | "dirs" | "jobs"
+            | "fg" | "bg" | "disown" | "times" | "help" | "which" | "whereis" | "whatis"
+            | "compgen" | "complete" | "enable" | "logout" | "suspend" | "history" | "fc"
+            | "caller" | "mapfile" | "readarray" | "sleep" => {
                 // `export X=y` etc.: plain assignments are handled by the
                 // grammar as variable_assignment nodes; here only side
                 // effects matter and there are none.
@@ -575,7 +645,8 @@ impl Walker {
                 let rest = strip_leading_opts(&args, &["-n", "--adjustment"]);
                 self.run(rest, by);
             }
-            "nohup" | "exec" | "builtin" | "chronic" | "unbuffer" | "time" | "ionice" | "caffeinate" | "stdbuf" => {
+            "nohup" | "exec" | "builtin" | "chronic" | "unbuffer" | "time" | "ionice"
+            | "caffeinate" | "stdbuf" => {
                 let takes = match base.as_str() {
                     "ionice" => &["-c", "-n", "-p"][..],
                     "caffeinate" => &["-t", "-w"][..],
@@ -603,7 +674,9 @@ impl Walker {
             }
 
             // -- shells and evaluators ----------------------------------------
-            "bash" | "sh" | "zsh" | "dash" | "ksh" | "mksh" | "ash" | "fish" => self.cmd_shell(&args, by),
+            "bash" | "sh" | "zsh" | "dash" | "ksh" | "mksh" | "ash" | "fish" => {
+                self.cmd_shell(&args, by)
+            }
             "eval" => {
                 let mut parts = Vec::new();
                 for a in &args {
@@ -618,13 +691,12 @@ impl Walker {
                 let joined = parts.join(" ");
                 self.analyse_source(&joined);
             }
-            "source" | "." => match args.first() {
-                Some(f) => {
+            "source" | "." => {
+                if let Some(f) = args.first() {
                     let f = f.clone();
                     self.analyse_script(&f, by, false);
                 }
-                None => {}
-            },
+            }
             "xargs" | "gxargs" => self.cmd_xargs(&args, by),
             "find" | "gfind" | "fd" | "fdfind" => {
                 if base == "fd" || base == "fdfind" {
@@ -641,28 +713,39 @@ impl Walker {
             "git-lfs" => self.unknown(by, "is a git extension autofork does not analyse"),
 
             // -- readers -----------------------------------------------------
-            "cat" | "ls" | "ll" | "dir" | "head" | "tail" | "wc" | "grep" | "egrep" | "fgrep" | "rg" | "ag" | "ack"
-            | "diff" | "cmp" | "comm" | "stat" | "file" | "id" | "whoami" | "date" | "basename" | "dirname"
-            | "realpath" | "readlink" | "printenv" | "uname" | "sort" | "uniq" | "cut" | "tr" | "jq" | "yq" | "tree"
-            | "du" | "df" | "md5" | "md5sum" | "shasum" | "sha1sum" | "sha256sum" | "sha512sum" | "cksum" | "xxd"
-            | "od" | "hexdump" | "strings" | "column" | "paste" | "join" | "less" | "more" | "nl" | "tac" | "rev"
-            | "fold" | "expand" | "unexpand" | "seq" | "bc" | "expr" | "hostname" | "arch" | "nproc" | "getconf"
-            | "locale" | "ps" | "top" | "lsof" | "pgrep" | "netstat" | "ifconfig" | "ip" | "sw_vers" | "sysctl"
-            | "system_profiler" | "uptime" | "w" | "who" | "last" | "env_parallel" | "look" | "tsort" | "fmt"
-            | "pr" | "yes" | "cal" | "man" | "info" | "tty" | "stty" | "base64" | "base32" | "iconv"
-            | "dos2unix_" | "sum" | "numfmt" | "factor" | "units" | "ncal" | "ldd" | "otool" | "nm"
-            | "objdump" | "readelf" | "lipo" | "codesign" | "spctl" | "plutil" | "sqlite3" | "bat" | "exa" | "eza"
-            | "lsd" | "fzf" | "delta" | "dig" | "nslookup" | "host" | "ping" | "traceroute" | "mtr" | "arp"
-            | "route" | "ss" | "vm_stat" | "iostat" | "vmstat" | "free" | "lscpu" | "lsblk" | "dmesg" | "journalctl"
-            | "watch" | "pbpaste" | "getent" | "groups" | "finger" => {
+            "cat" | "ls" | "ll" | "dir" | "head" | "tail" | "wc" | "grep" | "egrep" | "fgrep"
+            | "rg" | "ag" | "ack" | "diff" | "cmp" | "comm" | "stat" | "file" | "id" | "whoami"
+            | "date" | "basename" | "dirname" | "realpath" | "readlink" | "printenv" | "uname"
+            | "sort" | "uniq" | "cut" | "tr" | "jq" | "yq" | "tree" | "du" | "df" | "md5"
+            | "md5sum" | "shasum" | "sha1sum" | "sha256sum" | "sha512sum" | "cksum" | "xxd"
+            | "od" | "hexdump" | "strings" | "column" | "paste" | "join" | "less" | "more"
+            | "nl" | "tac" | "rev" | "fold" | "expand" | "unexpand" | "seq" | "bc" | "expr"
+            | "hostname" | "arch" | "nproc" | "getconf" | "locale" | "ps" | "top" | "lsof"
+            | "pgrep" | "netstat" | "ifconfig" | "ip" | "sw_vers" | "sysctl"
+            | "system_profiler" | "uptime" | "w" | "who" | "last" | "env_parallel" | "look"
+            | "tsort" | "fmt" | "pr" | "yes" | "cal" | "man" | "info" | "tty" | "stty"
+            | "base64" | "base32" | "iconv" | "dos2unix_" | "sum" | "numfmt" | "factor"
+            | "units" | "ncal" | "ldd" | "otool" | "nm" | "objdump" | "readelf" | "lipo"
+            | "codesign" | "spctl" | "plutil" | "sqlite3" | "bat" | "exa" | "eza" | "lsd"
+            | "fzf" | "delta" | "dig" | "nslookup" | "host" | "ping" | "traceroute" | "mtr"
+            | "arp" | "route" | "ss" | "vm_stat" | "iostat" | "vmstat" | "free" | "lscpu"
+            | "lsblk" | "dmesg" | "journalctl" | "watch" | "pbpaste" | "getent" | "groups"
+            | "finger" => {
                 // Tools whose only writes are to stdout. A few can be
                 // pointed at the network (dig, ping, sqlite3 on a file —
                 // sqlite3 writes!); handle the exceptions below.
                 if base == "sqlite3" {
                     self.cmd_sqlite(&args, by);
-                } else if matches!(base.as_str(), "dig" | "nslookup" | "host" | "ping" | "traceroute" | "mtr") {
+                } else if matches!(
+                    base.as_str(),
+                    "dig" | "nslookup" | "host" | "ping" | "traceroute" | "mtr"
+                ) {
                     self.effects.push(Effect::Network { by: by.to_string() });
-                } else if base == "plutil" && args.iter().any(|a| a.is("-convert") || a.is("-insert") || a.is("-replace") || a.is("-remove")) {
+                } else if base == "plutil"
+                    && args.iter().any(|a| {
+                        a.is("-convert") || a.is("-insert") || a.is("-replace") || a.is("-remove")
+                    })
+                {
                     if let Some(last) = non_opts(&args).last() {
                         let last = (*last).clone();
                         self.write(&last, by);
@@ -672,65 +755,182 @@ impl Walker {
             "sed" | "gsed" => self.cmd_sed(&args, by),
             "awk" | "gawk" | "mawk" | "nawk" => {
                 let dangerous = args.iter().any(|a| {
-                    a.lit().is_some_and(|s| s.contains('>') || s.contains("system(") || s.contains("| ") || s.contains("|\""))
+                    a.lit().is_some_and(|s| {
+                        s.contains('>')
+                            || s.contains("system(")
+                            || s.contains("| ")
+                            || s.contains("|\"")
+                    })
                 });
                 if dangerous {
                     self.unknown(by, "runs an awk program that writes files or commands");
                 }
             }
-            "perl" | "ruby" | "python" | "python2" | "python3" | "pythonw" | "node" | "nodejs" | "deno" | "bun" | "php"
-            | "swift" | "java" | "kotlin" | "kotlinc" | "scala" | "lua" | "luajit" | "tclsh" | "Rscript" | "R" | "julia"
-            | "ghc" | "runghc" | "runhaskell" | "elixir" | "erl" | "escript" | "groovy" | "clojure" | "clj" | "ocaml"
-            | "racket" | "guile" | "osascript" | "open" | "automator" | "expect" => {
+            "perl" | "ruby" | "python" | "python2" | "python3" | "pythonw" | "node" | "nodejs"
+            | "deno" | "bun" | "php" | "swift" | "java" | "kotlin" | "kotlinc" | "scala"
+            | "lua" | "luajit" | "tclsh" | "Rscript" | "R" | "julia" | "ghc" | "runghc"
+            | "runhaskell" | "elixir" | "erl" | "escript" | "groovy" | "clojure" | "clj"
+            | "ocaml" | "racket" | "guile" | "osascript" | "open" | "automator" | "expect" => {
                 self.unknown(by, "runs a program autofork cannot see inside");
             }
-            "go" | "rustc" | "gcc" | "cc" | "clang" | "clang++" | "g++" | "ld" | "make" | "gmake" | "cmake" | "ninja"
-            | "gradle" | "gradlew" | "mvn" | "ant" | "sbt" | "bazel" | "bazelisk" | "buck" | "meson" | "xcodebuild"
-            | "swiftc" | "tsc" | "esbuild" | "vite" | "webpack" | "dx" | "trunk" | "wasm-pack" | "zig" | "nim" | "dune"
-            | "stack" | "cabal" | "mix" | "rebar3" | "lein" | "pytest" | "tox" | "nox" | "jest" | "mocha" | "vitest" => {
-                self.unknown(by, "builds or tests, which writes wherever the build system decides");
+            "go" | "rustc" | "gcc" | "cc" | "clang" | "clang++" | "g++" | "ld" | "make"
+            | "gmake" | "cmake" | "ninja" | "gradle" | "gradlew" | "mvn" | "ant" | "sbt"
+            | "bazel" | "bazelisk" | "buck" | "meson" | "xcodebuild" | "swiftc" | "tsc"
+            | "esbuild" | "vite" | "webpack" | "dx" | "trunk" | "wasm-pack" | "zig" | "nim"
+            | "dune" | "stack" | "cabal" | "mix" | "rebar3" | "lein" | "pytest" | "tox" | "nox"
+            | "jest" | "mocha" | "vitest" => {
+                self.unknown(
+                    by,
+                    "builds or tests, which writes wherever the build system decides",
+                );
             }
-            "cargo" => self.cmd_tool(&args, by, &["publish", "login", "owner", "yank"], "publishes to crates.io"),
-            "npm" | "pnpm" | "yarn" | "npx" | "bunx" => {
-                self.cmd_tool(&args, by, &["publish", "login", "adduser", "deprecate", "unpublish", "owner", "dist-tag"], "publishes to the npm registry")
-            }
-            "pip" | "pip3" | "pipx" | "uv" | "poetry" | "conda" | "twine" | "gem" | "bundle" | "composer" | "cpan" | "cpanm"
-            | "luarocks" | "nix" | "nix-env" | "nix-shell" | "flatpak" | "snap" => {
-                self.cmd_tool(&args, by, &["upload", "publish", "push"], "publishes a package")
-            }
-            "brew" | "apt" | "apt-get" | "dnf" | "yum" | "pacman" | "apk" | "port" | "zypper" | "emerge" | "mas" => {
-                let sub = args.iter().find(|a| !a.is_opt()).and_then(|a| a.lit()).unwrap_or("");
-                if matches!(sub, "list" | "info" | "search" | "deps" | "outdated" | "config" | "doctor" | "show" | "--prefix" | "prefix" | "leaves" | "which" | "cat" | "home" | "desc" | "policy" | "ls") {
+            "cargo" => self.cmd_tool(
+                &args,
+                by,
+                &["publish", "login", "owner", "yank"],
+                "publishes to crates.io",
+            ),
+            "npm" | "pnpm" | "yarn" | "npx" | "bunx" => self.cmd_tool(
+                &args,
+                by,
+                &[
+                    "publish",
+                    "login",
+                    "adduser",
+                    "deprecate",
+                    "unpublish",
+                    "owner",
+                    "dist-tag",
+                ],
+                "publishes to the npm registry",
+            ),
+            "pip" | "pip3" | "pipx" | "uv" | "poetry" | "conda" | "twine" | "gem" | "bundle"
+            | "composer" | "cpan" | "cpanm" | "luarocks" | "nix" | "nix-env" | "nix-shell"
+            | "flatpak" | "snap" => self.cmd_tool(
+                &args,
+                by,
+                &["upload", "publish", "push"],
+                "publishes a package",
+            ),
+            "brew" | "apt" | "apt-get" | "dnf" | "yum" | "pacman" | "apk" | "port" | "zypper"
+            | "emerge" | "mas" => {
+                let sub = args
+                    .iter()
+                    .find(|a| !a.is_opt())
+                    .and_then(|a| a.lit())
+                    .unwrap_or("");
+                if matches!(
+                    sub,
+                    "list"
+                        | "info"
+                        | "search"
+                        | "deps"
+                        | "outdated"
+                        | "config"
+                        | "doctor"
+                        | "show"
+                        | "--prefix"
+                        | "prefix"
+                        | "leaves"
+                        | "which"
+                        | "cat"
+                        | "home"
+                        | "desc"
+                        | "policy"
+                        | "ls"
+                ) {
                     return;
                 }
                 self.unknown(by, "installs or removes software system-wide");
             }
             "docker" | "podman" | "nerdctl" | "docker-compose" => {
-                let sub = args.iter().find(|a| !a.is_opt()).and_then(|a| a.lit()).unwrap_or("");
+                let sub = args
+                    .iter()
+                    .find(|a| !a.is_opt())
+                    .and_then(|a| a.lit())
+                    .unwrap_or("");
                 if matches!(sub, "push" | "login" | "logout" | "manifest" | "buildx") {
-                    self.effects.push(Effect::Publish { by: by.to_string(), what: "pushes container images".into() });
-                } else if matches!(sub, "ps" | "images" | "logs" | "inspect" | "version" | "info" | "stats" | "top" | "port" | "diff" | "history" | "events" | "context") {
+                    self.effects.push(Effect::Publish {
+                        by: by.to_string(),
+                        what: "pushes container images".into(),
+                    });
+                } else if matches!(
+                    sub,
+                    "ps" | "images"
+                        | "logs"
+                        | "inspect"
+                        | "version"
+                        | "info"
+                        | "stats"
+                        | "top"
+                        | "port"
+                        | "diff"
+                        | "history"
+                        | "events"
+                        | "context"
+                ) {
                     self.effects.push(Effect::Network { by: by.to_string() });
                 } else {
-                    self.unknown(by, "drives a container engine, whose effects autofork cannot see");
+                    self.unknown(
+                        by,
+                        "drives a container engine, whose effects autofork cannot see",
+                    );
                 }
             }
-            "kubectl" | "oc" | "helm" | "terraform" | "tofu" | "pulumi" | "ansible" | "ansible-playbook" | "gcloud" | "aws"
-            | "az" | "flyctl" | "fly" | "vercel" | "netlify" | "heroku" | "railway" | "wrangler" | "serverless" | "sls"
-            | "cdk" | "sam" | "eb" | "doctl" | "linode-cli" | "hcloud" | "scw" | "argocd" | "flux" | "istioctl" | "velero"
-            | "k9s" | "stern" => {
-                let sub = args.iter().find(|a| !a.is_opt()).and_then(|a| a.lit()).unwrap_or("");
+            "kubectl" | "oc" | "helm" | "terraform" | "tofu" | "pulumi" | "ansible"
+            | "ansible-playbook" | "gcloud" | "aws" | "az" | "flyctl" | "fly" | "vercel"
+            | "netlify" | "heroku" | "railway" | "wrangler" | "serverless" | "sls" | "cdk"
+            | "sam" | "eb" | "doctl" | "linode-cli" | "hcloud" | "scw" | "argocd" | "flux"
+            | "istioctl" | "velero" | "k9s" | "stern" => {
+                let sub = args
+                    .iter()
+                    .find(|a| !a.is_opt())
+                    .and_then(|a| a.lit())
+                    .unwrap_or("");
                 let reads = matches!(
                     sub,
-                    "get" | "describe" | "logs" | "top" | "explain" | "version" | "config" | "list" | "ls" | "status" | "show"
-                        | "plan" | "validate" | "fmt" | "output" | "state" | "history" | "search" | "info" | "whoami" | "auth"
-                        | "cluster-info" | "api-resources" | "api-versions" | "diff" | "lint" | "template" | "env" | "repo"
-                        | "inspect" | "preview" | "console" | "help" | "completion"
+                    "get"
+                        | "describe"
+                        | "logs"
+                        | "top"
+                        | "explain"
+                        | "version"
+                        | "config"
+                        | "list"
+                        | "ls"
+                        | "status"
+                        | "show"
+                        | "plan"
+                        | "validate"
+                        | "fmt"
+                        | "output"
+                        | "state"
+                        | "history"
+                        | "search"
+                        | "info"
+                        | "whoami"
+                        | "auth"
+                        | "cluster-info"
+                        | "api-resources"
+                        | "api-versions"
+                        | "diff"
+                        | "lint"
+                        | "template"
+                        | "env"
+                        | "repo"
+                        | "inspect"
+                        | "preview"
+                        | "console"
+                        | "help"
+                        | "completion"
                 ) || sub.starts_with("describe");
                 if reads {
                     self.effects.push(Effect::Network { by: by.to_string() });
                 } else {
-                    self.effects.push(Effect::Publish { by: by.to_string(), what: "changes remote infrastructure".into() });
+                    self.effects.push(Effect::Publish {
+                        by: by.to_string(),
+                        what: "changes remote infrastructure".into(),
+                    });
                 }
             }
 
@@ -742,7 +942,16 @@ impl Walker {
                 }
             }
             "cp" | "install" => {
-                let takes = &["-t", "--target-directory", "-m", "-o", "-g", "-S", "--suffix", "--backup"][..];
+                let takes = &[
+                    "-t",
+                    "--target-directory",
+                    "-m",
+                    "-o",
+                    "-g",
+                    "-S",
+                    "--suffix",
+                    "--backup",
+                ][..];
                 let rest = skip_opts_with(&args, takes);
                 if let Some(t) = opt_value(&args, &["-t", "--target-directory"]) {
                     self.write(&t, by);
@@ -758,11 +967,17 @@ impl Walker {
                 }
             }
             "mv" => {
-                let rest = skip_opts_with(&args, &["-t", "--target-directory", "-S", "--suffix", "--backup"]);
+                let rest = skip_opts_with(
+                    &args,
+                    &["-t", "--target-directory", "-S", "--suffix", "--backup"],
+                );
                 let target = opt_value(&args, &["-t", "--target-directory"]);
                 let (sources, dest): (Vec<Val>, Option<Val>) = match target {
                     Some(t) => (rest.clone(), Some(t)),
-                    None if rest.len() >= 2 => (rest[..rest.len() - 1].to_vec(), Some(rest[rest.len() - 1].clone())),
+                    None if rest.len() >= 2 => (
+                        rest[..rest.len() - 1].to_vec(),
+                        Some(rest[rest.len() - 1].clone()),
+                    ),
                     None => (rest.clone(), None),
                 };
                 for s in sources {
@@ -774,7 +989,10 @@ impl Walker {
                 }
             }
             "ln" => {
-                let rest = skip_opts_with(&args, &["-t", "--target-directory", "-S", "--suffix", "--backup"]);
+                let rest = skip_opts_with(
+                    &args,
+                    &["-t", "--target-directory", "-S", "--suffix", "--backup"],
+                );
                 if let Some(t) = opt_value(&args, &["-t", "--target-directory"]) {
                     self.write(&t, by);
                 } else if rest.len() >= 2 {
@@ -785,16 +1003,49 @@ impl Walker {
                 }
             }
             "rsync" => {
-                let rest = skip_opts_with(&args, &["-e", "--rsh", "--exclude", "--include", "--exclude-from", "--include-from", "--files-from", "--filter", "--log-file", "--password-file", "--bwlimit", "--timeout", "--port", "--chmod", "--chown", "--backup-dir", "--suffix", "--temp-dir", "--partial-dir", "--compare-dest", "--copy-dest", "--link-dest", "--max-size", "--min-size", "--out-format", "--rsync-path"]);
-                let remote = rest.iter().any(|a| a.lit().is_some_and(|s| is_remote_spec(s)));
+                let rest = skip_opts_with(
+                    &args,
+                    &[
+                        "-e",
+                        "--rsh",
+                        "--exclude",
+                        "--include",
+                        "--exclude-from",
+                        "--include-from",
+                        "--files-from",
+                        "--filter",
+                        "--log-file",
+                        "--password-file",
+                        "--bwlimit",
+                        "--timeout",
+                        "--port",
+                        "--chmod",
+                        "--chown",
+                        "--backup-dir",
+                        "--suffix",
+                        "--temp-dir",
+                        "--partial-dir",
+                        "--compare-dest",
+                        "--copy-dest",
+                        "--link-dest",
+                        "--max-size",
+                        "--min-size",
+                        "--out-format",
+                        "--rsync-path",
+                    ],
+                );
+                let remote = rest.iter().any(|a| a.lit().is_some_and(is_remote_spec));
                 if remote {
                     self.effects.push(Effect::Network { by: by.to_string() });
                 }
-                if args.iter().any(|a| a.is("-n") || a.is("--dry-run") || a.is("--list-only")) {
+                if args
+                    .iter()
+                    .any(|a| a.is("-n") || a.is("--dry-run") || a.is("--list-only"))
+                {
                     return;
                 }
                 if let Some(dest) = rest.last() {
-                    if !dest.lit().is_some_and(|s| is_remote_spec(s)) {
+                    if !dest.lit().is_some_and(is_remote_spec) {
                         let dest = dest.clone();
                         self.write(&dest, by);
                     }
@@ -802,20 +1053,23 @@ impl Walker {
                     self.unknown(by, "has no destination autofork can see");
                 }
             }
-            "scp" | "sftp" | "ssh" | "ssh-copy-id" | "telnet" | "nc" | "ncat" | "netcat" | "socat" | "ftp" | "lftp" | "mosh"
-            | "rlogin" | "rsh" | "et" | "autossh" => {
+            "scp" | "sftp" | "ssh" | "ssh-copy-id" | "telnet" | "nc" | "ncat" | "netcat"
+            | "socat" | "ftp" | "lftp" | "mosh" | "rlogin" | "rsh" | "et" | "autossh" => {
                 self.effects.push(Effect::Network { by: by.to_string() });
                 if base == "scp" {
-                    let rest = skip_opts_with(&args, &["-i", "-P", "-o", "-F", "-S", "-c", "-l", "-J"]);
+                    let rest =
+                        skip_opts_with(&args, &["-i", "-P", "-o", "-F", "-S", "-c", "-l", "-J"]);
                     if let Some(dest) = rest.last() {
-                        if !dest.lit().is_some_and(|s| is_remote_spec(s)) {
+                        if !dest.lit().is_some_and(is_remote_spec) {
                             let dest = dest.clone();
                             self.write(&dest, by);
                         }
                     }
                 }
             }
-            "curl" | "wget" | "wget2" | "http" | "https" | "httpie" | "xh" | "aria2c" | "axel" => self.cmd_http(&base, &args, by),
+            "curl" | "wget" | "wget2" | "http" | "https" | "httpie" | "xh" | "aria2c" | "axel" => {
+                self.cmd_http(&base, &args, by)
+            }
             "rm" | "rmdir" | "unlink" | "shred" | "srm" | "trash" => {
                 let targets: Vec<Val> = non_opts(&args).into_iter().cloned().collect();
                 if targets.is_empty() {
@@ -880,7 +1134,10 @@ impl Walker {
                 }
             }
             "unzip" => {
-                if args.iter().any(|a| a.is("-l") || a.is("-t") || a.is("-z") || a.is("-p") || a.is("-c")) {
+                if args
+                    .iter()
+                    .any(|a| a.is("-l") || a.is("-t") || a.is("-z") || a.is("-p") || a.is("-c"))
+                {
                     return;
                 }
                 match opt_value(&args, &["-d"]) {
@@ -888,9 +1145,18 @@ impl Walker {
                     None => self.write_cwd(by),
                 }
             }
-            "gzip" | "gunzip" | "bzip2" | "bunzip2" | "xz" | "unxz" | "zstd" | "unzstd" | "lz4" | "brotli" | "compress"
-            | "uncompress" | "zcat" | "bzcat" | "xzcat" | "zstdcat" => {
-                if base.ends_with("cat") || args.iter().any(|a| a.is("-c") || a.is("--stdout") || a.is("-t") || a.is("--test") || a.is("-l") || a.is("--list")) {
+            "gzip" | "gunzip" | "bzip2" | "bunzip2" | "xz" | "unxz" | "zstd" | "unzstd" | "lz4"
+            | "brotli" | "compress" | "uncompress" | "zcat" | "bzcat" | "xzcat" | "zstdcat" => {
+                if base.ends_with("cat")
+                    || args.iter().any(|a| {
+                        a.is("-c")
+                            || a.is("--stdout")
+                            || a.is("-t")
+                            || a.is("--test")
+                            || a.is("-l")
+                            || a.is("--list")
+                    })
+                {
                     return;
                 }
                 let targets: Vec<Val> = non_opts(&args).into_iter().cloned().collect();
@@ -902,7 +1168,10 @@ impl Walker {
                     match self.path(&t) {
                         PVal::Known(p) => {
                             let parent = p.parent().map(|x| x.to_path_buf()).unwrap_or(p);
-                            self.effects.push(Effect::Write { path: parent, by: by.to_string() });
+                            self.effects.push(Effect::Write {
+                                path: parent,
+                                by: by.to_string(),
+                            });
                         }
                         PVal::Unknown => self.unknown(by, "targets a path autofork cannot resolve"),
                     }
@@ -913,22 +1182,34 @@ impl Walker {
                 None => self.write_cwd(by),
             },
             "defaults" => {
-                let sub = args.iter().find(|a| !a.is_opt()).and_then(|a| a.lit()).unwrap_or("");
+                let sub = args
+                    .iter()
+                    .find(|a| !a.is_opt())
+                    .and_then(|a| a.lit())
+                    .unwrap_or("");
                 if matches!(sub, "read" | "read-type" | "domains" | "find" | "export") {
                     return;
                 }
                 self.unknown(by, "changes macOS preferences");
             }
             "pbcopy" | "say" | "afplay" | "tput" | "clear" | "reset" => {}
-            "kill" | "pkill" | "killall" | "launchctl" | "systemctl" | "service" | "reboot" | "shutdown" | "halt"
-            | "poweroff" | "diskutil" | "mount" | "umount" | "nvram" | "dscl" | "pmset" | "networksetup" | "scutil"
-            | "tmutil" | "softwareupdate" | "csrutil" | "fdesetup" | "profiles" | "sysadminctl" | "dseditgroup"
-            | "iptables" | "nft" | "ufw" | "pfctl" | "swapoff" | "swapon" | "modprobe" | "insmod"
-            | "rmmod" => {
+            "kill" | "pkill" | "killall" | "launchctl" | "systemctl" | "service" | "reboot"
+            | "shutdown" | "halt" | "poweroff" | "diskutil" | "mount" | "umount" | "nvram"
+            | "dscl" | "pmset" | "networksetup" | "scutil" | "tmutil" | "softwareupdate"
+            | "csrutil" | "fdesetup" | "profiles" | "sysadminctl" | "dseditgroup" | "iptables"
+            | "nft" | "ufw" | "pfctl" | "swapoff" | "swapon" | "modprobe" | "insmod" | "rmmod" => {
                 if base == "launchctl" && args.iter().any(|a| a.is("list") || a.is("print")) {
                     return;
                 }
-                if base == "systemctl" && args.iter().any(|a| a.is("status") || a.is("list-units") || a.is("show") || a.is("is-active") || a.is("cat")) {
+                if base == "systemctl"
+                    && args.iter().any(|a| {
+                        a.is("status")
+                            || a.is("list-units")
+                            || a.is("show")
+                            || a.is("is-active")
+                            || a.is("cat")
+                    })
+                {
                     return;
                 }
                 if base == "diskutil" && args.iter().any(|a| a.is("list") || a.is("info")) {
@@ -943,10 +1224,17 @@ impl Walker {
                 self.effects.push(Effect::Disrupt { by: by.to_string() });
             }
             "mail" | "mailx" | "sendmail" | "mutt" | "neomutt" | "msmtp" | "swaks" => {
-                self.effects.push(Effect::Publish { by: by.to_string(), what: "sends mail".into() });
+                self.effects.push(Effect::Publish {
+                    by: by.to_string(),
+                    what: "sends mail".into(),
+                });
             }
-            "slack" | "discord" | "tweet" | "toot" | "ntfy" | "pushover" | "telegram-send" | "signal-cli" => {
-                self.effects.push(Effect::Publish { by: by.to_string(), what: "posts a message".into() });
+            "slack" | "discord" | "tweet" | "toot" | "ntfy" | "pushover" | "telegram-send"
+            | "signal-cli" => {
+                self.effects.push(Effect::Publish {
+                    by: by.to_string(),
+                    what: "posts a message".into(),
+                });
             }
 
             // -- by path -----------------------------------------------------
@@ -956,7 +1244,10 @@ impl Walker {
                     match self.path(&v) {
                         PVal::Known(p) => {
                             let trusted = self.is_trusted(&p);
-                            self.effects.push(Effect::Exec { path: p.clone(), by: by.to_string() });
+                            self.effects.push(Effect::Exec {
+                                path: p.clone(),
+                                by: by.to_string(),
+                            });
                             if !trusted {
                                 // Learn what we can from its content: a
                                 // literal `rm -rf` inside gets a proper
@@ -964,13 +1255,48 @@ impl Walker {
                                 self.analyse_script(&v, by, true);
                             }
                         }
-                        PVal::Unknown => self.unknown(by, "runs a program at a path autofork cannot resolve"),
+                        PVal::Unknown => {
+                            self.unknown(by, "runs a program at a path autofork cannot resolve")
+                        }
                     }
                 } else {
                     self.unknown(by, "is not a command autofork knows");
                 }
             }
         }
+    }
+
+    fn denied_by(&self, base: &str, name: &str, args: &[Val]) -> Option<String> {
+        for pat in &self.deny {
+            let head = &pat[0];
+            if !(glob_token(head, base) || glob_token(head, name)) {
+                continue;
+            }
+            let rest = &pat[1..];
+            let mut ok = true;
+            for (i, tok) in rest.iter().enumerate() {
+                if tok == "*" && i == rest.len() - 1 {
+                    break; // trailing `*`: whatever follows
+                }
+                match args.get(i) {
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                    Some(Val::Unknown) => {}
+                    Some(Val::Lit(a)) => {
+                        if !glob_token(tok, a) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if ok {
+                return Some(pat.join(" "));
+            }
+        }
+        None
     }
 
     // -- individual commands -----------------------------------------------
@@ -1018,7 +1344,12 @@ impl Walker {
         while i < args.len() {
             let a = &args[i];
             match a.lit() {
-                Some("-i") | Some("--ignore-environment") | Some("-0") | Some("--null") | Some("-v") | Some("--debug") => i += 1,
+                Some("-i")
+                | Some("--ignore-environment")
+                | Some("-0")
+                | Some("--null")
+                | Some("-v")
+                | Some("--debug") => i += 1,
                 Some("-u") | Some("--unset") | Some("-S") | Some("--split-string") => i += 2,
                 Some("-C") | Some("--chdir") => {
                     chdir = args.get(i + 1).cloned();
@@ -1115,7 +1446,10 @@ impl Walker {
             }
         };
         if self.is_trusted(&p) {
-            self.effects.push(Effect::Exec { path: p, by: by.to_string() });
+            self.effects.push(Effect::Exec {
+                path: p,
+                by: by.to_string(),
+            });
             return;
         }
         let meta = match std::fs::metadata(&p) {
@@ -1136,11 +1470,23 @@ impl Walker {
         if let Some(first) = content.lines().next() {
             if let Some(interp) = first.strip_prefix("#!") {
                 let interp = interp.trim();
-                let base = interp.split_whitespace().last().unwrap_or("").rsplit('/').next().unwrap_or("");
+                let base = interp
+                    .split_whitespace()
+                    .last()
+                    .unwrap_or("")
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("");
                 let is_shell = matches!(base, "sh" | "bash" | "zsh" | "dash" | "ksh")
-                    || (interp.contains("env") && interp.split_whitespace().any(|w| matches!(w, "sh" | "bash" | "zsh" | "dash" | "ksh")));
+                    || (interp.contains("env")
+                        && interp
+                            .split_whitespace()
+                            .any(|w| matches!(w, "sh" | "bash" | "zsh" | "dash" | "ksh")));
                 if !is_shell {
-                    self.unknown(by, &format!("runs a {base} script autofork cannot see inside"));
+                    self.unknown(
+                        by,
+                        &format!("runs a {base} script autofork cannot see inside"),
+                    );
                     return;
                 }
             }
@@ -1166,7 +1512,12 @@ impl Walker {
                 }
                 Some("-I") | Some("--replace") | Some("-i") => {
                     replace = args.get(i + 1).and_then(|v| v.lit()).map(|s| s.to_string());
-                    if a.is("-i") && replace.as_deref().map(|s| s.starts_with('-')).unwrap_or(true) {
+                    if a.is("-i")
+                        && replace
+                            .as_deref()
+                            .map(|s| s.starts_with('-'))
+                            .unwrap_or(true)
+                    {
                         replace = Some("{}".into());
                         i += 1;
                     } else {
@@ -1177,9 +1528,21 @@ impl Walker {
                     replace = Some(s[2..].to_string());
                     i += 1;
                 }
-                Some("-n") | Some("-P") | Some("-L") | Some("-s") | Some("-d") | Some("-a") | Some("-E") | Some("--max-args")
-                | Some("--max-procs") | Some("--max-lines") | Some("--max-chars") | Some("--delimiter") | Some("--arg-file")
-                | Some("--eof") | Some("--process-slot-var") => i += 2,
+                Some("-n")
+                | Some("-P")
+                | Some("-L")
+                | Some("-s")
+                | Some("-d")
+                | Some("-a")
+                | Some("-E")
+                | Some("--max-args")
+                | Some("--max-procs")
+                | Some("--max-lines")
+                | Some("--max-chars")
+                | Some("--delimiter")
+                | Some("--arg-file")
+                | Some("--eof")
+                | Some("--process-slot-var") => i += 2,
                 Some(s) if s.starts_with('-') => i += 1,
                 _ => break,
             }
@@ -1204,13 +1567,20 @@ impl Walker {
     fn cmd_find(&mut self, args: &[Val], by: &str) {
         let mut i = 0;
         // Leading options.
-        while i < args.len() && matches!(args[i].lit(), Some("-H" | "-L" | "-P" | "-E" | "-X" | "-d" | "-s" | "-x")) {
+        while i < args.len()
+            && matches!(
+                args[i].lit(),
+                Some("-H" | "-L" | "-P" | "-E" | "-X" | "-d" | "-s" | "-x")
+            )
+        {
             i += 1;
         }
         let mut paths: Vec<Val> = Vec::new();
         while i < args.len() {
             let a = &args[i];
-            let stop = a.lit().is_some_and(|s| s.starts_with('-') || s == "(" || s == "!" || s == ",");
+            let stop = a
+                .lit()
+                .is_some_and(|s| s.starts_with('-') || s == "(" || s == "!" || s == ",");
             if stop {
                 break;
             }
@@ -1296,7 +1666,14 @@ impl Walker {
                     repo = self.join_repo(&repo, &d);
                     i += 2;
                 }
-                Some("-c") | Some("--git-dir") | Some("--work-tree") | Some("--namespace") | Some("--exec-path") | Some("--super-prefix") | Some("--config-env") | Some("--list-cmds") => {
+                Some("-c")
+                | Some("--git-dir")
+                | Some("--work-tree")
+                | Some("--namespace")
+                | Some("--exec-path")
+                | Some("--super-prefix")
+                | Some("--config-env")
+                | Some("--list-cmds") => {
                     if a.is("--work-tree") {
                         let d = args.get(i + 1).cloned().unwrap_or(Val::Unknown);
                         repo = self.join_repo(&repo, &d);
@@ -1332,22 +1709,34 @@ impl Walker {
         let has = |o: &[&str]| rest.iter().any(|a| a.lit().is_some_and(|s| o.contains(&s)));
 
         let repo_write = |w: &mut Walker| match &repo {
-            PVal::Known(p) => w.effects.push(Effect::Write { path: p.clone(), by: by.to_string() }),
+            PVal::Known(p) => w.effects.push(Effect::Write {
+                path: p.clone(),
+                by: by.to_string(),
+            }),
             PVal::Unknown => w.unknown(by, "changes a repository autofork cannot locate"),
         };
         let repo_remote = |w: &mut Walker, publish: bool| match &repo {
-            PVal::Known(p) => w.effects.push(Effect::GitRemote { repo: p.clone(), by: by.to_string(), publish }),
-            PVal::Unknown => w.unknown(by, "talks to a remote of a repository autofork cannot locate"),
+            PVal::Known(p) => w.effects.push(Effect::GitRemote {
+                repo: p.clone(),
+                by: by.to_string(),
+                publish,
+            }),
+            PVal::Unknown => w.unknown(
+                by,
+                "talks to a remote of a repository autofork cannot locate",
+            ),
         };
 
         match sub.as_str() {
-            "status" | "log" | "diff" | "show" | "rev-parse" | "ls-files" | "ls-tree" | "blame" | "describe" | "cat-file"
-            | "grep" | "shortlog" | "var" | "count-objects" | "name-rev" | "merge-base" | "cherry" | "for-each-ref"
-            | "check-ignore" | "check-attr" | "diff-tree" | "diff-index" | "diff-files" | "help" | "version" | "--version"
-            | "rev-list" | "show-ref" | "whatchanged" | "range-diff" | "show-branch" | "verify-commit" | "verify-tag"
-            | "fsck" | "annotate" | "difftool" | "get-tar-commit-id" | "mailinfo"
-            | "merge-tree" | "patch-id" | "stripspace" | "verify-pack" | "check-ref-format" | "column"
-            | "interpret-trailers" | "web--browse" => {}
+            "status" | "log" | "diff" | "show" | "rev-parse" | "ls-files" | "ls-tree" | "blame"
+            | "describe" | "cat-file" | "grep" | "shortlog" | "var" | "count-objects"
+            | "name-rev" | "merge-base" | "cherry" | "for-each-ref" | "check-ignore"
+            | "check-attr" | "diff-tree" | "diff-index" | "diff-files" | "help" | "version"
+            | "--version" | "rev-list" | "show-ref" | "whatchanged" | "range-diff"
+            | "show-branch" | "verify-commit" | "verify-tag" | "fsck" | "annotate" | "difftool"
+            | "get-tar-commit-id" | "mailinfo" | "merge-tree" | "patch-id" | "stripspace"
+            | "verify-pack" | "check-ref-format" | "column" | "interpret-trailers"
+            | "web--browse" => {}
             "ls-remote" => repo_remote(self, false),
             "push" | "send-email" | "send-pack" => repo_remote(self, true),
             "fetch" | "pull" | "remote-update" => repo_remote(self, false),
@@ -1355,13 +1744,22 @@ impl Walker {
                 let dest = match positional.len() {
                     0 => None,
                     1 => positional[0].lit().map(|url| {
-                        let name = url.trim_end_matches('/').rsplit('/').next().unwrap_or("repo").trim_end_matches(".git");
+                        let name = url
+                            .trim_end_matches('/')
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or("repo")
+                            .trim_end_matches(".git");
                         Val::Lit(name.to_string())
                     }),
                     _ => Some((*positional[positional.len() - 1]).clone()),
                 };
                 match dest.map(|d| self.path(&d)) {
-                    Some(PVal::Known(p)) => self.effects.push(Effect::GitRemote { repo: p, by: by.to_string(), publish: false }),
+                    Some(PVal::Known(p)) => self.effects.push(Effect::GitRemote {
+                        repo: p,
+                        by: by.to_string(),
+                        publish: false,
+                    }),
                     _ => self.unknown(by, "clones into a place autofork cannot resolve"),
                 }
             }
@@ -1382,14 +1780,52 @@ impl Walker {
                 }
             }
             "branch" => {
-                let creates_or_deletes = has(&["-d", "-D", "-m", "-M", "-c", "-C", "--delete", "--move", "--copy", "--set-upstream-to", "-u", "--unset-upstream", "--edit-description", "-f", "--force"]);
-                let lists = has(&["-a", "-r", "-v", "-vv", "--list", "--show-current", "--contains", "--merged", "--no-merged", "--points-at", "-l"]);
+                let creates_or_deletes = has(&[
+                    "-d",
+                    "-D",
+                    "-m",
+                    "-M",
+                    "-c",
+                    "-C",
+                    "--delete",
+                    "--move",
+                    "--copy",
+                    "--set-upstream-to",
+                    "-u",
+                    "--unset-upstream",
+                    "--edit-description",
+                    "-f",
+                    "--force",
+                ]);
+                let lists = has(&[
+                    "-a",
+                    "-r",
+                    "-v",
+                    "-vv",
+                    "--list",
+                    "--show-current",
+                    "--contains",
+                    "--merged",
+                    "--no-merged",
+                    "--points-at",
+                    "-l",
+                ]);
                 if creates_or_deletes || (!positional.is_empty() && !lists) {
                     repo_write(self);
                 }
             }
             "tag" => {
-                let lists = has(&["-l", "--list", "-n", "--contains", "--points-at", "--merged", "--no-merged", "-v", "--verify"]);
+                let lists = has(&[
+                    "-l",
+                    "--list",
+                    "-n",
+                    "--contains",
+                    "--points-at",
+                    "--merged",
+                    "--no-merged",
+                    "-v",
+                    "--verify",
+                ]);
                 if !positional.is_empty() && !lists {
                     repo_write(self);
                 }
@@ -1401,20 +1837,49 @@ impl Walker {
                 }
             }
             "config" => {
-                let reads = has(&["--get", "--get-all", "--get-regexp", "-l", "--list", "--show-origin", "--get-urlmatch", "--get-color", "--get-colorbool", "--show-scope"]);
-                if reads || positional.len() == 1 && !has(&["--unset", "--unset-all", "--add", "--replace-all", "--remove-section", "--rename-section", "-e", "--edit"]) {
+                let reads = has(&[
+                    "--get",
+                    "--get-all",
+                    "--get-regexp",
+                    "-l",
+                    "--list",
+                    "--show-origin",
+                    "--get-urlmatch",
+                    "--get-color",
+                    "--get-colorbool",
+                    "--show-scope",
+                ]);
+                if reads
+                    || positional.len() == 1
+                        && !has(&[
+                            "--unset",
+                            "--unset-all",
+                            "--add",
+                            "--replace-all",
+                            "--remove-section",
+                            "--rename-section",
+                            "-e",
+                            "--edit",
+                        ])
+                {
                     return;
                 }
                 if has(&["--global"]) {
                     match &self.home {
                         Some(h) => {
                             let cfg = h.join(".gitconfig");
-                            self.effects.push(Effect::Write { path: cfg, by: by.to_string() });
+                            self.effects.push(Effect::Write {
+                                path: cfg,
+                                by: by.to_string(),
+                            });
                         }
                         None => self.unknown(by, "changes the global git config"),
                     }
                 } else if has(&["--system"]) {
-                    self.effects.push(Effect::Write { path: PathBuf::from("/etc/gitconfig"), by: by.to_string() });
+                    self.effects.push(Effect::Write {
+                        path: PathBuf::from("/etc/gitconfig"),
+                        by: by.to_string(),
+                    });
                 } else {
                     repo_write(self);
                 }
@@ -1439,9 +1904,23 @@ impl Walker {
                     repo_write(self);
                 }
             }
-            "notes" | "bisect" | "rerere" | "sparse-checkout" | "maintenance" | "lfs" | "replace" | "credential" => {
+            "notes" | "bisect" | "rerere" | "sparse-checkout" | "maintenance" | "lfs"
+            | "replace" | "credential" => {
                 let sub2 = positional.first().and_then(|a| a.lit()).unwrap_or("");
-                if matches!(sub2, "list" | "show" | "log" | "visualize" | "view" | "status" | "diff" | "fill" | "" | "env" | "version") {
+                if matches!(
+                    sub2,
+                    "list"
+                        | "show"
+                        | "log"
+                        | "visualize"
+                        | "view"
+                        | "status"
+                        | "diff"
+                        | "fill"
+                        | ""
+                        | "env"
+                        | "version"
+                ) {
                     return;
                 }
                 repo_write(self);
@@ -1454,7 +1933,9 @@ impl Walker {
             "archive" | "format-patch" | "bundle" => {
                 if let Some(o) = opt_value(&rest, &["-o", "--output", "--output-directory"]) {
                     self.write(&o, by);
-                } else if sub == "format-patch" || (sub == "bundle" && positional.first().is_some_and(|a| a.is("create"))) {
+                } else if sub == "format-patch"
+                    || (sub == "bundle" && positional.first().is_some_and(|a| a.is("create")))
+                {
                     if sub == "bundle" {
                         if let Some(f) = positional.get(1) {
                             let f = (*f).clone();
@@ -1472,12 +1953,17 @@ impl Walker {
                 }
                 None => repo_write(self),
             },
-            "add" | "commit" | "checkout" | "switch" | "restore" | "reset" | "merge" | "rebase" | "rm" | "mv" | "clean"
-            | "apply" | "cherry-pick" | "revert" | "am" | "update-index" | "filter-branch" | "gc" | "prune" | "update-ref"
-            | "mergetool" | "read-tree" | "write-tree" | "commit-tree" | "hash-object" | "pack-refs" | "repack" | "fast-import"
-            | "unpack-objects" | "index-pack" | "prune-packed" | "checkout-index" | "mktag" | "mktree" | "multi-pack-index"
-            | "commit-graph" | "stage" | "citool" | "gui" | "instaweb" => repo_write(self),
-            _ => self.unknown(by, &format!("runs `git {sub}`, which autofork does not know (an alias?)")),
+            "add" | "commit" | "checkout" | "switch" | "restore" | "reset" | "merge" | "rebase"
+            | "rm" | "mv" | "clean" | "apply" | "cherry-pick" | "revert" | "am"
+            | "update-index" | "filter-branch" | "gc" | "prune" | "update-ref" | "mergetool"
+            | "read-tree" | "write-tree" | "commit-tree" | "hash-object" | "pack-refs"
+            | "repack" | "fast-import" | "unpack-objects" | "index-pack" | "prune-packed"
+            | "checkout-index" | "mktag" | "mktree" | "multi-pack-index" | "commit-graph"
+            | "stage" | "citool" | "gui" | "instaweb" => repo_write(self),
+            _ => self.unknown(
+                by,
+                &format!("runs `git {sub}`, which autofork does not know (an alias?)"),
+            ),
         }
     }
 
@@ -1493,43 +1979,107 @@ impl Walker {
     }
 
     fn cmd_forge(&mut self, args: &[Val], by: &str) {
-        let words: Vec<&str> = args.iter().filter(|a| !a.is_opt()).filter_map(|a| a.lit()).collect();
+        let words: Vec<&str> = args
+            .iter()
+            .filter(|a| !a.is_opt())
+            .filter_map(|a| a.lit())
+            .collect();
         let first = words.first().copied().unwrap_or("");
         let second = words.get(1).copied().unwrap_or("");
-        let read_words = ["view", "list", "ls", "status", "diff", "checks", "download", "search", "browse", "config", "help", "version", "completion", "whoami", "logs"];
-        let reads = matches!(first, "help" | "version" | "search" | "browse" | "completion" | "status")
-            || (first == "auth" && matches!(second, "status" | "token"))
+        let read_words = [
+            "view",
+            "list",
+            "ls",
+            "status",
+            "diff",
+            "checks",
+            "download",
+            "search",
+            "browse",
+            "config",
+            "help",
+            "version",
+            "completion",
+            "whoami",
+            "logs",
+        ];
+        let reads = matches!(
+            first,
+            "help" | "version" | "search" | "browse" | "completion" | "status"
+        ) || (first == "auth" && matches!(second, "status" | "token"))
             || read_words.contains(&second)
-            || (first == "api" && !args.iter().any(|a| {
-                a.lit().is_some_and(|s| {
-                    matches!(s, "-X" | "--method" | "-f" | "-F" | "--field" | "--raw-field" | "--input")
-                        || s.starts_with("--method=")
-                        || s.starts_with("-X")
-                        || s.starts_with("-f")
-                        || s.starts_with("-F")
-                })
-            }))
+            || (first == "api"
+                && !args.iter().any(|a| {
+                    a.lit().is_some_and(|s| {
+                        matches!(
+                            s,
+                            "-X" | "--method" | "-f" | "-F" | "--field" | "--raw-field" | "--input"
+                        ) || s.starts_with("--method=")
+                            || s.starts_with("-X")
+                            || s.starts_with("-f")
+                            || s.starts_with("-F")
+                    })
+                }))
             || (first == "run" && matches!(second, "view" | "list" | "watch" | "download"))
             || (first == "repo" && matches!(second, "view" | "list" | "clone"));
         if reads {
             self.effects.push(Effect::Network { by: by.to_string() });
         } else {
-            self.effects.push(Effect::Publish { by: by.to_string(), what: "acts on the forge (comment, PR, issue, review, release, …)".into() });
+            self.effects.push(Effect::Publish {
+                by: by.to_string(),
+                what: "acts on the forge (comment, PR, issue, review, release, …)".into(),
+            });
         }
     }
 
     fn cmd_tool(&mut self, args: &[Val], by: &str, publish_subs: &[&str], what: &str) {
-        let sub = args.iter().find(|a| !a.is_opt()).and_then(|a| a.lit()).unwrap_or("");
+        let sub = args
+            .iter()
+            .find(|a| !a.is_opt())
+            .and_then(|a| a.lit())
+            .unwrap_or("");
         if publish_subs.contains(&sub) {
-            self.effects.push(Effect::Publish { by: by.to_string(), what: what.into() });
-        } else if matches!(sub, "--version" | "-V" | "version" | "help" | "--help" | "metadata" | "tree" | "search" | "info" | "view" | "show" | "ls" | "list" | "outdated" | "audit" | "why" | "explain" | "locate-project" | "pkgid" | "config" | "env" ) {
+            self.effects.push(Effect::Publish {
+                by: by.to_string(),
+                what: what.into(),
+            });
+        } else if matches!(
+            sub,
+            "--version"
+                | "-V"
+                | "version"
+                | "help"
+                | "--help"
+                | "metadata"
+                | "tree"
+                | "search"
+                | "info"
+                | "view"
+                | "show"
+                | "ls"
+                | "list"
+                | "outdated"
+                | "audit"
+                | "why"
+                | "explain"
+                | "locate-project"
+                | "pkgid"
+                | "config"
+                | "env"
+        ) {
             // Some of these use the network (search, info, audit) but
             // change nothing.
-            if matches!(sub, "search" | "info" | "view" | "show" | "audit" | "outdated") {
+            if matches!(
+                sub,
+                "search" | "info" | "view" | "show" | "audit" | "outdated"
+            ) {
                 self.effects.push(Effect::Network { by: by.to_string() });
             }
         } else {
-            self.unknown(by, "runs a build or package tool whose effects autofork cannot see");
+            self.unknown(
+                by,
+                "runs a build or package tool whose effects autofork cannot see",
+            );
         }
     }
 
@@ -1537,19 +2087,56 @@ impl Walker {
         self.effects.push(Effect::Network { by: by.to_string() });
         match base {
             "curl" => {
-                if let Some(o) = opt_value(args, &["-o", "--output", "-D", "--dump-header", "--trace", "--trace-ascii", "-c", "--cookie-jar", "--output-dir", "--etag-save"]) {
+                if let Some(o) = opt_value(
+                    args,
+                    &[
+                        "-o",
+                        "--output",
+                        "-D",
+                        "--dump-header",
+                        "--trace",
+                        "--trace-ascii",
+                        "-c",
+                        "--cookie-jar",
+                        "--output-dir",
+                        "--etag-save",
+                    ],
+                ) {
                     self.write(&o, by);
                 }
-                if args.iter().any(|a| a.is("-O") || a.is("--remote-name") || a.is("--remote-name-all") || a.is("-J") || a.lit().is_some_and(|s| s.starts_with('-') && !s.starts_with("--") && s.len() > 1 && s[1..].contains('O'))) {
+                if args.iter().any(|a| {
+                    a.is("-O")
+                        || a.is("--remote-name")
+                        || a.is("--remote-name-all")
+                        || a.is("-J")
+                        || a.lit().is_some_and(|s| {
+                            s.starts_with('-')
+                                && !s.starts_with("--")
+                                && s.len() > 1
+                                && s[1..].contains('O')
+                        })
+                }) {
                     self.write_cwd(by);
                 }
             }
             "wget" | "wget2" => {
-                if let Some(o) = opt_value(args, &["-O", "--output-document", "-P", "--directory-prefix", "-o", "--output-file", "-a", "--append-output"]) {
+                if let Some(o) = opt_value(
+                    args,
+                    &[
+                        "-O",
+                        "--output-document",
+                        "-P",
+                        "--directory-prefix",
+                        "-o",
+                        "--output-file",
+                        "-a",
+                        "--append-output",
+                    ],
+                ) {
                     if !o.is("-") {
                         self.write(&o, by);
                     }
-                } else if !args.iter().any(|a| a.is("--spider") || a.is("-q") && false) {
+                } else if !args.iter().any(|a| a.is("--spider")) {
                     self.write_cwd(by);
                 }
             }
@@ -1572,15 +2159,35 @@ impl Walker {
     fn cmd_sed(&mut self, args: &[Val], by: &str) {
         let in_place = args.iter().any(|a| {
             a.lit().is_some_and(|s| {
-                s == "-i" || s.starts_with("-i") && !s.starts_with("--") || s == "--in-place" || s.starts_with("--in-place=")
-                    || (s.starts_with('-') && !s.starts_with("--") && s.len() > 1 && s[1..].contains('i') && !s[1..].contains('n') || (s.starts_with('-') && !s.starts_with("--") && s[1..].chars().all(|c| "nrEisuz".contains(c)) && s.contains('i')))
+                s == "-i"
+                    || s.starts_with("-i") && !s.starts_with("--")
+                    || s == "--in-place"
+                    || s.starts_with("--in-place=")
+                    || (s.starts_with('-')
+                        && !s.starts_with("--")
+                        && s.len() > 1
+                        && s[1..].contains('i')
+                        && !s[1..].contains('n')
+                        || (s.starts_with('-')
+                            && !s.starts_with("--")
+                            && s[1..].chars().all(|c| "nrEisuz".contains(c))
+                            && s.contains('i')))
             })
         });
         if !in_place {
             return;
         }
-        let has_script_opt = args.iter().any(|a| a.is("-e") || a.is("-f") || a.starts_with("--expression") || a.starts_with("--file") || a.lit().is_some_and(|s| s.starts_with("-e") && s.len() > 2));
-        let mut files = skip_opts_with(args, &["-e", "-f", "--expression", "--file", "-l", "--line-length"]);
+        let has_script_opt = args.iter().any(|a| {
+            a.is("-e")
+                || a.is("-f")
+                || a.starts_with("--expression")
+                || a.starts_with("--file")
+                || a.lit().is_some_and(|s| s.starts_with("-e") && s.len() > 2)
+        });
+        let mut files = skip_opts_with(
+            args,
+            &["-e", "-f", "--expression", "--file", "-l", "--line-length"],
+        );
         files.retain(|f| !f.is("")); // BSD `-i ''`
         if !has_script_opt && !files.is_empty() {
             files.remove(0); // the script
@@ -1615,10 +2222,13 @@ impl Walker {
                     i += 2;
                     continue;
                 }
-                Some(s) if s.starts_with("--file=") => file = Some(Val::Lit(s["--file=".len()..].to_string())),
+                Some(s) if s.starts_with("--file=") => {
+                    file = Some(Val::Lit(s["--file=".len()..].to_string()))
+                }
                 Some("-x") | Some("--extract") | Some("--get") => mode = 'x',
                 Some("-c") | Some("--create") => mode = 'c',
-                Some("-r") | Some("--append") | Some("-u") | Some("--update") | Some("--delete") => mode = 'r',
+                Some("-r") | Some("--append") | Some("-u") | Some("--update")
+                | Some("--delete") => mode = 'r',
                 Some("-t") | Some("--list") => mode = 't',
                 Some(s) if i == 0 && !s.starts_with("--") => {
                     // old-style or clustered: `xzf`, `-xzf`
@@ -1682,16 +2292,25 @@ impl Walker {
     }
 
     fn cmd_sqlite(&mut self, args: &[Val], by: &str) {
-        let rest = skip_opts_with(args, &["-init", "-cmd", "-separator", "-newline", "-nullvalue", "-vfs", "-A", "-batch_"]);
+        let rest = skip_opts_with(
+            args,
+            &[
+                "-init",
+                "-cmd",
+                "-separator",
+                "-newline",
+                "-nullvalue",
+                "-vfs",
+                "-A",
+                "-batch_",
+            ],
+        );
         if args.iter().any(|a| a.is("-readonly")) {
             return;
         }
-        match rest.first() {
-            Some(db) => {
-                let db = db.clone();
-                self.write(&db, by);
-            }
-            None => {}
+        if let Some(db) = rest.first() {
+            let db = db.clone();
+            self.write(&db, by);
         }
     }
 }
@@ -1708,9 +2327,27 @@ fn excerpt(s: &str) -> String {
     }
 }
 
+/// `*`-wildcard match of one pattern token against one word.
+fn glob_token(pat: &str, word: &str) -> bool {
+    fn rec(p: &[char], w: &[char]) -> bool {
+        match p.split_first() {
+            None => w.is_empty(),
+            Some(('*', rest)) => (0..=w.len()).any(|i| rec(rest, &w[i..])),
+            Some((c, rest)) => w.first() == Some(c) && rec(rest, &w[1..]),
+        }
+    }
+    let p: Vec<char> = pat.chars().collect();
+    let w: Vec<char> = word.chars().collect();
+    rec(&p, &w)
+}
+
 fn is_assignment(s: &str) -> bool {
-    let Some((name, _)) = s.split_once('=') else { return false };
-    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && !name.starts_with(|c: char| c.is_ascii_digit())
+    let Some((name, _)) = s.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !name.starts_with(|c: char| c.is_ascii_digit())
 }
 
 fn is_remote_spec(s: &str) -> bool {
@@ -1726,7 +2363,16 @@ fn is_remote_spec(s: &str) -> bool {
 
 fn is_device(p: &Path) -> bool {
     let s = p.to_string_lossy();
-    s == "/dev/null" || s == "/dev/stdout" || s == "/dev/stderr" || s == "/dev/stdin" || s.starts_with("/dev/tty") || s.starts_with("/dev/fd/") || s.starts_with("/dev/pts/") || s == "/dev/zero" || s == "/dev/random" || s == "/dev/urandom"
+    s == "/dev/null"
+        || s == "/dev/stdout"
+        || s == "/dev/stderr"
+        || s == "/dev/stdin"
+        || s.starts_with("/dev/tty")
+        || s.starts_with("/dev/fd/")
+        || s.starts_with("/dev/pts/")
+        || s == "/dev/zero"
+        || s == "/dev/random"
+        || s == "/dev/urandom"
 }
 
 /// Arguments minus options. `takes` lists options that consume the next
@@ -1745,13 +2391,7 @@ fn skip_opts_with(args: &[Val], takes: &[&str]) -> Vec<Val> {
             }
             if let Some(s) = a.lit() {
                 if s.starts_with('-') && s != "-" {
-                    if takes.contains(&s) {
-                        i += 2;
-                    } else if s.starts_with("--") && s.contains('=') {
-                        i += 1;
-                    } else {
-                        i += 1;
-                    }
+                    i += if takes.contains(&s) { 2 } else { 1 };
                     continue;
                 }
             }
@@ -1880,7 +2520,45 @@ mod tests {
     use super::*;
 
     fn run(cmd: &str) -> Vec<Effect> {
-        analyse(cmd, Path::new("/work/proj"), &[]).effects
+        analyse(cmd, Path::new("/work/proj"), &[], &[]).effects
+    }
+
+    #[test]
+    fn deny_patterns() {
+        let deny = |cmd: &str, pats: &[&str]| -> Vec<String> {
+            let pats: Vec<String> = pats.iter().map(|s| s.to_string()).collect();
+            analyse(cmd, Path::new("/work"), &[], &pats)
+                .effects
+                .into_iter()
+                .filter_map(|e| match e {
+                    Effect::Denied { pattern, .. } => Some(pattern),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(deny("ssh host", &["ssh"]), vec!["ssh"]);
+        assert_eq!(deny("/usr/bin/ssh host", &["ssh"]), vec!["ssh"]);
+        assert_eq!(deny("nohup ssh host", &["ssh"]), vec!["ssh"]);
+        assert_eq!(deny("bash -c 'ssh host'", &["ssh"]), vec!["ssh"]);
+        assert_eq!(deny("find . -exec ssh {} \\;", &["ssh"]), vec!["ssh"]);
+        assert_eq!(deny("git push origin x", &["git push*"]), vec!["git push*"]);
+        assert_eq!(deny("git push", &["git push*"]), vec!["git push*"]);
+        assert_eq!(deny("git pull", &["git push*"]), Vec::<String>::new());
+        assert_eq!(deny("git $SUB", &["git push*"]), vec!["git push*"]); // unknown arg = match
+        assert_eq!(deny("rm -rf /", &["rm -rf *"]), vec!["rm -rf *"]);
+        assert_eq!(deny("rm -rf", &["rm -rf *"]), vec!["rm -rf *"]);
+        assert_eq!(deny("rm -r x", &["rm -rf *"]), Vec::<String>::new());
+        assert_eq!(
+            deny("gh pr comment 1", &["gh pr comment"]),
+            vec!["gh pr comment"]
+        );
+        assert_eq!(
+            deny("gh pr view 1", &["gh pr comment"]),
+            Vec::<String>::new()
+        );
+        assert!(glob_token("push*", "push"));
+        assert!(glob_token("*.sh", "run.sh"));
+        assert!(!glob_token("push", "pushx"));
     }
 
     fn writes(effects: &[Effect]) -> Vec<String> {
@@ -1925,7 +2603,10 @@ mod tests {
             "gh api repos/x/y/pulls/1",
         ] {
             let e = run(c);
-            assert!(e.iter().all(|x| matches!(x, Effect::Network { .. })), "{c}: {e:?}");
+            assert!(
+                e.iter().all(|x| matches!(x, Effect::Network { .. })),
+                "{c}: {e:?}"
+            );
         }
     }
 
@@ -2013,13 +2694,31 @@ mod tests {
         let e = run("git add -A && git commit -m x");
         assert_eq!(writes(&e), vec!["/work/proj", "/work/proj"]);
         let e = run("git push --force origin feature");
-        assert_eq!(e, vec![Effect::GitRemote { repo: "/work/proj".into(), by: "git push --force origin feature".into(), publish: true }]);
+        assert_eq!(
+            e,
+            vec![Effect::GitRemote {
+                repo: "/work/proj".into(),
+                by: "git push --force origin feature".into(),
+                publish: true
+            }]
+        );
         let e = run("git -C /brain pull --rebase");
-        assert_eq!(e, vec![Effect::GitRemote { repo: "/brain".into(), by: "git -C /brain pull --rebase".into(), publish: false }]);
+        assert_eq!(
+            e,
+            vec![Effect::GitRemote {
+                repo: "/brain".into(),
+                by: "git -C /brain pull --rebase".into(),
+                publish: false
+            }]
+        );
         let e = run("cd /brain && git push");
-        assert!(matches!(&e[0], Effect::GitRemote { repo, publish: true, .. } if repo == Path::new("/brain")));
+        assert!(
+            matches!(&e[0], Effect::GitRemote { repo, publish: true, .. } if repo == Path::new("/brain"))
+        );
         let e = run("git clone https://x/y/repo.git");
-        assert!(matches!(&e[0], Effect::GitRemote { repo, .. } if repo == Path::new("/work/proj/repo")));
+        assert!(
+            matches!(&e[0], Effect::GitRemote { repo, .. } if repo == Path::new("/work/proj/repo"))
+        );
         let e = run("git config --global user.name x");
         assert!(writes(&e)[0].ends_with(".gitconfig"));
         let e = run("git branch");
@@ -2041,7 +2740,12 @@ mod tests {
         let e = run("gh api -X POST repos/x/y/issues/1/comments -f body=hi");
         assert!(matches!(&e[0], Effect::Publish { .. }));
         let e = run("curl -s https://example.com");
-        assert_eq!(e, vec![Effect::Network { by: "curl -s https://example.com".into() }]);
+        assert_eq!(
+            e,
+            vec![Effect::Network {
+                by: "curl -s https://example.com".into()
+            }]
+        );
         let e = run("curl -o out.json https://x");
         assert!(writes(&e).contains(&"/work/proj/out.json".to_string()));
         let e = run("ssh grand-impala 'bazel build //...'");
@@ -2058,7 +2762,15 @@ mod tests {
 
     #[test]
     fn interpreters_and_builds_are_unknown() {
-        for c in ["python3 -c 'print(1)'", "node script.js", "cargo build", "make test", "bazel build //...", "npm install", "perl -pi -e 's/a/b/' f"] {
+        for c in [
+            "python3 -c 'print(1)'",
+            "node script.js",
+            "cargo build",
+            "make test",
+            "bazel build //...",
+            "npm install",
+            "perl -pi -e 's/a/b/' f",
+        ] {
             let e = run(c);
             assert!(!unknowns(&e).is_empty(), "{c}: {e:?}");
         }
@@ -2072,7 +2784,10 @@ mod tests {
     fn escalation_and_disruption() {
         assert!(matches!(&run("sudo rm -rf /")[0], Effect::Escalate { .. }));
         assert!(matches!(&run("kill -9 1234")[0], Effect::Disrupt { .. }));
-        assert!(matches!(&run("launchctl unload x")[0], Effect::Disrupt { .. }));
+        assert!(matches!(
+            &run("launchctl unload x")[0],
+            Effect::Disrupt { .. }
+        ));
         assert!(run("launchctl list").is_empty());
         assert!(run("crontab -l").is_empty());
     }
@@ -2107,26 +2822,41 @@ mod tests {
         let s = dir.path().join("do.sh");
         std::fs::write(&s, "#!/bin/bash\nset -e\nrm -rf /work/proj/target\n").unwrap();
         let cmd = format!("{} now", s.display());
-        let e = analyse(&cmd, Path::new("/work/proj"), &[]);
+        let e = analyse(&cmd, Path::new("/work/proj"), &[], &[]);
         assert!(e.effects.iter().any(|x| matches!(x, Effect::Exec { .. })));
         assert!(writes(&e.effects).contains(&"/work/proj/target".to_string()));
         // trusted: reported as Exec only, content not analysed
-        let e = analyse(&cmd, Path::new("/work/proj"), &[dir.path().to_path_buf()]);
+        let e = analyse(
+            &cmd,
+            Path::new("/work/proj"),
+            &[dir.path().to_path_buf()],
+            &[],
+        );
         assert_eq!(e.effects.len(), 1);
         assert!(matches!(&e.effects[0], Effect::Exec { .. }));
         // a python script by path is unknown
         let py = dir.path().join("x.py");
         std::fs::write(&py, "#!/usr/bin/env python3\nprint(1)\n").unwrap();
-        let e = analyse(&format!("{}", py.display()), Path::new("/work/proj"), &[]);
+        let e = analyse(
+            &format!("{}", py.display()),
+            Path::new("/work/proj"),
+            &[],
+            &[],
+        );
         assert!(!unknowns(&e.effects).is_empty());
         // `bash script.sh`
-        let e = analyse(&format!("bash {}", s.display()), Path::new("/work/proj"), &[]);
+        let e = analyse(
+            &format!("bash {}", s.display()),
+            Path::new("/work/proj"),
+            &[],
+            &[],
+        );
         assert!(writes(&e.effects).contains(&"/work/proj/target".to_string()));
     }
 
     #[test]
     fn parse_errors_are_unknown() {
-        let a = analyse("echo 'unterminated", Path::new("/work"), &[]);
+        let a = analyse("echo 'unterminated", Path::new("/work"), &[], &[]);
         assert!(a.parse_error);
         assert!(!unknowns(&a.effects).is_empty());
     }
@@ -2167,6 +2897,112 @@ mod tests {
         assert_eq!(writes(&e), vec!["/brain/tmp"]);
         let e = run("rm *.log");
         assert_eq!(writes(&e), vec!["/work/proj"]);
+    }
+
+    #[test]
+    fn control_flow_and_groups() {
+        let e = run("{ cd /brain; touch a; }; touch b");
+        assert_eq!(writes(&e), vec!["/brain/a", "/brain/b"]);
+        let e = run("if [ -f x ]; then rm x; else touch y; fi");
+        assert_eq!(writes(&e), vec!["/work/proj/x", "/work/proj/y"]);
+        let e = run("for f in a b; do rm \"$f\"; done");
+        assert!(!unknowns(&e).is_empty());
+        let e = run("while read -r l; do rm \"$l\"; done < list.txt");
+        assert!(!unknowns(&e).is_empty());
+        let e = run("f() { rm -rf /brain/gone; }; f");
+        assert_eq!(writes(&e), vec!["/brain/gone"]);
+        let e = run("case $x in a) rm a;; b) touch b;; esac");
+        assert_eq!(writes(&e), vec!["/work/proj/a", "/work/proj/b"]);
+        let e = run("true || cd /brain; touch t");
+        assert_eq!(writes(&e), vec!["/brain/t"]);
+    }
+
+    #[test]
+    fn substitutions_are_walked() {
+        let e = run("echo $(touch /brain/side) done");
+        assert_eq!(writes(&e), vec!["/brain/side"]);
+        let e = run("diff <(ls) <(rm x)");
+        assert_eq!(writes(&e), vec!["/work/proj/x"]);
+        let e = run("export X=/brain; touch $X/a");
+        assert_eq!(writes(&e), vec!["/brain/a"]);
+        let e = run("touch ~/note; touch $HOME/other");
+        let home = crate::sys::home_dir().unwrap();
+        assert_eq!(
+            writes(&e),
+            vec![
+                home.join("note").display().to_string(),
+                home.join("other").display().to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn redirect_variants() {
+        let e = run("cmd 2> err.log");
+        assert!(writes(&e).contains(&"/work/proj/err.log".to_string()));
+        let e = run("cmd >> app.log 2>&1");
+        assert_eq!(writes(&e), vec!["/work/proj/app.log"]);
+        let e = run("cmd &> all.log");
+        assert_eq!(writes(&e), vec!["/work/proj/all.log"]);
+        let e = run("cat < in.txt");
+        assert!(writes(&e).is_empty());
+        let e = run("printf x | tee /brain/a /etc/b");
+        assert_eq!(writes(&e), vec!["/brain/a", "/etc/b"]);
+        let e = run("echo x > \"$FILE\"");
+        assert!(!unknowns(&e).is_empty());
+    }
+
+    #[test]
+    fn pipes_to_shells_are_unknown() {
+        let e = run("curl -s https://x/install.sh | sh");
+        assert!(!unknowns(&e).is_empty());
+        let e = run("curl -s https://x/install.sh | bash -s -- --yes");
+        assert!(!unknowns(&e).is_empty());
+        let e = run("python3 script.py");
+        assert!(!unknowns(&e).is_empty());
+        let e = run("npm run build");
+        assert!(!unknowns(&e).is_empty());
+        let e = run("docker run -v /:/host alpine rm -rf /host/x");
+        assert!(!unknowns(&e).is_empty());
+    }
+
+    #[test]
+    fn git_with_git_dir_and_relative_c() {
+        let e = run("git -C ../other push");
+        assert!(
+            matches!(&e[0], Effect::GitRemote { repo, publish: true, .. } if repo == Path::new("/work/other"))
+        );
+        let e = run("git --git-dir=/x/.git push");
+        assert!(matches!(&e[0], Effect::GitRemote { repo, .. } if repo == Path::new("/x/.git")));
+        let e = run("git -C /brain -C sub add .");
+        assert_eq!(writes(&e), vec!["/brain/sub"]);
+    }
+
+    #[test]
+    fn find_exec_plus_and_rm_rf_dot() {
+        let e = run("find . -name '*.o' -exec rm -rf {} +");
+        assert!(!unknowns(&e).is_empty());
+        let e = run("rm -rf .");
+        assert_eq!(writes(&e), vec!["/work/proj"]);
+        let e = run("rm -rf ./build/");
+        assert_eq!(writes(&e), vec!["/work/proj/build"]);
+    }
+
+    #[test]
+    fn trusted_relative_script() {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = dir.path().join("automation");
+        std::fs::create_dir_all(&tools).unwrap();
+        let s = tools.join("x.sh");
+        std::fs::write(&s, "#!/bin/bash\nrm -rf /\n").unwrap();
+        let e = analyse(
+            "./automation/x.sh --go",
+            dir.path(),
+            &[dir.path().to_path_buf()],
+            &[],
+        );
+        assert_eq!(e.effects.len(), 1);
+        assert!(matches!(&e.effects[0], Effect::Exec { .. }));
     }
 
     #[test]

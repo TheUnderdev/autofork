@@ -263,6 +263,232 @@ fn run_one(
     )
 }
 
+/// The Claude Code tool names behind each guard tool family. `guard.tools`
+/// names families; the harness denies by tool name, so every family the
+/// author did NOT list becomes this many deny rules.
+fn family_tools(f: autofork_core::guard::ToolFamily) -> &'static [&'static str] {
+    use autofork_core::guard::ToolFamily as F;
+    match f {
+        F::Read => &["Read", "Glob", "Grep"],
+        F::Shell => &["Bash"],
+        F::Edit => &["Edit", "Write", "MultiEdit", "NotebookEdit"],
+        F::Web => &["WebFetch", "WebSearch"],
+        F::Task => &["Agent", "Task"],
+    }
+}
+
+/// Tools that belong to no family: bookkeeping and lookup, harmless for a
+/// fork that still has tools, and the last thing to take away from a
+/// `tools: []` reviewer — which is meant to answer from the conversation it
+/// inherited and nothing else.
+const UNFAMILIED_TOOLS: [&str; 4] = ["TodoWrite", "Skill", "LSP", "ToolSearch"];
+
+/// `Edit(//abs/path/**)` for each writable root. Permission rules spell an
+/// absolute path with a DOUBLE slash (`//tmp/brain`); a single slash means
+/// "relative to the project root" there, which would silently point the rule
+/// at the parent's workspace — the one place the guard exists to protect.
+fn guard_allow_rules(g: &autofork_core::guard::Guard) -> Vec<String> {
+    g.write
+        .iter()
+        .map(|p| {
+            let s = p.display().to_string();
+            let s = s.trim_end_matches('/');
+            if let Some(rest) = s.strip_prefix('/') {
+                format!("Edit(//{rest}/**)")
+            } else {
+                // Not absolute (frontmatter parsing makes these absolute, so
+                // this is belt and braces): leave it project-relative rather
+                // than inventing a root.
+                format!("Edit({s}/**)")
+            }
+        })
+        .collect()
+}
+
+/// One `deny:` command pattern as Claude Code `Bash(...)` deny rules.
+///
+/// A permission rule matches a command by prefix: `Bash(git push)` is the
+/// bare command and `Bash(git push:*)` is that command with anything after
+/// it, so a pattern that names a whole command needs both — otherwise
+/// `ssh` is refused and `ssh host 'rm -rf /'` sails past. A pattern that
+/// already ends in a star only ever means "and whatever follows", so the
+/// `:*` form alone covers it.
+///
+/// This is a coarser net than the analyser the parent session's hook runs
+/// (which sees through `bash -c`, `xargs` and a wrapper script): a rule
+/// matches the command line the model wrote. The sandbox is what catches
+/// what slips past — this list is the author's explicit, readable "not this
+/// command", denied before anything else is considered.
+fn guard_bash_deny_rules(pattern: &str) -> Vec<String> {
+    let mut tokens: Vec<&str> = pattern.split_whitespace().collect();
+    let mut trailing_star = false;
+    if let Some(last) = tokens.last().copied() {
+        if last == "*" {
+            tokens.pop();
+            trailing_star = true;
+        } else if let Some(stem) = last.strip_suffix('*') {
+            tokens.pop();
+            if !stem.is_empty() {
+                tokens.push(stem);
+            }
+            trailing_star = true;
+        }
+    }
+    let prefix = tokens.join(" ");
+    if prefix.is_empty() {
+        // A bare `*`: every command. Nothing to prefix-match on, so deny the
+        // tool outright rather than emitting `Bash(:*)`, which matches
+        // nothing.
+        return vec!["Bash".to_string()];
+    }
+    if trailing_star {
+        vec![format!("Bash({prefix}:*)")]
+    } else {
+        vec![format!("Bash({prefix})"), format!("Bash({prefix}:*)")]
+    }
+}
+
+/// Whole-tool deny rules for a guard: the web tools when the fork has no
+/// network, every tool of every family the author did not list, and the
+/// author's own `deny:` command patterns.
+fn guard_deny_rules(g: &autofork_core::guard::Guard) -> Vec<String> {
+    use autofork_core::guard::ToolFamily;
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |name: &str| {
+        let rule = name.to_string();
+        if !out.contains(&rule) {
+            out.push(rule);
+        }
+    };
+    if !g.network {
+        // The sandbox only governs Bash; WebFetch and WebSearch run
+        // in-process and are gated by permission rules alone.
+        push("WebFetch");
+        push("WebSearch");
+    }
+    if let Some(allowed) = &g.tools {
+        for f in ToolFamily::ALL {
+            if !allowed.contains(&f) {
+                for t in family_tools(f) {
+                    push(t);
+                }
+            }
+        }
+        if allowed.is_empty() {
+            for t in UNFAMILIED_TOOLS {
+                push(t);
+            }
+        }
+    }
+    for pattern in &g.deny {
+        for rule in guard_bash_deny_rules(pattern) {
+            push(&rule);
+        }
+    }
+    out
+}
+
+/// Whether the fork's working directory (the parent session's project root)
+/// must be closed to sandboxed commands. The sandbox writes to the working
+/// directory by default, so a guard that does not name it would otherwise
+/// leave the parent's workspace open to `sh -c 'echo … > file'` even though
+/// the Edit tool is refused there. The deny is skipped when the write set
+/// and the cwd overlap in either direction: a `denyWrite` is documented to
+/// hold inside a wider `allowWrite` (only the READ lists document a narrower
+/// allow re-opening a denied region), so denying a cwd that contains a
+/// writable root would take that root away too.
+fn guard_denies_cwd(g: &autofork_core::guard::Guard, cwd: &std::path::Path) -> bool {
+    !g.write
+        .iter()
+        .any(|w| w.starts_with(cwd) || cwd.starts_with(w))
+}
+
+/// The `--settings` JSON for one guarded run.
+///
+/// A fork gets no hooks (see `run_attempt`), so a PreToolUse hook — how the
+/// guard is enforced in the parent's own session — is not available here.
+/// Enforcement is therefore two settings layers that need no hook:
+///
+/// - the native Bash **sandbox**, which the OS enforces (Seatbelt on macOS,
+///   bubblewrap on Linux) on every command and child process: writes only
+///   under the write set, network only to the hosts the write set's own git
+///   remotes use. `allowUnsandboxedCommands: false` removes the model's
+///   `dangerouslyDisableSandbox` escape hatch, and `failIfUnavailable` turns
+///   a missing sandbox into a failed run rather than a silently unguarded
+///   one. Claude Code reports a sandbox violation in the blocked command's
+///   result, naming the path or host — so the model reads a specific reason,
+///   which is the whole point of a guard.
+/// - **permission rules**, which gate the in-process tools the sandbox never
+///   sees (Edit/Write, WebFetch, subagents). `deny` always wins; the `allow`
+///   list is what makes the write set usable at all, because a guarded run
+///   is forced into permission mode `default`, where anything not explicitly
+///   allowed would need a prompt nobody can answer.
+///
+/// The author's `message:` is not in here: it rides on
+/// `--append-system-prompt` (`wake::guard_paragraph`), so the fork reads its
+/// scope before its first tool call and hears the same words back when a
+/// rule blocks it.
+fn guard_settings(
+    g: &autofork_core::guard::Guard,
+    disable_hooks: bool,
+    cwd: &std::path::Path,
+) -> serde_json::Value {
+    use serde_json::json;
+
+    let writes: Vec<String> = g
+        .write
+        .iter()
+        .map(|p| p.display().to_string().trim_end_matches('/').to_string())
+        .collect();
+
+    let mut filesystem = json!({ "allowWrite": writes });
+    if guard_denies_cwd(g, cwd) {
+        filesystem["denyWrite"] = json!([cwd.display().to_string()]);
+    }
+
+    // Network. `strictAllowlist` is what makes the allowlist a wall: without
+    // it a host outside the list is decided by permission mode, which in a
+    // headless `default`-mode run means "ask" — and an unanswerable prompt
+    // is a hung command rather than a refusal the model can read. It is
+    // honoured from user, managed and CLI `--settings` settings, which is
+    // what we are.
+    //
+    // A fork WITH network still goes through the allowlist (there is no
+    // documented "allow all" switch, and a bare `*` is documented only for
+    // `WebFetch(domain:*)` rules, not for `allowedDomains`) — so that is
+    // exactly what we add: the sandbox's allowlist is `allowedDomains` PLUS
+    // the domains of `WebFetch(domain:...)` allow rules, and there a bare
+    // `*` matches every host. One rule therefore opens both the sandbox and
+    // the WebFetch tool, which is what `network: true` means.
+    let mut permissions_allow = guard_allow_rules(g);
+    if g.network {
+        permissions_allow.push("WebFetch(domain:*)".to_string());
+    }
+
+    let mut settings = json!({
+        "sandbox": {
+            "enabled": true,
+            "autoAllowBashIfSandboxed": true,
+            "allowUnsandboxedCommands": false,
+            "excludedCommands": [],
+            "failIfUnavailable": true,
+            "filesystem": filesystem,
+            "network": {
+                "allowedDomains": g.remote_hosts(),
+                "strictAllowlist": true,
+            },
+        },
+        "permissions": {
+            "allow": permissions_allow,
+            "deny": guard_deny_rules(g),
+        },
+    });
+    if disable_hooks {
+        settings["disableAllHooks"] = json!(true);
+    }
+    settings
+}
+
 /// One `claude -p` attempt on one model candidate.
 fn run_attempt(
     session_id: &str,
@@ -282,11 +508,6 @@ fn run_attempt(
     if let Some(m) = model {
         cmd.arg("--model").arg(m);
     }
-    // Headless runs cannot answer permission prompts; without a mode a write
-    // simply stalls until the run times out. `acceptEdits` is the smallest
-    // mode that lets typical consolidation forks do their file work.
-    cmd.arg("--permission-mode")
-        .arg(spec.mode.as_deref().unwrap_or("acceptEdits"));
     // Session-scoped Stop hooks outlive the session that set them: Claude
     // Code restores the one `/goal` installs from the transcript on every
     // `--resume`, and `--fork-session` is a resume. Inside a headless fork
@@ -299,8 +520,39 @@ fn run_attempt(
     // a throwaway reviewer has no business triggering anyway — autofork's own
     // hooks already no-op on AUTOFORK_FORK=1. `AUTOFORK_FORK_HOOKS=1` opts
     // back in for anyone whose forks depend on a hook.
-    if std::env::var_os("AUTOFORK_FORK_HOOKS").is_none() {
-        cmd.arg("--settings").arg(r#"{"disableAllHooks":true}"#);
+    let disable_hooks = std::env::var_os("AUTOFORK_FORK_HOOKS").is_none();
+    match spec.guard.as_ref() {
+        // Guarded run. The mode is forced to `default` (Manual) whatever the
+        // fork's `mode:` or the config says: `acceptEdits` and
+        // `bypassPermissions` both approve edits the guard's `allow` list
+        // does not cover, which would turn the write set into a suggestion.
+        // In `-p` there is nobody to answer a prompt, so "needs approval"
+        // resolves to "denied, do not retry" — exactly the wall a guard
+        // wants, with the allow rules cutting a hole for the write set.
+        Some(g) => {
+            cmd.arg("--permission-mode").arg("default");
+            cmd.arg("--settings")
+                .arg(guard_settings(g, disable_hooks, cwd).to_string());
+            // The guard's prose, in the fork's own system prompt. A resumed
+            // conversation replays the system prompt it recorded on its
+            // first request, so an appended prompt would be dropped on the
+            // floor without `--system-prompt-snapshot off`, which re-renders
+            // it per request.
+            cmd.arg("--append-system-prompt")
+                .arg(autofork_core::wake::guard_paragraph(g));
+            cmd.arg("--system-prompt-snapshot").arg("off");
+        }
+        // Unguarded run. Headless runs cannot answer permission prompts;
+        // without a mode a write simply stalls until the run times out.
+        // `acceptEdits` is the smallest mode that lets typical consolidation
+        // forks do their file work.
+        None => {
+            cmd.arg("--permission-mode")
+                .arg(spec.mode.as_deref().unwrap_or("acceptEdits"));
+            if disable_hooks {
+                cmd.arg("--settings").arg(r#"{"disableAllHooks":true}"#);
+            }
+        }
     }
     cmd.arg(prompt)
         .current_dir(cwd)
@@ -752,5 +1004,199 @@ mod tests {
                 "--auto",
             ]
         );
+    }
+
+    use autofork_core::guard::{Guard, ToolFamily};
+    use serde_json::json;
+    use std::path::{Path, PathBuf};
+
+    fn guard(write: &[&str]) -> Guard {
+        Guard {
+            write: write.iter().map(PathBuf::from).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn guard_settings_confine_writes_and_network() {
+        // The whole enforcement surface of a guarded headless run, spelled
+        // out: no write outside the list, no host but the write set's own
+        // git remotes, no escape hatch, and the web tools off.
+        let g = guard(&["/tmp/brain"]);
+        let v = guard_settings(&g, true, Path::new("/work/proj"));
+        assert_eq!(
+            v,
+            json!({
+                "disableAllHooks": true,
+                "sandbox": {
+                    "enabled": true,
+                    "autoAllowBashIfSandboxed": true,
+                    "allowUnsandboxedCommands": false,
+                    "excludedCommands": [],
+                    "failIfUnavailable": true,
+                    "filesystem": {
+                        "allowWrite": ["/tmp/brain"],
+                        "denyWrite": ["/work/proj"],
+                    },
+                    "network": {
+                        "allowedDomains": [],
+                        "strictAllowlist": true,
+                    },
+                },
+                "permissions": {
+                    "allow": ["Edit(//tmp/brain/**)"],
+                    "deny": ["WebFetch", "WebSearch"],
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn guard_settings_keep_hooks_when_opted_back_in() {
+        // `AUTOFORK_FORK_HOOKS=1` only drops the hook gate; every guard key
+        // stays.
+        let v = guard_settings(&guard(&["/tmp/brain"]), false, Path::new("/work/proj"));
+        assert!(v.get("disableAllHooks").is_none(), "{v}");
+        assert_eq!(v["sandbox"]["enabled"], json!(true));
+    }
+
+    #[test]
+    fn guard_edit_rules_use_the_double_slash_absolute_form() {
+        // `Edit(/tmp/brain/**)` with ONE slash is a project-relative rule —
+        // it would point at the parent's workspace instead.
+        assert_eq!(
+            guard_allow_rules(&guard(&["/tmp/brain/", "/var/tmp/out"])),
+            ["Edit(//tmp/brain/**)", "Edit(//var/tmp/out/**)"]
+        );
+    }
+
+    #[test]
+    fn guard_with_network_opens_the_allowlist_with_a_webfetch_wildcard() {
+        // There is no `allowedDomains: ["*"]`; the sandbox's allowlist is
+        // `allowedDomains` plus `WebFetch(domain:...)` allow rules, and a
+        // bare `*` is honoured there. The same rule un-denies the web tools.
+        let g = Guard {
+            network: true,
+            ..guard(&["/tmp/brain"])
+        };
+        let v = guard_settings(&g, true, Path::new("/work/proj"));
+        assert_eq!(
+            v["permissions"]["allow"],
+            json!(["Edit(//tmp/brain/**)", "WebFetch(domain:*)"])
+        );
+        assert_eq!(v["permissions"]["deny"], json!([]));
+        assert_eq!(v["sandbox"]["network"]["strictAllowlist"], json!(true));
+    }
+
+    #[test]
+    fn guard_denies_every_family_the_author_left_out() {
+        let g = Guard {
+            tools: Some(vec![ToolFamily::Read]),
+            ..guard(&[])
+        };
+        assert_eq!(
+            guard_deny_rules(&g),
+            [
+                "WebFetch",
+                "WebSearch",
+                "Bash",
+                "Edit",
+                "Write",
+                "MultiEdit",
+                "NotebookEdit",
+                "Agent",
+                "Task",
+            ]
+        );
+    }
+
+    #[test]
+    fn guard_with_no_tools_denies_the_unfamilied_ones_too() {
+        // `tools: []` is a reviewer that answers from the conversation it
+        // inherited; even TodoWrite is taken away.
+        let g = Guard {
+            tools: Some(vec![]),
+            network: true,
+            ..guard(&[])
+        };
+        let deny = guard_deny_rules(&g);
+        for t in [
+            "Read",
+            "Glob",
+            "Grep",
+            "Bash",
+            "Edit",
+            "Write",
+            "MultiEdit",
+            "NotebookEdit",
+            "WebFetch",
+            "WebSearch",
+            "Agent",
+            "Task",
+            "TodoWrite",
+            "Skill",
+            "LSP",
+            "ToolSearch",
+        ] {
+            assert!(deny.contains(&t.to_string()), "{t} missing from {deny:?}");
+        }
+        // No duplicates: the web family can be excluded both by `tools:` and
+        // by having no network.
+        let mut sorted = deny.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), deny.len(), "{deny:?}");
+    }
+
+    #[test]
+    fn guard_deny_patterns_become_bash_prefix_rules() {
+        // A whole-command pattern needs both forms: without `Bash(ssh)` the
+        // bare command runs, without `Bash(ssh:*)` every invocation with an
+        // argument does.
+        assert_eq!(guard_bash_deny_rules("ssh"), ["Bash(ssh)", "Bash(ssh:*)"]);
+        // A star already means "and whatever follows".
+        assert_eq!(guard_bash_deny_rules("git push*"), ["Bash(git push:*)"]);
+        assert_eq!(guard_bash_deny_rules("rm -rf *"), ["Bash(rm -rf:*)"]);
+        // Nothing to prefix-match on: take the tool away instead of
+        // emitting a rule that matches nothing.
+        assert_eq!(guard_bash_deny_rules("*"), ["Bash"]);
+    }
+
+    #[test]
+    fn guard_deny_patterns_reach_the_settings() {
+        let g = Guard {
+            deny: vec!["ssh".into(), "gh pr comment".into()],
+            network: true,
+            ..guard(&["/tmp/brain"])
+        };
+        assert_eq!(
+            guard_settings(&g, true, Path::new("/work/proj"))["permissions"]["deny"],
+            json!([
+                "Bash(ssh)",
+                "Bash(ssh:*)",
+                "Bash(gh pr comment)",
+                "Bash(gh pr comment:*)"
+            ])
+        );
+    }
+
+    #[test]
+    fn guard_does_not_deny_a_cwd_that_overlaps_the_write_set() {
+        // Denying the cwd would take a writable root inside it away with it:
+        // a `denyWrite` holds inside a wider `allowWrite`.
+        assert!(!guard_denies_cwd(
+            &guard(&["/work/proj/docs"]),
+            Path::new("/work/proj")
+        ));
+        assert!(!guard_denies_cwd(
+            &guard(&["/work/proj"]),
+            Path::new("/work/proj/crates")
+        ));
+        assert!(guard_denies_cwd(
+            &guard(&["/tmp/brain"]),
+            Path::new("/work/proj")
+        ));
+        // A read-only fork (no write set at all) closes the cwd.
+        assert!(guard_denies_cwd(&guard(&[]), Path::new("/work/proj")));
     }
 }
