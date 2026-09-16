@@ -10,6 +10,7 @@ pub mod discovery;
 pub mod duration;
 pub mod frontmatter;
 pub mod glob;
+pub mod guard;
 pub mod harness;
 pub mod hooks;
 pub mod moments;

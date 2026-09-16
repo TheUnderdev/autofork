@@ -171,6 +171,7 @@ async fn dispatch(daemon: &Arc<Daemon>, body: RequestBody) -> ResponseBody {
                     gate: e.parsed.def.gate,
                     model: e.parsed.def.model.display(),
                     mode: e.parsed.def.mode.display(),
+                    guard: e.parsed.def.guard.as_ref().map(|g| g.display()),
                     warnings: e
                         .parsed
                         .warnings

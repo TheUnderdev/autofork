@@ -21,6 +21,9 @@
 use crate::duration::parse_duration_yaml;
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+use crate::guard::{Guard, ToolFamily};
 
 /// A frontmatter value that may differ per client: one scalar used verbatim
 /// wherever the fork runs, or a map keyed by client name (`claude-code`,
@@ -134,6 +137,110 @@ fn parse_client_scoped(
     }
 }
 
+/// `guard:` — what a fork run may touch. A map with `write:` (a path, a
+/// list of paths, or `none`), `tools:` (`none`, `all`, or a list of
+/// families: read, shell, edit, web, task), `network:` (bool) and
+/// `message:` (the author's course-correction text). Paths must be
+/// absolute or `~/…`.
+fn parse_guard(v: &serde_yaml::Value, name: &str, warnings: &mut Vec<String>) -> Option<Guard> {
+    use serde_yaml::Value as Y;
+    let home = crate::sys::home_dir();
+    let expand = |s: &str| -> Option<PathBuf> {
+        let s = s.trim();
+        let p = if let Some(rest) = s.strip_prefix("~/") {
+            home.as_ref()?.join(rest)
+        } else if s == "~" {
+            home.clone()?
+        } else if let Some(rest) = s.strip_prefix("$HOME/") {
+            home.as_ref()?.join(rest)
+        } else {
+            PathBuf::from(s)
+        };
+        if !p.is_absolute() {
+            return None;
+        }
+        Some(crate::guard::normalize(&p))
+    };
+    let Y::Mapping(m) = v else {
+        warnings.push(format!(
+            "fork '{name}': guard must be a map with write/tools/network/message; ignoring"
+        ));
+        return None;
+    };
+    let mut g = Guard::default();
+    for (k, val) in m {
+        let Some(k) = k.as_str() else { continue };
+        match k {
+            "write" => {
+                let items: Vec<String> = match val {
+                    Y::Null => Vec::new(),
+                    Y::String(s) if s.trim() == "none" => Vec::new(),
+                    Y::String(s) => vec![s.clone()],
+                    Y::Sequence(seq) => seq.iter().filter_map(|x| x.as_str().map(String::from)).collect(),
+                    _ => {
+                        warnings.push(format!("fork '{name}': guard.write must be a path, a list of paths, or none; ignoring"));
+                        continue;
+                    }
+                };
+                for s in items {
+                    match expand(&s) {
+                        Some(p) => {
+                            if !g.write.contains(&p) {
+                                g.write.push(p);
+                            }
+                        }
+                        None => warnings.push(format!(
+                            "fork '{name}': guard.write entry '{s}' must be an absolute path or ~/…; ignoring it"
+                        )),
+                    }
+                }
+            }
+            "tools" => {
+                let items: Option<Vec<String>> = match val {
+                    Y::String(s) if s.trim() == "none" => Some(Vec::new()),
+                    Y::String(s) if s.trim() == "all" => None,
+                    Y::String(s) => Some(vec![s.clone()]),
+                    Y::Sequence(seq) => Some(seq.iter().filter_map(|x| x.as_str().map(String::from)).collect()),
+                    Y::Null => None,
+                    _ => {
+                        warnings.push(format!("fork '{name}': guard.tools must be none, all, or a list of families; ignoring"));
+                        continue;
+                    }
+                };
+                g.tools = items.map(|list| {
+                    let mut out = Vec::new();
+                    for s in list {
+                        match ToolFamily::parse(&s) {
+                            Some(f) => {
+                                if !out.contains(&f) {
+                                    out.push(f);
+                                }
+                            }
+                            None => warnings.push(format!(
+                                "fork '{name}': guard.tools entry '{s}' is not a tool family (read, shell, edit, web, task); ignoring it"
+                            )),
+                        }
+                    }
+                    out
+                });
+            }
+            "network" => match val {
+                Y::Bool(b) => g.network = *b,
+                _ => warnings.push(format!("fork '{name}': guard.network must be true or false; using false")),
+            },
+            "message" => match val {
+                Y::String(s) => g.message = Some(s.trim().to_string()).filter(|s| !s.is_empty()),
+                Y::Null => {}
+                _ => warnings.push(format!("fork '{name}': guard.message must be a string; ignoring")),
+            },
+            other => warnings.push(format!(
+                "fork '{name}': guard.{other} is not a guard key (write, tools, network, message); ignoring it"
+            )),
+        }
+    }
+    Some(g)
+}
+
 /// A parsed fork definition (frontmatter only; the body is the prompt).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForkDef {
@@ -186,6 +293,10 @@ pub struct ForkDef {
     /// subagent runner cannot (fork subagents always inherit the parent
     /// model).
     pub model: ClientScoped,
+    /// `guard:` — what a run may touch (write set, tool families, network,
+    /// course-correction message); enforced at the tool boundary by each
+    /// runner. `None` = unguarded.
+    pub guard: Option<Guard>,
     /// Operation mode for this fork's runs (scalar or client-keyed map):
     /// permission mode on Claude Code (headless runner), sandbox mode on
     /// codex, agent on opencode. Unset = config `[fork_modes]` default for
@@ -209,6 +320,7 @@ impl Default for ForkDef {
             background_hold: None,
             model: ClientScoped::Unset,
             mode: ClientScoped::Unset,
+            guard: None,
         }
     }
 }
@@ -535,6 +647,8 @@ struct RawFork {
     model: Option<serde_yaml::Value>,
     #[serde(default)]
     mode: Option<serde_yaml::Value>,
+    #[serde(default)]
+    guard: Option<serde_yaml::Value>,
     // Deprecated since v0.5: parsed only to warn, then ignored.
     #[serde(default)]
     delivery: Option<serde_yaml::Value>,
@@ -571,6 +685,7 @@ impl RawFork {
             || self.background_hold.is_some()
             || self.model.is_some()
             || self.mode.is_some()
+            || self.guard.is_some()
             || self.delivery.is_some()
             || self.allowed_tools.is_some()
             || self.permission_mode.is_some()
@@ -826,6 +941,7 @@ pub fn parse_fork_file(name: &str, content: &str) -> ForkParse {
         .as_ref()
         .map(|v| parse_client_scoped(v, "mode", name, &mut warnings))
         .unwrap_or_default();
+    let guard = raw.guard.as_ref().and_then(|v| parse_guard(v, name, &mut warnings));
 
     for w in &warnings {
         tracing::warn!(fork = name, "{w}");
@@ -846,6 +962,7 @@ pub fn parse_fork_file(name: &str, content: &str) -> ForkParse {
             background_hold,
             model,
             mode,
+            guard,
         },
         body: body.to_string(),
         warnings,

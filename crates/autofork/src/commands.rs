@@ -300,6 +300,9 @@ pub fn list_forks(paths: &Paths, project: Option<std::path::PathBuf>) -> Result<
         if let Some(m) = &f.mode {
             details.push(format!("mode: {m}"));
         }
+        if let Some(g) = &f.guard {
+            details.push(format!("guard: {g}"));
+        }
         if !f.tags.is_empty() {
             details.push(format!("tags: {}", f.tags.join(", ")));
         }
@@ -504,6 +507,7 @@ pub fn run_fork(paths: &Paths, name: Option<String>, tag: Option<String>) -> Res
             model: None,
             model_fallbacks: Vec::new(),
             mode: None,
+            guard: None,
             detail: None,
         })
         .collect();

@@ -307,6 +307,7 @@ fn run_attempt(
         .env("AUTOFORK_FORK", "1")
         .env("AUTOFORK_SESSION_ID", session_id)
         .env("AUTOFORK_FORK_NAME", &spec.name)
+        .env("AUTOFORK_FORK_PATH", &spec.path)
         .env("AUTOFORK_TRIGGER", &spec.trigger)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -690,6 +691,9 @@ fn run_final_opencode(
             .current_dir(cwd)
             .env("AUTOFORK_FORK", "1")
             .env("AUTOFORK_SESSION_ID", session_id)
+            .env("AUTOFORK_FORK_NAME", &spec.name)
+            .env("AUTOFORK_FORK_PATH", &spec.path)
+            .env("AUTOFORK_TRIGGER", &spec.trigger)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());

@@ -49,6 +49,8 @@ pub struct SelectedFork {
     pub model: autofork_core::frontmatter::ClientScoped,
     /// Raw `mode:` frontmatter (client-scoped); resolved at wake build.
     pub mode: autofork_core::frontmatter::ClientScoped,
+    /// `guard:` frontmatter, carried verbatim into the wake.
+    pub guard: Option<autofork_core::guard::Guard>,
     /// The latch this fork consumes at wake-issuance, if any: `context_*`
     /// triggers latch once per session (key = the trigger label); `idle`
     /// triggers latch once per pause (key = `idle-pause:<epoch>`). `None` means
@@ -306,6 +308,7 @@ pub fn select_forks(
             background_hold: parsed.def.background_hold,
             model: parsed.def.model.clone(),
             mode: parsed.def.mode.clone(),
+            guard: parsed.def.guard.clone(),
             latch_key,
             detail,
             consumes,
@@ -518,6 +521,7 @@ pub fn build_final_runs(daemon: &Arc<Daemon>, session: &SessionRow) -> Vec<WakeF
                 model,
                 model_fallbacks,
                 mode,
+                guard: sel.guard.clone(),
                 // Close-time runs are idle forks only; no external trigger
                 // can reach them, so there is nothing to carry.
                 detail: None,
@@ -792,6 +796,7 @@ pub fn build_wake(
                     model: model.clone(),
                     model_fallbacks: fallbacks.clone(),
                     mode: mode.clone(),
+                    guard: sel.guard.clone(),
                     detail: sel.detail.clone(),
                 });
             } else {
@@ -915,6 +920,7 @@ pub fn release_due(daemon: &Arc<Daemon>, session: &SessionRow) -> Option<(String
                 model,
                 model_fallbacks,
                 mode,
+                guard: def.as_ref().and_then(|d| d.guard.clone()),
                 // A dependent's trigger was consumed when the batch was
                 // issued; its predecessors' reports are the context it gets.
                 detail: None,

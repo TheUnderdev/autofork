@@ -1,6 +1,7 @@
 mod client;
 mod codex;
 mod commands;
+mod guard_cmd;
 mod hook;
 mod opencode;
 mod runner;
@@ -120,11 +121,48 @@ enum Command {
         #[arg(long)]
         bin: Option<std::path::PathBuf>,
     },
+    /// Fork guards: evaluate, check or analyse what a fork may touch.
+    Guard {
+        #[command(subcommand)]
+        command: GuardCommand,
+    },
     /// Ask the daemon to exit (it restarts on the next hook event).
     StopDaemon {
         /// Wait for in-flight fork runs to finish first.
         #[arg(long, default_value_t = true)]
         drain: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum GuardCommand {
+    /// The tool-boundary entrypoint used by the harness adapters: a JSON
+    /// call on stdin, a JSON verdict on stdout.
+    #[command(hide = true)]
+    Eval,
+    /// What a fork's guard says to a shell command (after `--`) or to an
+    /// edit (`--path`).
+    Check {
+        /// The fork's .md file.
+        #[arg(long)]
+        fork: std::path::PathBuf,
+        /// Working directory the command would run from (default: here).
+        #[arg(long)]
+        cwd: Option<std::path::PathBuf>,
+        /// Check an edit of this path instead of a command.
+        #[arg(long)]
+        path: Option<std::path::PathBuf>,
+        /// The command line.
+        #[arg(trailing_var_arg = true)]
+        command: Vec<String>,
+    },
+    /// What the shell analyser sees in a command line (after `--`).
+    Analyse {
+        /// Working directory the command would run from (default: here).
+        #[arg(long)]
+        cwd: Option<std::path::PathBuf>,
+        #[arg(trailing_var_arg = true)]
+        command: Vec<String>,
     },
 }
 
@@ -266,6 +304,13 @@ fn main() {
                 parsed,
             );
         }
+        Command::Guard { command } => match command {
+            GuardCommand::Eval => guard_cmd::eval_stdin(&paths),
+            GuardCommand::Check { fork, cwd, path, command } => {
+                exit_on_err(guard_cmd::check(&paths, &fork, cwd, path, command))
+            }
+            GuardCommand::Analyse { cwd, command } => exit_on_err(guard_cmd::analyse(cwd, command)),
+        },
         Command::StopDaemon { drain } => exit_on_err(stop_daemon(&paths, drain)),
     }
 }

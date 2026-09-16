@@ -1036,6 +1036,7 @@ fn attempt_run(
     cmd.env("AUTOFORK_FORK", "1")
         .env("AUTOFORK_SESSION_ID", session)
         .env("AUTOFORK_FORK_NAME", &spec.name)
+        .env("AUTOFORK_FORK_PATH", &spec.path)
         .env("AUTOFORK_TRIGGER", &spec.trigger)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

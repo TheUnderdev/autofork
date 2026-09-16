@@ -409,6 +409,10 @@ pub struct WakeFork {
     /// sandbox / agent, per client). `None` = the client's default. Additive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+    /// The fork's guard, when it has one: what the run may touch. Runners
+    /// enforce it at the tool boundary. Additive field (no proto bump).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard: Option<crate::guard::Guard>,
     /// The prompt to run the fork with (already carries the fork file path,
     /// trigger, session/conversation ids and project root).
     pub prompt: String,
@@ -450,6 +454,9 @@ pub struct ForkInfo {
     /// Display form of the fork's `mode:`. Additive field (no proto bump).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+    /// Display form of the fork's `guard:`. Additive field (no proto bump).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard: Option<String>,
     pub warnings: Vec<String>,
 }
 
@@ -520,6 +527,7 @@ mod tests {
                     model: None,
                     model_fallbacks: Vec::new(),
                     mode: None,
+                    guard: None,
                     prompt: "Read the file /x/journal.md".into(),
                 }]),
                 feed: None,

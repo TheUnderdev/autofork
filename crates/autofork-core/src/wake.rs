@@ -253,6 +253,8 @@ pub struct DueFork {
     pub model_fallbacks: Vec<String>,
     /// Operation mode for the run, resolved like `model`.
     pub mode: Option<String>,
+    /// The fork's guard (`guard:` frontmatter), if any.
+    pub guard: Option<crate::guard::Guard>,
     /// What an external trigger carried: the changed paths of a `changed:`
     /// fire, or the payload of an `event:`. Passed to the fork so it can act
     /// on *what* moved instead of re-deriving it — a fork woken by a change
@@ -313,6 +315,10 @@ fn spawn_prompt(
         Some(d) => format!(" What the trigger carried:\n{}\n", trim_detail(d)),
         None => String::new(),
     };
+    let guard_line = match &fork.guard {
+        Some(g) => format!(" {}", guard_paragraph(g)),
+        None => String::new(),
+    };
     format!(
         "Read the file {path} and follow the instructions in its body.{skill_line}{detail_line} \
          {SPAWN_CTX_PREFIX}{name}', trigger '{trigger}', parent session {session_id}, conversation \
@@ -323,11 +329,41 @@ fn spawn_prompt(
          task table, so TaskOutput on one of its task ids fails with \"No task found\" — that \
          is a visibility limit, not evidence the task stopped; never report it as gone or \
          ask the parent to re-arm it on that basis. Your final message is your \
-         report.{chain_line}",
+         report.{chain_line}{guard_line}",
         path = fork.path,
         name = fork.name,
         trigger = fork.trigger,
     )
+}
+
+/// The guard, stated up front in the spawn prompt so the fork knows its
+/// scope before its first tool call; the same words come back as the
+/// refusal if it crosses the line.
+pub fn guard_paragraph(g: &crate::guard::Guard) -> String {
+    let mut out = String::from("This run is guarded.");
+    if g.write.is_empty() {
+        out.push_str(" You may not change any file.");
+    } else {
+        let list: Vec<String> = g.write.iter().map(|p| format!("`{}`", p.display())).collect();
+        out.push_str(&format!(" You may only change files under: {}.", list.join(", ")));
+    }
+    match &g.tools {
+        Some(t) if t.is_empty() => out.push_str(" You have no tools at all: decide from the conversation you inherited and write your report."),
+        Some(t) => {
+            let names: Vec<&str> = t.iter().map(|f| f.name()).collect();
+            out.push_str(&format!(" Your only tools are: {}.", names.join(", ")));
+        }
+        None => {}
+    }
+    if !g.network {
+        out.push_str(" You have no network (git may still sync and push a repository inside your write list).");
+    }
+    if let Some(m) = g.message.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+        out.push(' ');
+        out.push_str(m);
+    }
+    out.push_str(" These limits are enforced at the tool boundary; a blocked call is not a bug to route around — leave that action to the session you were forked from and report what you did not do.");
+    out
 }
 
 /// Cap the trigger detail carried into a spawn prompt. A `git pull` can
@@ -512,6 +548,7 @@ pub fn build_wake_forks(
             model: f.model.clone(),
             model_fallbacks: f.model_fallbacks.clone(),
             mode: f.mode.clone(),
+            guard: f.guard.clone(),
             prompt: spawn_prompt(f, session_id, conversation_id, project_root),
         })
         .collect()
@@ -552,6 +589,7 @@ mod tests {
             model: None,
             model_fallbacks: Vec::new(),
             mode: None,
+            guard: None,
             detail: None,
         }
     }
