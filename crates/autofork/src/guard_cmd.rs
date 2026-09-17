@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use autofork_core::config::Paths;
 use autofork_core::frontmatter::{parse_fork_file, ForkParse};
-use autofork_core::guard::{shell, Guard, ToolCall, Verdict};
+use autofork_core::guard::{patch_paths, shell, Guard, ToolCall, Verdict};
 use serde::Deserialize;
 
 /// The fork's name from its path, the way discovery names it: the file
@@ -84,7 +84,7 @@ fn map_call<'a>(
                     cwd: &buf.cwd,
                 }
             }
-            "edit" | "write" | "patch" | "multiedit" | "apply_patch" => {
+            "edit" | "write" | "multiedit" => {
                 buf.path = s("filePath")
                     .or(s("file_path"))
                     .or(s("path"))
@@ -95,6 +95,33 @@ fn map_call<'a>(
                     cwd,
                 }
             }
+            // `apply_patch` (and the older `patch`) take no path argument:
+            // the files are named inside the patch body (`patchText`), so
+            // the guard reads them out of it. Falling through to an empty
+            // path would have the guard judge the cwd instead — which is
+            // both too strict (a brain handover from a job directory) and
+            // too loose (a patch reaching outside from inside).
+            "patch" | "apply_patch" => match s("filePath").or(s("file_path")).or(s("path")) {
+                Some(p) => {
+                    buf.path = PathBuf::from(p);
+                    ToolCall::Edit {
+                        path: &buf.path,
+                        cwd,
+                    }
+                }
+                None => {
+                    buf.paths = patch_paths(
+                        s("patchText")
+                            .or(s("patch_text"))
+                            .or(s("patch"))
+                            .unwrap_or(""),
+                    );
+                    ToolCall::Patch {
+                        paths: &buf.paths,
+                        cwd,
+                    }
+                }
+            },
             "read" | "glob" | "grep" | "list" | "ls" | "lsp" | "codesearch" => ToolCall::Read,
             "webfetch" | "websearch" => ToolCall::Web {
                 target: s("url").or(s("query")),
@@ -150,6 +177,13 @@ fn map_call<'a>(
                     cwd,
                 }
             }
+            "patch" => {
+                buf.paths = patch_paths(s("patch").unwrap_or(""));
+                ToolCall::Patch {
+                    paths: &buf.paths,
+                    cwd,
+                }
+            }
             "read" => ToolCall::Read,
             "web" => ToolCall::Web { target: s("url") },
             "task" => ToolCall::Task,
@@ -181,6 +215,7 @@ struct MapBuf {
     command: String,
     cwd: PathBuf,
     path: PathBuf,
+    paths: Vec<PathBuf>,
 }
 
 /// Evaluate one call. `None` guard = allow.
@@ -209,6 +244,11 @@ fn log_verdict(paths: &Paths, fork: &str, tool: &str, call: &ToolCall, verdict: 
             .collect::<String>()
             .replace('\n', " "),
         ToolCall::Edit { path, .. } => path.display().to_string(),
+        ToolCall::Patch { paths, .. } => paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" "),
         ToolCall::Web { target } => target.unwrap_or("").to_string(),
         _ => String::new(),
     };
@@ -228,7 +268,10 @@ fn log_verdict(paths: &Paths, fork: &str, tool: &str, call: &ToolCall, verdict: 
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let _ = writeln!(f, "{now} {action} fork={fork} tool={tool} {what}");
+        // One write per line: concurrent forks append to this file, and a
+        // `writeln!` is several writes that interleave mid-line.
+        let line = format!("{now} {action} fork={fork} tool={tool} {what}\n");
+        let _ = f.write_all(line.as_bytes());
     }
 }
 

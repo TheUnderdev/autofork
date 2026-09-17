@@ -134,6 +134,12 @@ pub enum ToolCall<'a> {
         path: &'a Path,
         cwd: &'a Path,
     },
+    /// A patch that names its files in its body (`apply_patch`, unified
+    /// diffs): every path it adds, updates, deletes or moves to.
+    Patch {
+        paths: &'a [PathBuf],
+        cwd: &'a Path,
+    },
     Read,
     Web {
         target: Option<&'a str>,
@@ -153,7 +159,7 @@ impl ToolCall<'_> {
     pub fn family(&self) -> Option<ToolFamily> {
         match self {
             ToolCall::Shell { .. } => Some(ToolFamily::Shell),
-            ToolCall::Edit { .. } => Some(ToolFamily::Edit),
+            ToolCall::Edit { .. } | ToolCall::Patch { .. } => Some(ToolFamily::Edit),
             ToolCall::Read => Some(ToolFamily::Read),
             ToolCall::Web { .. } => Some(ToolFamily::Web),
             ToolCall::Task => Some(ToolFamily::Task),
@@ -216,6 +222,7 @@ impl Guard {
                         format!("the shell (`{}`)", excerpt(command))
                     }
                     ToolCall::Edit { path, .. } => format!("editing `{}`", path.display()),
+                    ToolCall::Patch { .. } => "patching files".to_string(),
                     ToolCall::Read => "reading files".to_string(),
                     ToolCall::Web { .. } => "the web".to_string(),
                     ToolCall::Task => "subagents".to_string(),
@@ -279,25 +286,67 @@ impl Guard {
                 }
             }
             ToolCall::Edit { path, cwd } => {
-                let abs = if path.is_absolute() {
-                    path.to_path_buf()
-                } else {
-                    cwd.join(path)
-                };
-                let abs = normalize(&abs);
-                if self.writable(&abs) {
-                    Verdict::Allow
-                } else {
-                    Verdict::Deny {
+                // A call whose target the adapter could not find is refused,
+                // never judged by its working directory: the cwd is not what
+                // the call edits, and a guard that cannot see the target
+                // cannot let it through.
+                if path.as_os_str().is_empty() {
+                    return Verdict::Deny {
                         message: self.compose(
                             fork_name,
-                            &[format!("editing `{}` is outside the list", abs.display())],
+                            &[
+                                "this call names no file to edit, so the guard cannot check it \
+                               against the list; use a tool that takes a file path"
+                                    .to_string(),
+                            ],
                         ),
+                    };
+                }
+                self.evaluate_edit(fork_name, path, cwd)
+            }
+            ToolCall::Patch { paths, cwd } => {
+                if paths.is_empty() {
+                    return Verdict::Deny {
+                        message: self.compose(
+                            fork_name,
+                            &["this patch names no file the guard can check (no `*** Add File:`, \
+                               `*** Update File:`, `*** Delete File:` or `*** Move to:` header, \
+                               and no `+++`/`---` unified-diff header); write the file with a \
+                               tool that takes a path instead"
+                                .to_string()],
+                        ),
+                    };
+                }
+                for path in paths.iter() {
+                    if let deny @ Verdict::Deny { .. } = self.evaluate_edit(fork_name, path, cwd) {
+                        return deny;
                     }
                 }
+                Verdict::Allow
             }
             ToolCall::Shell { command, cwd } => {
                 self.evaluate_shell(fork_name, command, cwd, tmp_dir)
+            }
+        }
+    }
+
+    /// One edit target against the write set, resolved from `cwd` when
+    /// relative.
+    fn evaluate_edit(&self, fork_name: &str, path: &Path, cwd: &Path) -> Verdict {
+        let abs = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            cwd.join(path)
+        };
+        let abs = normalize(&abs);
+        if self.writable(&abs) {
+            Verdict::Allow
+        } else {
+            Verdict::Deny {
+                message: self.compose(
+                    fork_name,
+                    &[format!("editing `{}` is outside the list", abs.display())],
+                ),
             }
         }
     }
@@ -606,6 +655,61 @@ fn git_remote_hosts(repo: &Path) -> Vec<String> {
 
 /// The host of a git remote URL: `https://h/x`, `ssh://git@h:port/x`,
 /// `git@h:x`, `h:x`.
+/// The files a patch body touches: every `*** Add File:`, `*** Update
+/// File:`, `*** Delete File:` and `*** Move to:` header of the
+/// `apply_patch` format, or, when it carries none, the `---`/`+++` (and
+/// `rename from`/`rename to`) headers of a unified diff with git's `a/`
+/// and `b/` prefixes stripped. `/dev/null` is not a file. Empty when the
+/// text names nothing the guard can check, and the caller must refuse it.
+pub fn patch_paths(text: &str) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut push = |p: &str| {
+        let p = p.trim();
+        if !p.is_empty() && p != "/dev/null" && !out.iter().any(|q| q == Path::new(p)) {
+            out.push(PathBuf::from(p));
+        }
+    };
+    let mut apply_patch_headers = false;
+    for line in text.lines() {
+        let line = line.trim_end();
+        for tag in [
+            "*** Add File:",
+            "*** Update File:",
+            "*** Delete File:",
+            "*** Move to:",
+        ] {
+            if let Some(rest) = line.strip_prefix(tag) {
+                apply_patch_headers = true;
+                push(rest);
+            }
+        }
+    }
+    if apply_patch_headers {
+        return out;
+    }
+    fn strip_git(p: &str) -> &str {
+        let p = p.split('\t').next().unwrap_or(p).trim();
+        p.strip_prefix("a/")
+            .or_else(|| p.strip_prefix("b/"))
+            .unwrap_or(p)
+    }
+    for line in text.lines() {
+        let line = line.trim_end();
+        if let Some(rest) = line
+            .strip_prefix("+++ ")
+            .or_else(|| line.strip_prefix("--- "))
+        {
+            push(strip_git(rest));
+        } else if let Some(rest) = line
+            .strip_prefix("rename to ")
+            .or_else(|| line.strip_prefix("rename from "))
+        {
+            push(rest);
+        }
+    }
+    out
+}
+
 pub fn remote_url_host(url: &str) -> Option<String> {
     if let Some(idx) = url.find("://") {
         let rest = &url[idx + 3..];
@@ -680,6 +784,109 @@ mod tests {
             ),
             Verdict::Allow
         );
+    }
+
+    #[test]
+    fn patch_paths_reads_apply_patch_headers() {
+        let text = "*** Begin Patch\n*** Add File: /tmp/brain/handovers/a.md\n+hello\n\
+                    *** Update File: src/x.rs\n*** Move to: src/y.rs\n@@\n-a\n+b\n\
+                    *** Delete File: old.txt\n*** End Patch\n";
+        assert_eq!(
+            patch_paths(text),
+            vec![
+                PathBuf::from("/tmp/brain/handovers/a.md"),
+                PathBuf::from("src/x.rs"),
+                PathBuf::from("src/y.rs"),
+                PathBuf::from("old.txt"),
+            ]
+        );
+        // A `+++` line inside a hunk body is not a header once the
+        // apply_patch headers are there.
+        let text = "*** Begin Patch\n*** Update File: a.md\n@@\n+++ b/evil\n*** End Patch\n";
+        assert_eq!(patch_paths(text), vec![PathBuf::from("a.md")]);
+    }
+
+    #[test]
+    fn patch_paths_reads_unified_diffs() {
+        let text = "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-x\n+y\n\
+                    --- /dev/null\n+++ b/new.txt\t2026\n@@\n+n\nrename from c.txt\nrename to d.txt\n";
+        assert_eq!(
+            patch_paths(text),
+            vec![
+                PathBuf::from("src/a.rs"),
+                PathBuf::from("new.txt"),
+                PathBuf::from("c.txt"),
+                PathBuf::from("d.txt"),
+            ]
+        );
+        assert!(patch_paths("just prose, no headers").is_empty());
+    }
+
+    #[test]
+    fn patch_is_judged_by_every_file_it_names_never_by_cwd() {
+        let g = guard(&["/tmp/brain"]);
+        let tmp = Path::new("/tmp");
+        // A run whose cwd is outside the write set may still patch the brain:
+        // the patch's own paths are what count (the assistant-job regression).
+        let inside = [PathBuf::from("/tmp/brain/handovers/2026/09/17/x.md")];
+        assert_eq!(
+            g.evaluate(
+                "handover",
+                &ToolCall::Patch {
+                    paths: &inside,
+                    cwd: Path::new("/home/u/.local/state/assistant/jobs/emailbatch_1"),
+                },
+                tmp
+            ),
+            Verdict::Allow
+        );
+        // And a cwd inside the write set does not launder a patch that
+        // reaches outside it.
+        let mixed = [
+            PathBuf::from("/tmp/brain/ok.md"),
+            PathBuf::from("../elsewhere/secret.md"),
+        ];
+        match g.evaluate(
+            "handover",
+            &ToolCall::Patch {
+                paths: &mixed,
+                cwd: Path::new("/tmp/brain"),
+            },
+            tmp,
+        ) {
+            Verdict::Deny { message } => {
+                assert!(message.contains("/tmp/elsewhere/secret.md"), "{message}")
+            }
+            other => panic!("{other:?}"),
+        }
+        // A patch that names nothing is refused, not waved through.
+        assert!(matches!(
+            g.evaluate(
+                "handover",
+                &ToolCall::Patch {
+                    paths: &[],
+                    cwd: Path::new("/tmp/brain")
+                },
+                tmp
+            ),
+            Verdict::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn edit_with_no_path_is_refused_not_judged_by_cwd() {
+        let g = guard(&["/tmp/brain"]);
+        match g.evaluate(
+            "handover",
+            &ToolCall::Edit {
+                path: Path::new(""),
+                cwd: Path::new("/tmp/brain"),
+            },
+            Path::new("/tmp"),
+        ) {
+            Verdict::Deny { message } => assert!(message.contains("names no file"), "{message}"),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

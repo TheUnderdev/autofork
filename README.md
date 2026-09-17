@@ -422,7 +422,11 @@ The author states only what the fork may **change**; everything else follows fro
 | `message` | the author's words, quoted back to the fork every time it hits the guard | — |
 
 **What the guard decides, per tool call.** An edit or write is allowed iff its path is inside the
-write set (symlinks resolved). A shell command goes through a static **shell analyser**
+write set (symlinks resolved). A patch tool that takes no path (`apply_patch`, `patch`) is judged
+by the files its body names — every `*** Add/Update/Delete File:` and `*** Move to:` header, or the
+`---`/`+++` headers of a unified diff — and all of them must be inside; the working directory is
+never a stand-in for the target, and a call the guard cannot find a file in is refused rather than
+waved through. A shell command goes through a static **shell analyser**
 (`autofork guard analyse -- <cmd>` shows what it sees): the command is parsed with the real bash
 grammar and interpreted abstractly — it follows `cd`/`pushd`/`popd`/subshells/`env -C`/`git -C`,
 expands literal variables and `$(pwd)`, treats redirections as writes, unwraps `bash -c`, `sh -c`,
