@@ -19,6 +19,7 @@ pub mod project;
 pub mod protocol;
 pub mod runenv;
 pub mod schedule;
+#[cfg(feature = "store")]
 pub mod store;
 pub mod sys;
 pub mod tags;

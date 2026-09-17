@@ -9,11 +9,18 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[features]
+default = ["store"]
+# The SQLite-backed daemon state (`store`). Off, the crate is the pure
+# semantics — frontmatter, hooks, guard, glob, wake — for an embedder that
+# keeps its own state and links its own SQLite.
+store = ["dep:rusqlite"]
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
-rusqlite.workspace = true
+rusqlite = { workspace = true, optional = true }
 getrandom.workspace = true
 toml.workspace = true
 tracing.workspace = true

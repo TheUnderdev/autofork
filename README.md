@@ -1137,6 +1137,12 @@ honor extra keys or moments as extensions (autofork warns about and ignores keys
 that only make sense elsewhere), and the reverse holds here: a definition written for such a
 harness degrades gracefully under autofork.
 
+A harness written in Rust can embed the semantics directly: the `autofork-core` crate on crates.io
+carries the frontmatter and hook parsers, the continue sentinel, the guard evaluator (shell analyser
+and sandbox included) and the glob matcher. Build it with `default-features = false` to drop the
+`store` feature — the SQLite-backed daemon state — when the embedder keeps its own state and links
+its own SQLite.
+
 ## License
 
 MIT
