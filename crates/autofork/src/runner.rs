@@ -233,12 +233,20 @@ fn run_one(
         }
         None => candidates.push(None),
     }
+    // A guarded run keeps hooks on, so it must not inherit an active
+    // `/goal` (see `goal_cleared_fork`). Once per run, not per attempt.
+    let attempt_target = if spec.guard.is_some() {
+        goal_cleared_fork(session_id, resume_target, cwd, &spec)
+            .unwrap_or_else(|| resume_target.to_string())
+    } else {
+        resume_target.to_string()
+    };
     let mut status = "failed";
     let mut report = String::new();
     for (i, model) in candidates.iter().enumerate() {
         let (st, rep) = run_attempt(
             session_id,
-            resume_target,
+            &attempt_target,
             cwd,
             &spec,
             &prompt,
@@ -306,6 +314,41 @@ fn guard_allow_rules(g: &autofork_core::guard::Guard) -> Vec<String> {
             }
         })
         .collect()
+}
+
+/// Bare `Read`/`Glob`/`Grep` allow rules when the fork may read at all.
+///
+/// A guard bounds where a fork WRITES; reading is unrestricted (the guard's
+/// own verdict for a read is "allow" whenever the family is in). Claude
+/// Code's modes disagree: outside the working directory a read needs an
+/// approval, and in `-p` an approval nobody can give is a denial — which is
+/// how a handover fork came to be unable to read its own FORK.md under
+/// `~/.claude/skills`. These rules say what the guard means. A fork whose
+/// `tools:` leaves `read` out gets deny rules for the same names instead,
+/// and deny wins.
+fn guard_read_rules(g: &autofork_core::guard::Guard) -> Vec<String> {
+    if g.allows_family(autofork_core::guard::ToolFamily::Read) {
+        family_tools(autofork_core::guard::ToolFamily::Read)
+            .iter()
+            .map(|t| t.to_string())
+            .collect()
+    } else {
+        Vec::new()
+    }
+}
+
+/// The `PreToolUse` hook command for one guarded run: this very binary,
+/// `guard hook --fork <file>`. Claude Code runs it through a shell, so both
+/// paths are single-quoted (a `'` inside becomes `'\''`).
+fn guard_hook_command(autofork_bin: &std::path::Path, fork_path: &str) -> String {
+    fn sq(s: &str) -> String {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+    format!(
+        "{} guard hook --fork {}",
+        sq(&autofork_bin.display().to_string()),
+        sq(fork_path)
+    )
 }
 
 /// One `deny:` command pattern as Claude Code `Bash(...)` deny rules.
@@ -408,9 +451,20 @@ fn guard_denies_cwd(g: &autofork_core::guard::Guard, cwd: &std::path::Path) -> b
 
 /// The `--settings` JSON for one guarded run.
 ///
-/// A fork gets no hooks (see `run_attempt`), so a PreToolUse hook — how the
-/// guard is enforced in the parent's own session — is not available here.
-/// Enforcement is therefore two settings layers that need no hook:
+/// The guard is enforced the way the opencode plugin enforces it: a hook at
+/// the tool boundary (`autofork guard hook`, a `PreToolUse` hook installed
+/// right here) evaluates every call against the fork file and refuses with
+/// the author's words, logging each decision to `guard.log`. The permission
+/// mode is NOT the wall — it is whatever the fork's `mode:` says, exactly as
+/// for an unguarded fork — so the run never depends on an allow list
+/// enumerating every read and write a fork legitimately makes. (It used to:
+/// a guarded run was forced into mode `default` with `Edit(//…)` allow rules
+/// and nothing else, and could not even read its own FORK.md outside the
+/// cwd — an approval nobody can give, silently.)
+///
+/// Under the hook, two settings layers hold whatever the hook cannot — a hook
+/// that fails to start is fail-open on Claude Code's side, so these are the
+/// floor, and both hold in every permission mode:
 ///
 /// - the native Bash **sandbox**, which the OS enforces (Seatbelt on macOS,
 ///   bubblewrap on Linux) on every command and child process: writes only
@@ -419,22 +473,21 @@ fn guard_denies_cwd(g: &autofork_core::guard::Guard, cwd: &std::path::Path) -> b
 ///   `dangerouslyDisableSandbox` escape hatch, and `failIfUnavailable` turns
 ///   a missing sandbox into a failed run rather than a silently unguarded
 ///   one. Claude Code reports a sandbox violation in the blocked command's
-///   result, naming the path or host — so the model reads a specific reason,
-///   which is the whole point of a guard.
-/// - **permission rules**, which gate the in-process tools the sandbox never
-///   sees (Edit/Write, WebFetch, subagents). `deny` always wins; the `allow`
-///   list is what makes the write set usable at all, because a guarded run
-///   is forced into permission mode `default`, where anything not explicitly
-///   allowed would need a prompt nobody can answer.
+///   result, naming the path or host.
+/// - **permission rules**: `deny` for every tool family the guard leaves
+///   out (deny wins in every mode, `bypassPermissions` included); `allow` for
+///   the write set's edits, for reads, and for the web when the fork has
+///   network — what makes the run usable in `default` mode, should a fork
+///   ask for that.
 ///
 /// The author's `message:` is not in here: it rides on
 /// `--append-system-prompt` (`wake::guard_paragraph`), so the fork reads its
-/// scope before its first tool call and hears the same words back when a
-/// rule blocks it.
+/// scope before its first tool call and hears the same words back when the
+/// hook blocks it.
 fn guard_settings(
     g: &autofork_core::guard::Guard,
-    disable_hooks: bool,
     cwd: &std::path::Path,
+    hook_command: &str,
 ) -> serde_json::Value {
     use serde_json::json;
 
@@ -464,11 +517,23 @@ fn guard_settings(
     // `*` matches every host. One rule therefore opens both the sandbox and
     // the WebFetch tool, which is what `network: true` means.
     let mut permissions_allow = guard_allow_rules(g);
+    permissions_allow.extend(guard_read_rules(g));
     if g.network {
         permissions_allow.push("WebFetch(domain:*)".to_string());
     }
 
-    let mut settings = json!({
+    // The hook: every tool call, no matcher. Verdicts are logged by `guard
+    // eval`'s machinery; a deny reaches the model as the tool's result.
+    json!({
+        "hooks": {
+            "PreToolUse": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": hook_command,
+                    "timeout": 30,
+                }],
+            }],
+        },
         "sandbox": {
             "enabled": true,
             "autoAllowBashIfSandboxed": true,
@@ -485,11 +550,80 @@ fn guard_settings(
             "allow": permissions_allow,
             "deny": guard_deny_rules(g),
         },
-    });
-    if disable_hooks {
-        settings["disableAllHooks"] = json!(true);
+    })
+}
+
+/// The environment every fork run carries: the marker autofork's own hooks
+/// no-op on, and the fork's coordinates.
+fn fork_env(cmd: &mut Command, session_id: &str, spec: &WakeFork) {
+    cmd.env("AUTOFORK_FORK", "1")
+        .env("AUTOFORK_SESSION_ID", session_id)
+        .env("AUTOFORK_FORK_NAME", &spec.name)
+        .env("AUTOFORK_FORK_PATH", &spec.path)
+        .env("AUTOFORK_TRIGGER", &spec.trigger);
+}
+
+/// A fork of `resume_target` with no active `/goal`, for a run that keeps
+/// hooks on.
+///
+/// A guarded run needs its hooks (that is where the guard is enforced), and
+/// `--resume` restores the session-scoped Stop hook `/goal` installs — which
+/// inside a headless fork refuses every stop, so the fork loops on the
+/// PARENT's goal until an evaluator gives up on it (observed: seven turns of
+/// a haiku fork trying to finish the parent's job). `disableAllHooks` is how
+/// unguarded runs gate that restore, and it also gates the hooks passed in
+/// `--settings` — there is no finer switch. What there is: `/goal clear`
+/// works in `-p`, costs no model turn (no API call, ~30 ms), and a
+/// `--fork-session` run of it leaves a new session whose transcript carries
+/// the cleared goal; a fork of THAT session restores nothing. "No goal set"
+/// is the same success.
+///
+/// `None` when the pre-run fails — the caller falls back to the original
+/// target and the fork timeout bounds the worst case.
+fn goal_cleared_fork(
+    session_id: &str,
+    resume_target: &str,
+    cwd: &std::path::Path,
+    spec: &WakeFork,
+) -> Option<String> {
+    let mut cmd = Command::new(claude_bin());
+    cmd.arg("-p")
+        .arg("--resume")
+        .arg(resume_target)
+        .arg("--fork-session")
+        .arg("--output-format")
+        .arg("json")
+        .arg("/goal clear")
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    fork_env(&mut cmd, session_id, spec);
+    autofork_core::runenv::apply_oauth_override(&mut cmd);
+    autofork_core::sys::detach(&mut cmd);
+    let out = match cmd.output() {
+        Ok(o) if o.status.success() => o.stdout,
+        Ok(o) => {
+            eprintln!(
+                "[headless] fork '{}': `/goal clear` pre-run exited {}; resuming the parent directly",
+                spec.name, o.status
+            );
+            return None;
+        }
+        Err(e) => {
+            eprintln!(
+                "[headless] fork '{}': `/goal clear` pre-run failed to spawn: {e}; resuming the parent directly",
+                spec.name
+            );
+            return None;
+        }
+    };
+    let v: serde_json::Value = serde_json::from_slice(&out).ok()?;
+    let id = v["session_id"].as_str()?.to_string();
+    if id.is_empty() {
+        return None;
     }
-    settings
+    Some(id)
 }
 
 /// One `claude -p` attempt on one model candidate.
@@ -517,25 +651,32 @@ fn run_attempt(
     // that hook refuses the stop — the run never terminates, so no report is
     // captured, no `<<autofork:continue>>` sentinel survives, the parent is
     // never woken, and the fork wanders off doing the parent's work against
-    // the parent's own workspace. `disableAllHooks` in flag settings gates
-    // the restore (the resume path checks the same gate `/goal` itself does)
-    // and keeps the fork from firing the user's settings/plugin hooks, which
-    // a throwaway reviewer has no business triggering anyway — autofork's own
-    // hooks already no-op on AUTOFORK_FORK=1. `AUTOFORK_FORK_HOOKS=1` opts
-    // back in for anyone whose forks depend on a hook.
+    // the parent's own workspace. For an unguarded run, `disableAllHooks` in
+    // flag settings gates the restore (the resume path checks the same gate
+    // `/goal` itself does) and keeps the fork from firing the user's
+    // settings/plugin hooks, which a throwaway reviewer has no business
+    // triggering anyway — autofork's own hooks already no-op on
+    // AUTOFORK_FORK=1. `AUTOFORK_FORK_HOOKS=1` opts back in for anyone whose
+    // forks depend on a hook. A guarded run cannot take that gate: its guard
+    // IS a hook, so it resumes a goal-cleared fork instead (`run_one`).
     let disable_hooks = std::env::var_os("AUTOFORK_FORK_HOOKS").is_none();
+    // Headless runs cannot answer permission prompts; without a mode a write
+    // simply stalls until the run times out. `acceptEdits` is the smallest
+    // mode that lets typical consolidation forks do their file work. The
+    // same resolution for both branches: a guard bounds what the fork may
+    // touch, it does not pick how the harness approves what is in bounds.
+    let mode = spec.mode.as_deref().unwrap_or("acceptEdits");
     match spec.guard.as_ref() {
-        // Guarded run. The mode is forced to `default` (Manual) whatever the
-        // fork's `mode:` or the config says: `acceptEdits` and
-        // `bypassPermissions` both approve edits the guard's `allow` list
-        // does not cover, which would turn the write set into a suggestion.
-        // In `-p` there is nobody to answer a prompt, so "needs approval"
-        // resolves to "denied, do not retry" — exactly the wall a guard
-        // wants, with the allow rules cutting a hole for the write set.
+        // Guarded run: the guard hook, the sandbox and the family denies
+        // (`guard_settings`), in the fork's own mode. Hooks stay ON — the
+        // guard is one.
         Some(g) => {
-            cmd.arg("--permission-mode").arg("default");
+            let autofork_bin =
+                std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("autofork"));
+            let hook = guard_hook_command(&autofork_bin, &spec.path);
+            cmd.arg("--permission-mode").arg(mode);
             cmd.arg("--settings")
-                .arg(guard_settings(g, disable_hooks, cwd).to_string());
+                .arg(guard_settings(g, cwd, &hook).to_string());
             // The guard's prose, in the fork's own system prompt. A resumed
             // conversation replays the system prompt it recorded on its
             // first request, so an appended prompt would be dropped on the
@@ -552,13 +693,9 @@ fn run_attempt(
                 cmd.arg("--strict-mcp-config");
             }
         }
-        // Unguarded run. Headless runs cannot answer permission prompts;
-        // without a mode a write simply stalls until the run times out.
-        // `acceptEdits` is the smallest mode that lets typical consolidation
-        // forks do their file work.
+        // Unguarded run.
         None => {
-            cmd.arg("--permission-mode")
-                .arg(spec.mode.as_deref().unwrap_or("acceptEdits"));
+            cmd.arg("--permission-mode").arg(mode);
             if disable_hooks {
                 cmd.arg("--settings").arg(r#"{"disableAllHooks":true}"#);
             }
@@ -566,14 +703,10 @@ fn run_attempt(
     }
     cmd.arg(prompt)
         .current_dir(cwd)
-        .env("AUTOFORK_FORK", "1")
-        .env("AUTOFORK_SESSION_ID", session_id)
-        .env("AUTOFORK_FORK_NAME", &spec.name)
-        .env("AUTOFORK_FORK_PATH", &spec.path)
-        .env("AUTOFORK_TRIGGER", &spec.trigger)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    fork_env(&mut cmd, session_id, spec);
     // Claude Code scrubbed CLAUDE_CODE_OAUTH_TOKEN from our env on the way
     // into the hook; a token-only session gets its fork runs authenticated
     // through AUTOFORK_CLAUDE_CODE_OAUTH_TOKEN instead (see `runenv`).
@@ -1030,14 +1163,27 @@ mod tests {
     #[test]
     fn guard_settings_confine_writes_and_network() {
         // The whole enforcement surface of a guarded headless run, spelled
-        // out: no write outside the list, no host but the write set's own
-        // git remotes, no escape hatch, and the web tools off.
+        // out: the guard hook on every call, no write outside the list, no
+        // host but the write set's own git remotes, no escape hatch, and
+        // the web tools off. Never `disableAllHooks`: the guard IS a hook.
         let g = guard(&["/tmp/brain"]);
-        let v = guard_settings(&g, true, Path::new("/work/proj"));
+        let v = guard_settings(
+            &g,
+            Path::new("/work/proj"),
+            "'/opt/autofork' guard hook --fork '/f/FORK.md'",
+        );
         assert_eq!(
             v,
             json!({
-                "disableAllHooks": true,
+                "hooks": {
+                    "PreToolUse": [{
+                        "hooks": [{
+                            "type": "command",
+                            "command": "'/opt/autofork' guard hook --fork '/f/FORK.md'",
+                            "timeout": 30,
+                        }],
+                    }],
+                },
                 "sandbox": {
                     "enabled": true,
                     "autoAllowBashIfSandboxed": true,
@@ -1054,20 +1200,33 @@ mod tests {
                     },
                 },
                 "permissions": {
-                    "allow": ["Edit(//tmp/brain/**)"],
+                    "allow": ["Edit(//tmp/brain/**)", "Read", "Glob", "Grep"],
                     "deny": ["WebFetch", "WebSearch"],
                 },
             })
         );
+        assert!(v.get("disableAllHooks").is_none(), "{v}");
     }
 
     #[test]
-    fn guard_settings_keep_hooks_when_opted_back_in() {
-        // `AUTOFORK_FORK_HOOKS=1` only drops the hook gate; every guard key
-        // stays.
-        let v = guard_settings(&guard(&["/tmp/brain"]), false, Path::new("/work/proj"));
-        assert!(v.get("disableAllHooks").is_none(), "{v}");
-        assert_eq!(v["sandbox"]["enabled"], json!(true));
+    fn guard_hook_command_quotes_both_paths_for_the_shell() {
+        assert_eq!(
+            guard_hook_command(Path::new("/opt/auto fork/bin"), "/home/o'brien/FORK.md"),
+            "'/opt/auto fork/bin' guard hook --fork '/home/o'\\''brien/FORK.md'"
+        );
+    }
+
+    #[test]
+    fn guard_read_rules_follow_the_read_family() {
+        // Reads are unrestricted by a guard; the rules make Claude Code agree
+        // outside the cwd. A fork without `read` gets denies instead.
+        assert_eq!(guard_read_rules(&guard(&[])), ["Read", "Glob", "Grep"]);
+        let g = Guard {
+            tools: Some(vec![ToolFamily::Shell]),
+            ..guard(&[])
+        };
+        assert!(guard_read_rules(&g).is_empty());
+        assert!(guard_deny_rules(&g).iter().any(|r| r == "Read"));
     }
 
     #[test]
@@ -1089,10 +1248,16 @@ mod tests {
             network: true,
             ..guard(&["/tmp/brain"])
         };
-        let v = guard_settings(&g, true, Path::new("/work/proj"));
+        let v = guard_settings(&g, Path::new("/work/proj"), "hook");
         assert_eq!(
             v["permissions"]["allow"],
-            json!(["Edit(//tmp/brain/**)", "WebFetch(domain:*)"])
+            json!([
+                "Edit(//tmp/brain/**)",
+                "Read",
+                "Glob",
+                "Grep",
+                "WebFetch(domain:*)"
+            ])
         );
         assert_eq!(v["permissions"]["deny"], json!([]));
         assert_eq!(v["sandbox"]["network"]["strictAllowlist"], json!(true));
@@ -1180,7 +1345,7 @@ mod tests {
             ..guard(&["/tmp/brain"])
         };
         assert_eq!(
-            guard_settings(&g, true, Path::new("/work/proj"))["permissions"]["deny"],
+            guard_settings(&g, Path::new("/work/proj"), "hook")["permissions"]["deny"],
             json!([
                 "Bash(ssh)",
                 "Bash(ssh:*)",

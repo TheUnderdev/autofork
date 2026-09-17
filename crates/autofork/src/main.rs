@@ -140,6 +140,15 @@ enum GuardCommand {
     /// call on stdin, a JSON verdict on stdout.
     #[command(hide = true)]
     Eval,
+    /// The Claude Code `PreToolUse` entrypoint the headless runner installs
+    /// in a guarded fork: Claude Code's hook JSON on stdin, a permission
+    /// decision on stdout.
+    #[command(hide = true)]
+    Hook {
+        /// The fork's .md file.
+        #[arg(long)]
+        fork: std::path::PathBuf,
+    },
     /// What a fork's guard says to a shell command (after `--`) or to an
     /// edit (`--path`).
     Check {
@@ -306,6 +315,7 @@ fn main() {
         }
         Command::Guard { command } => match command {
             GuardCommand::Eval => guard_cmd::eval_stdin(&paths),
+            GuardCommand::Hook { fork } => guard_cmd::claude_hook(&paths, &fork),
             GuardCommand::Check {
                 fork,
                 cwd,

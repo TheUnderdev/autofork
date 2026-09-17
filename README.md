@@ -458,12 +458,12 @@ every client. Enforcement differs by what each harness exposes:
 | client | enforcement |
 |---|---|
 | opencode | the plugin's `tool.execute.before` hook calls `autofork guard eval` on every tool call of a guarded fork session (and of its subagents): a refusal is thrown as the tool's error — the model reads the message; a sandboxed command has its `command` rewritten; `tool.execute.after` appends the explanation when a sandboxed command fails on the rule. Any tool that is not an opencode built-in is an MCP tool and refused unless `mcp` is named. Both the live path and close-time `opencode run --fork` runs (via `AUTOFORK_FORK_PATH`). |
-| Claude Code (headless runner) | a fork run has no hooks (`disableAllHooks`, see the runner section), so the guard becomes settings: Claude Code's native Bash sandbox (`filesystem.allowWrite` = the write set, `network.allowedDomains` = the hosts of the write set's git remotes, `allowUnsandboxedCommands: false`), `permissions.allow` `Edit(//path/**)` rules for the write set under `--permission-mode default` (everything else needs an approval nobody can give), tool denies for the families the guard excludes, `--strict-mcp-config` (no MCP server is loaded at all) unless `mcp` is named, and the guard paragraph appended to the system prompt. Claude Code's own violation report is what the model reads when the sandbox blocks a command. |
+| Claude Code (headless runner) | a `PreToolUse` hook installed in the run's `--settings` calls `autofork guard hook` on every tool call: a refusal is a `deny` decision whose reason is the guard's message — the model reads it as the tool's result. The run keeps the fork's own `mode:` (the guard is not the permission mode; v0.31 forced `default` and a generated allow list, and a fork could not read its own FORK.md outside the cwd). Under the hook, two layers that need no hook and hold in every mode: Claude Code's native Bash sandbox (`filesystem.allowWrite` = the write set, `network.allowedDomains` = the hosts of the write set's git remotes, `allowUnsandboxedCommands: false`), and permission rules — `deny` for the families the guard excludes, `allow` for the write set's edits, for reads, and for the web when `network` is on. `--strict-mcp-config` (no MCP server is loaded at all) unless `mcp` is named, and the guard paragraph appended to the system prompt. Because the guard is a hook, a guarded run does not pass `disableAllHooks`; it forks a goal-cleared session instead (see the runner section). |
 | codex | no tool hooks at all: the guard becomes the sandbox (`read-only` for an empty write set, else `workspace-write` with `writable_roots` = the write set and no network), the MCP server table is overridden to empty unless `mcp` is named, and the run starts inside the first write root, since codex makes the cwd writable. The analyser and the custom message do not apply here. |
 
 `autofork guard check --fork <file> [--cwd <dir>] -- <cmd>` (or `--path <file>` for an edit) prints
-what a fork's guard would say, message included. Every decision is appended to
-`~/.autofork/logs/guard.log`.
+what a fork's guard would say, message included. Every decision — opencode plugin or Claude Code
+hook — is appended to `~/.autofork/logs/guard.log`.
 
 A guard does not replace `mode:`. Keep `mode:` for what the harness should be (a read-only codex
 sandbox, an opencode agent with its own permission table); add `guard:` for what the *fork* may
@@ -757,12 +757,17 @@ request prefixes per mode), so each run reads the inherited history cold — whi
 pairs naturally with cheap fork models (`[fork_models]`, above): pay small-model input prices for
 the copy instead of burning your session's model on a journal update. Runs default to
 `--permission-mode acceptEdits` (headless runs can't answer permission prompts); set a fork's
-`mode:` or `[fork_modes]` for more or less. Runs also carry
+`mode:` or `[fork_modes]` for more or less — guarded or not. Unguarded runs also carry
 `--settings '{"disableAllHooks":true}'`: a `--resume` restores the session-scoped Stop hook that
 Claude Code's own `/goal` installs, and inside a headless fork that hook refuses the stop — the
 run never ends, its report (sentinel included) is never captured, and the fork drifts into doing
 the parent's work. Disabling hooks in the fork also keeps a throwaway reviewer from firing your
-lifecycle hooks; set `AUTOFORK_FORK_HOOKS=1` if a fork of yours depends on one.
+lifecycle hooks; set `AUTOFORK_FORK_HOOKS=1` if a fork of yours depends on one. A **guarded** run
+cannot take that gate — its guard is a `PreToolUse` hook, and `disableAllHooks` would drop that
+too. It first runs `claude -p --resume <conversation> --fork-session "/goal clear"` (no model
+turn, no API call: a few milliseconds and one transcript copy) and resumes *that* fork, which
+restores no goal; your lifecycle hooks do run in a guarded fork, and can tell from
+`AUTOFORK_FORK=1`.
 
 A fork is a separate process, so the parent's background tasks — a Monitor, a
 `run_in_background` command, a subagent — are not in its task table: `TaskOutput` on one of the

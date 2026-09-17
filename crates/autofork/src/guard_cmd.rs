@@ -303,6 +303,84 @@ pub fn eval_stdin(paths: &Paths) {
     }
 }
 
+/// `guard hook`: the Claude Code `PreToolUse` face of the guard, for the
+/// headless runner's forks. Claude Code's hook JSON on stdin (`tool_name`,
+/// `tool_input`, `cwd`), a `hookSpecificOutput` decision on stdout.
+///
+/// A deny is reported as a `permissionDecision` of `deny` with the guard's
+/// message as the reason, which Claude Code hands the model as the tool's
+/// result — the same words the opencode plugin throws as the tool's error.
+/// An allow prints an empty object, so the call goes on through the normal
+/// permission flow (the mode, the settings rules, the native sandbox). A
+/// `sandbox` verdict — a command the analyser cannot prove — is also let
+/// through: on this client every Bash command already runs inside Claude
+/// Code's own sandbox, confined to the same write set, so autofork's
+/// wrapper would only nest one sandbox in another.
+///
+/// Fails closed: an input that cannot be read or parsed, or a fork file
+/// that cannot be loaded, is a deny — never a silent allow. Exit status is
+/// 0 either way; Claude Code honours the JSON decision as long as it parses.
+pub fn claude_hook(paths: &Paths, fork_path: &Path) {
+    let mut raw = String::new();
+    let decision = match std::io::stdin().read_to_string(&mut raw) {
+        Err(e) => Some(format!("autofork guard could not read its input: {e}")),
+        Ok(_) => match serde_json::from_str::<ClaudeHookInput>(&raw) {
+            Err(e) => Some(format!("autofork guard could not parse its input: {e}")),
+            Ok(input) => {
+                let eval = EvalInput {
+                    fork_path: fork_path.to_path_buf(),
+                    fork: None,
+                    client: Some("claude-code".to_string()),
+                    tool: input.tool_name,
+                    args: input.tool_input,
+                    cwd: input
+                        .cwd
+                        .or_else(|| std::env::current_dir().ok())
+                        .unwrap_or_else(|| PathBuf::from("/")),
+                };
+                match evaluate(paths, &eval) {
+                    Ok(v) => hook_denial(&v),
+                    Err(e) => Some(format!("autofork guard could not load the fork: {e}")),
+                }
+            }
+        },
+    };
+    println!("{}", claude_hook_output(decision.as_deref()));
+}
+
+/// What Claude Code's `PreToolUse` JSON carries that the guard needs.
+#[derive(Debug, Deserialize)]
+struct ClaudeHookInput {
+    tool_name: String,
+    #[serde(default)]
+    tool_input: serde_json::Value,
+    #[serde(default)]
+    cwd: Option<PathBuf>,
+}
+
+/// The reason to deny with, if the verdict is a denial.
+fn hook_denial(v: &Verdict) -> Option<String> {
+    match v {
+        Verdict::Allow | Verdict::Sandbox { .. } => None,
+        Verdict::Deny { message } => Some(message.clone()),
+    }
+}
+
+/// The `PreToolUse` hook's stdout: a deny with its reason, or `{}`.
+fn claude_hook_output(deny_reason: Option<&str>) -> String {
+    let v = match deny_reason {
+        Some(reason) => serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason,
+            }
+        }),
+        None => serde_json::json!({}),
+    };
+    v.to_string()
+}
+
 fn print_verdict(v: &Verdict) {
     println!(
         "{}",
@@ -393,4 +471,55 @@ pub fn analyse(cwd: Option<PathBuf>, command: Vec<String>) -> Result<(), String>
         println!("(the line did not fully parse as shell)");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claude_hook_denies_with_the_guard_message_as_the_reason() {
+        // The reason is what Claude Code hands the model as the tool
+        // result, so it carries the guard's own words.
+        let out = claude_hook_output(Some("fork 'x' may only change files under `/tmp/brain`"));
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+        assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert_eq!(
+            v["hookSpecificOutput"]["permissionDecisionReason"],
+            "fork 'x' may only change files under `/tmp/brain`"
+        );
+    }
+
+    #[test]
+    fn claude_hook_lets_allow_and_sandbox_through_untouched() {
+        // `{}` = no decision: the call goes on through the mode, the rules
+        // and Claude Code's own sandbox. A `sandbox` verdict is not a deny
+        // here — the native sandbox already confines every Bash command.
+        assert_eq!(claude_hook_output(None), "{}");
+        assert_eq!(hook_denial(&Verdict::Allow), None);
+        assert_eq!(
+            hook_denial(&Verdict::Sandbox {
+                command: "x".into(),
+                message: "y".into()
+            }),
+            None
+        );
+        assert_eq!(
+            hook_denial(&Verdict::Deny {
+                message: "no".into()
+            }),
+            Some("no".to_string())
+        );
+    }
+
+    #[test]
+    fn claude_hook_input_takes_claude_codes_field_names() {
+        let raw = r#"{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"Write",
+            "tool_input":{"file_path":"/etc/hosts","content":"x"},"cwd":"/work"}"#;
+        let i: ClaudeHookInput = serde_json::from_str(raw).unwrap();
+        assert_eq!(i.tool_name, "Write");
+        assert_eq!(i.tool_input["file_path"], "/etc/hosts");
+        assert_eq!(i.cwd.as_deref(), Some(Path::new("/work")));
+    }
 }
